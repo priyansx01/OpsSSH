@@ -1,0 +1,20 @@
+[package]
+name = "opsssh-term-view"
+description = "Renderer-independent frame scheduling for OpsSSH"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+gui = ["dep:gpui", "opsssh-platform/gui"]
+
+[dependencies]
+opsssh-term-core.workspace = true
+opsssh-platform.workspace = true
+async-channel.workspace = true
+gpui = { workspace = true, optional = true }
+
+[lints]
+workspace = true

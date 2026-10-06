@@ -1,0 +1,22 @@
+[package]
+name = "opsssh"
+description = "OpsSSH development diagnostics and terminal benchmark harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = ["gui"]
+gui = ["dep:gpui", "opsssh-platform/gui", "opsssh-term-view/gui"]
+capture = ["gui", "gpui/test-support", "opsssh-platform/capture"]
+
+[dependencies]
+opsssh-platform.workspace = true
+opsssh-term-core.workspace = true
+opsssh-term-view.workspace = true
+gpui = { workspace = true, optional = true }
+
+[lints]
+workspace = true

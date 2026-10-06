@@ -1,0 +1,21 @@
+[package]
+name = "opsssh-platform"
+description = "Platform information and local-terminal interfaces for OpsSSH"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+gui = ["dep:gpui", "dep:gpui-platform"]
+capture = ["gui", "gpui-platform/test-support"]
+
+[dependencies]
+opsssh-term-core.workspace = true
+portable-pty.workspace = true
+gpui = { workspace = true, optional = true }
+gpui-platform = { workspace = true, optional = true }
+
+[lints]
+workspace = true

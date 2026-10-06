@@ -1,0 +1,23 @@
+name: Bug report
+description: Report a reproducible OpsSSH defect
+body:
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps and command
+      description: Use synthetic data; remove secrets and personal server details.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Paste output from `cargo run -p opsssh -- diagnostics`.
+    validations:
+      required: true

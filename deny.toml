@@ -1,0 +1,26 @@
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Maintenance-only, pinned upstream dependencies for the local spike.
+# Review/remove before release; see docs/DEPENDENCIES.md. Vulnerabilities remain denied.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "GPUI/pulp depend on paste; maintenance-only exception for pinned renderer spike; review before release" },
+    { id = "RUSTSEC-2026-0206", reason = "GPUI/usvg depend on rustybuzz; maintenance-only exception for pinned renderer spike; review before release" },
+    { id = "RUSTSEC-2026-0192", reason = "GPUI/fontdb depend on ttf-parser; maintenance-only exception for pinned renderer spike; review before release" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unicode-3.0", "MPL-2.0", "CC0-1.0", "bzip2-1.0.6"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

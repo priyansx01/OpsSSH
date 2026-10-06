@@ -1,0 +1,5 @@
+/target/
+/.cache/
+/artifacts/
+*.profraw
+*.profdata

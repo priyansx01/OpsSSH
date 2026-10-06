@@ -1,0 +1,121 @@
+//! Application-owned platform services. No other crate contains OS conditionals.
+//!
+//! Local terminals use portable-pty's ConPTY/openpty implementations.
+
+mod pty;
+pub use pty::{NativeTerminal, NativeTerminalFactory, TerminalKiller};
+
+#[cfg(feature = "gui")]
+pub fn application() -> gpui::Application {
+    gpui_platform::application()
+}
+
+use std::io::{self, Read, Write};
+use std::path::PathBuf;
+
+use opsssh_term_core::TerminalSize;
+
+#[cfg(target_os = "windows")]
+mod native {
+    pub const NAME: &str = "windows";
+    pub const DEFAULT_SHELL: &str = "powershell.exe";
+    pub const PRIMARY_MODIFIER: &str = "Ctrl";
+    pub const TERMINAL_FONT: &str = "Consolas";
+}
+
+#[cfg(target_os = "macos")]
+mod native {
+    pub const NAME: &str = "macos";
+    pub const DEFAULT_SHELL: &str = "/bin/zsh";
+    pub const PRIMARY_MODIFIER: &str = "Cmd";
+    pub const TERMINAL_FONT: &str = "Menlo";
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+mod native {
+    pub const NAME: &str = std::env::consts::OS;
+    pub const DEFAULT_SHELL: &str = "/bin/sh";
+    pub const PRIMARY_MODIFIER: &str = "Ctrl";
+    pub const TERMINAL_FONT: &str = "DejaVu Sans Mono";
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlatformInfo {
+    pub os: &'static str,
+    pub architecture: &'static str,
+    pub primary_modifier: &'static str,
+}
+
+pub fn info() -> PlatformInfo {
+    PlatformInfo {
+        os: native::NAME,
+        architecture: std::env::consts::ARCH,
+        primary_modifier: native::PRIMARY_MODIFIER,
+    }
+}
+
+pub fn default_shell() -> PathBuf {
+    if native::NAME == "windows" {
+        return PathBuf::from(native::DEFAULT_SHELL);
+    }
+    std::env::var_os("SHELL")
+        .filter(|shell| !shell.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(native::DEFAULT_SHELL))
+}
+
+pub fn terminal_font_family() -> &'static str {
+    native::TERMINAL_FONT
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalShellOptions {
+    pub executable: PathBuf,
+    pub size: TerminalSize,
+    pub working_directory: Option<PathBuf>,
+}
+
+impl Default for LocalShellOptions {
+    fn default() -> Self {
+        Self {
+            executable: default_shell(),
+            size: TerminalSize::new(80, 24).expect("constant dimensions are nonzero"),
+            working_directory: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessExit {
+    pub code: Option<u32>,
+}
+
+/// A real PTY, not shell stdio pipes. Reads and writes run on background workers.
+pub trait LocalTerminal: Send {
+    fn reader(&mut self) -> io::Result<Box<dyn Read + Send>>;
+    fn writer(&mut self) -> io::Result<Box<dyn Write + Send>>;
+    fn resize(&mut self, size: TerminalSize) -> io::Result<()>;
+    fn try_wait(&mut self) -> io::Result<Option<ProcessExit>>;
+    fn terminate(&mut self) -> io::Result<()>;
+}
+
+pub trait LocalTerminalFactory: Send + Sync {
+    type Terminal: LocalTerminal;
+    fn spawn(&self, options: LocalShellOptions) -> io::Result<Self::Terminal>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_information_and_shell_options_are_usable() {
+        let info = info();
+        assert!(!info.os.is_empty());
+        assert!(!info.architecture.is_empty());
+        assert!(matches!(info.primary_modifier, "Ctrl" | "Cmd"));
+        let options = LocalShellOptions::default();
+        assert!(!options.executable.as_os_str().is_empty());
+        assert_eq!(options.size.rows(), 24);
+    }
+}
