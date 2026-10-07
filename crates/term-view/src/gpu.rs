@@ -1,4 +1,5 @@
 use opsssh_i18n::text as tr;
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -85,6 +86,9 @@ pub struct TerminalView {
     connection_generation: u64,
     at_prompt: bool,
     paste_preview: Option<String>,
+    clipboard_keys: HashSet<String>,
+    #[cfg(all(test, feature = "test-support"))]
+    sent_input: Vec<Vec<u8>>,
     error: Option<String>,
     title: String,
     frame_pending: bool,
@@ -254,6 +258,7 @@ impl TerminalView {
                 this.focus_changed(true, window, cx);
             }),
             cx.on_blur(&focus, window, |this, window, cx| {
+                this.clipboard_keys.clear();
                 this.focus_changed(false, window, cx);
             }),
             cx.observe_window_activation(window, |this, window, cx| this.refresh_blink(window, cx)),
@@ -323,6 +328,9 @@ impl TerminalView {
             connection_generation: 0,
             at_prompt: false,
             paste_preview: None,
+            clipboard_keys: HashSet::new(),
+            #[cfg(all(test, feature = "test-support"))]
+            sent_input: Vec::new(),
             error: None,
             title: "Local terminal".into(),
             frame_pending: false,
@@ -848,6 +856,8 @@ impl TerminalView {
     }
 
     fn send(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        #[cfg(all(test, feature = "test-support"))]
+        self.sent_input.push(bytes.clone());
         if let Some(session) = &self.session
             && let Err(error) = session.write(bytes)
         {
@@ -983,25 +993,26 @@ impl TerminalView {
             return;
         }
         let key = &event.keystroke;
-        let primary = if opsssh_platform::info().primary_modifier == "Cmd" {
-            key.modifiers.platform
-        } else {
-            key.modifiers.control
-        };
-        // Let the workspace handle its Home/Quit bindings before terminal input.
-        if primary
-            && (matches!(key.key.as_str(), "k" | "n" | "w")
-                || (key.modifiers.shift && matches!(key.key.as_str(), "h" | "q"))
-                || (key.modifiers.platform && key.key == "q"))
+        let clipboard_primary = !key.modifiers.alt
+            && if opsssh_platform::info().primary_modifier == "Cmd" {
+                key.modifiers.platform && !key.modifiers.control
+            } else {
+                key.modifiers.control && !key.modifiers.platform
+            };
+        if clipboard_primary && key.key == "c" && (self.selection.is_some() || key.modifiers.shift)
         {
-            return;
-        }
-        if primary && key.key == "c" && (self.selection.is_some() || key.modifiers.shift) {
+            self.clipboard_keys.insert(key.key.clone());
             self.copy(cx);
             cx.stop_propagation();
             return;
         }
-        if (primary && key.key == "v") || (key.modifiers.shift && key.key == "insert") {
+        let shift_insert = key.modifiers.shift
+            && !key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.platform
+            && key.key == "insert";
+        if (clipboard_primary && key.key == "v") || shift_insert {
+            self.clipboard_keys.insert(key.key.clone());
             if let Some(item) = cx.read_from_clipboard() {
                 self.paste_item(item, cx);
             }
@@ -1046,6 +1057,14 @@ impl TerminalView {
     }
 
     fn key_up(&mut self, event: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // A clipboard gesture consumes both halves, even if modifiers were released first.
+        if self.clipboard_keys.remove(&event.keystroke.key) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.prompt.is_some() || self.paste_preview.is_some() {
+            return;
+        }
         if let Some(session) = &self.session
             && let Some(key) = key_value(&event.keystroke.key, event.keystroke.key_char.as_deref())
             && let Ok(bytes) = encode_key(
@@ -1352,6 +1371,7 @@ impl Render for TerminalView {
         let _ = &self.subscriptions;
         div()
             .id("terminal")
+            .key_context("OpsSSHTerminal")
             .relative()
             .size_full()
             .flex()
@@ -1776,7 +1796,7 @@ impl EntityInputHandler for TerminalView {
 mod clipboard_tests {
     use super::*;
     use gpui::{Entity, TestAppContext, VisualTestContext};
-    use opsssh_term_core::Cell;
+    use opsssh_term_core::{Cell, TerminalBackend};
 
     fn fixture(window: &mut Window, cx: &mut Context<TerminalView>) -> TerminalView {
         // Invalid options fail before opening any SSH connection.
@@ -1844,6 +1864,112 @@ mod clipboard_tests {
         cx.simulate_mouse_move(end, Some(MouseButton::Left), modifiers);
         cx.simulate_mouse_up(end, MouseButton::Left, modifiers);
         draw(cx);
+    }
+
+    #[gpui::test]
+    fn harness_keys_reach_the_transport_with_their_modifiers(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let session = Session::local(LocalShellOptions::default()).unwrap();
+        let (view, cx) = cx.add_window_view(fixture);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.stopped = false;
+                view.session = Some(session);
+                view.focus.focus(window, cx);
+            })
+        });
+        draw(cx);
+        for (keys, expected) in [
+            ("ctrl-k", b"\x0b".as_slice()),
+            ("ctrl-n", b"\x0e".as_slice()),
+            ("ctrl-w", b"\x17".as_slice()),
+            ("ctrl-j", b"\n".as_slice()),
+            ("ctrl-c", b"\x03".as_slice()),
+            ("ctrl-r", b"\x12".as_slice()),
+            ("ctrl-t", b"\x14".as_slice()),
+            ("ctrl-o", b"\x0f".as_slice()),
+            ("ctrl-shift-h", b"\x08".as_slice()),
+            ("ctrl-shift-q", b"\x11".as_slice()),
+            ("shift-tab", b"\x1b[Z".as_slice()),
+            ("alt-p", b"\x1bp".as_slice()),
+            ("alt-enter", b"\x1b\r".as_slice()),
+            ("ctrl-alt-v", b"\x1b\x16".as_slice()),
+            ("ctrl-alt-c", b"\x1b\x03".as_slice()),
+            ("escape", b"\x1b".as_slice()),
+            ("up", b"\x1b[A".as_slice()),
+        ] {
+            cx.update(|_, cx| view.update(cx, |view, _| view.sent_input.clear()));
+            cx.simulate_keystrokes(keys);
+            assert_eq!(
+                view.read_with(cx, |view, _| view.sent_input.concat()),
+                expected,
+                "{keys} was not forwarded correctly"
+            );
+        }
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.session
+                    .as_ref()
+                    .unwrap()
+                    .backend()
+                    .lock()
+                    .unwrap()
+                    .ingest(b"\x1b[>1u")
+                    .unwrap();
+                view.sent_input.clear();
+            })
+        });
+        cx.simulate_keystrokes("shift-enter");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sent_input.concat()),
+            b"\x1b[13;2u"
+        );
+        cx.update(|_, cx| view.update(cx, |view, cx| view.disconnect(cx)));
+    }
+
+    #[gpui::test]
+    fn clipboard_gestures_do_not_leak_key_release_events_into_a_harness(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let session = Session::local(LocalShellOptions::default()).unwrap();
+        let (view, cx) = cx.add_window_view(fixture);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.stopped = false;
+                view.session = Some(session);
+                view.focus.focus(window, cx);
+                view.session
+                    .as_ref()
+                    .unwrap()
+                    .backend()
+                    .lock()
+                    .unwrap()
+                    .ingest(b"\x1b[>11u")
+                    .unwrap();
+            })
+        });
+        draw(cx);
+        for keys in ["primary-shift-c", "primary-shift-v", "shift-insert"] {
+            cx.update(|_, cx| view.update(cx, |view, _| view.sent_input.clear()));
+            shortcut(cx, keys);
+            cx.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    // Releasing Ctrl/Shift before the letter must still consume its release.
+                    view.key_up(
+                        &KeyUpEvent {
+                            keystroke: gpui::Keystroke::parse(keys.split('-').next_back().unwrap())
+                                .unwrap(),
+                        },
+                        window,
+                        cx,
+                    );
+                    assert!(
+                        view.sent_input.concat().is_empty(),
+                        "{keys} leaked an unmatched key event"
+                    );
+                })
+            });
+        }
+        cx.update(|_, cx| view.update(cx, |view, cx| view.disconnect(cx)));
     }
 
     #[gpui::test]

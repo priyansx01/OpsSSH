@@ -952,6 +952,12 @@ impl Workspace {
             .flex_col()
             .gap_3()
             .child(div().text_lg().child(tr("settings-shortcuts")))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(p.muted))
+                    .child(tr("settings-terminal-shortcuts")),
+            )
             .children(
                 [
                     ("N", "new-server"),

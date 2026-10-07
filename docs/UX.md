@@ -17,7 +17,7 @@ are requested during authentication. Unsupported SSH options require explicit
 review. Save & connect validates connection options before saving or closing
 the dialog; failed checks retain entered values.
 
-Session entities stay alive while navigating home or settings. Ctrl/Cmd+W cannot
+Session entities stay alive while navigating home or settings. Outside terminal focus, Ctrl/Cmd+W cannot
 close a hidden terminal from settings, help, or a connection dialog. Files use
 a resizable panel with per-task cancellation and current-file byte progress.
 Click the file list's Name heading, or activate it with the keyboard, to use
@@ -121,3 +121,27 @@ multiline review, and a real local PTY paste followed by Enter. The workspace
 suite passed 110 tests and strict Clippy passed. The native Windows right-click
 menu was rendered and inspected at 125% scaling. Reproduce that review with
 `snapshot-session-clipboard` using the development `capture` feature.
+
+
+## Harness shortcut priority
+
+The focused terminal has its own GPUI key context. Workspace bindings are
+excluded from that context, including Home, New connection, Close tab, and Quit.
+Ctrl+K, Ctrl+N, Ctrl+W, Ctrl+J, Ctrl+R, Ctrl+T, Ctrl+O, Shift+Tab, Escape, and
+Alt combinations therefore reach the shell or harness. Workspace buttons remain
+available, and the usual workspace bindings still work outside terminal focus.
+Explicit clipboard shortcuts remain local. Extra Alt/Super/Control modifiers
+are not mistaken for clipboard gestures, and consumed clipboard key releases
+are not sent to a harness.
+
+Shift+Enter remains distinct from Enter when the application negotiates the
+Kitty keyboard protocol. Legacy Enter behavior remains compatible with ordinary
+shells. A tmux server can filter extended keys before a harness receives them;
+see the [harness terminal configuration](https://code.claude.com/docs/en/terminal-config#configure-tmux)
+for configuring that layer. OpsSSH does not modify the VM's tmux configuration.
+
+The workspace suite passed 114 tests; strict Clippy and the normal GUI build
+passed. GUI tests exercise the actual workspace bindings, verify that Home shortcuts
+still work, inspect the encoded transport bytes for harness shortcuts and
+negotiated Shift+Enter, and reject unmatched clipboard release events. Live
+harness and tmux acceptance on a disposable VM remains a release check.

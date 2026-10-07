@@ -75,11 +75,31 @@ pub fn run(open_terminal: bool) {
 pub fn capture(screen: &str, path: PathBuf) {
     run_internal(screen == "snapshot-local", Some((screen.into(), path)));
 }
+fn bind_workspace_keys(cx: &mut App) {
+    // Workspace actions must never consume keys from a focused VM terminal.
+    const WORKSPACE: &str = "OpsSSH && !OpsSSHTerminal";
+    const HOME: &str = "OpsSSHHome && !OpsSSHTerminal";
+    cx.bind_keys([
+        KeyBinding::new("ctrl-enter", OpenLocalTerminal, Some(HOME)),
+        KeyBinding::new("cmd-enter", OpenLocalTerminal, Some(HOME)),
+        KeyBinding::new("ctrl-k", GoHome, Some(WORKSPACE)),
+        KeyBinding::new("cmd-k", GoHome, Some(WORKSPACE)),
+        KeyBinding::new("ctrl-n", NewServer, Some(WORKSPACE)),
+        KeyBinding::new("cmd-n", NewServer, Some(WORKSPACE)),
+        KeyBinding::new("ctrl-w", CloseTab, Some(WORKSPACE)),
+        KeyBinding::new("cmd-w", CloseTab, Some(WORKSPACE)),
+        KeyBinding::new("ctrl-shift-h", GoHome, Some(WORKSPACE)),
+        KeyBinding::new("cmd-shift-h", GoHome, Some(WORKSPACE)),
+        KeyBinding::new("ctrl-shift-q", Quit, Some(WORKSPACE)),
+        KeyBinding::new("cmd-q", Quit, Some(WORKSPACE)),
+    ]);
+}
+
 fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
     let launched = Instant::now();
     opsssh_platform::application().with_assets(gpui_kit_assets::AllAssets).run(move|cx:&mut App|{
     gpui_component::init(cx);Theme::change(ThemeMode::Dark,None,cx);
-    cx.bind_keys([KeyBinding::new("ctrl-enter",OpenLocalTerminal,Some("OpsSSHHome")),KeyBinding::new("cmd-enter",OpenLocalTerminal,Some("OpsSSHHome")),KeyBinding::new("ctrl-k",GoHome,Some("OpsSSH")),KeyBinding::new("cmd-k",GoHome,Some("OpsSSH")),KeyBinding::new("ctrl-n",NewServer,Some("OpsSSH")),KeyBinding::new("cmd-n",NewServer,Some("OpsSSH")),KeyBinding::new("ctrl-w",CloseTab,Some("OpsSSH")),KeyBinding::new("cmd-w",CloseTab,Some("OpsSSH")),KeyBinding::new("ctrl-shift-h",GoHome,Some("OpsSSH")),KeyBinding::new("cmd-shift-h",GoHome,Some("OpsSSH")),KeyBinding::new("ctrl-shift-q",Quit,Some("OpsSSH")),KeyBinding::new("cmd-q",Quit,Some("OpsSSH"))]);
+    bind_workspace_keys(cx);
     cx.on_window_closed(|cx,_|{if cx.windows().is_empty(){cx.quit();}}).detach();
     #[allow(unused_mut)]
     let mut dimensions=size(px(1280.),px(820.));
@@ -975,7 +995,7 @@ impl Render for Workspace {
 #[cfg(all(test, feature = "capture"))]
 mod tests {
     use super::*;
-    use gpui::{TestAppContext, VisualTestContext};
+    use gpui::{Focusable, TestAppContext, VisualTestContext};
 
     fn fixture(window: &mut Window, cx: &mut Context<Workspace>) -> Workspace {
         let mut navigation = SessionTabs::default();
@@ -1074,6 +1094,95 @@ mod tests {
                 assert_eq!(this.navigation.active, Some(second));
             })
         });
+    }
+
+    #[gpui::test]
+    fn terminal_focus_preserves_harness_shortcuts(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            bind_workspace_keys(cx);
+        });
+        let mut workspace = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| fixture(window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        let active = VisualTestContext::update(cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                let id = this.sessions[1].id;
+                this.activate_session(id, window, cx);
+                id
+            })
+        });
+        cx.run_until_parked();
+        VisualTestContext::update(cx, |window, cx| {
+            let _ = window.draw(cx);
+        });
+        for keys in [
+            "ctrl-k",
+            "ctrl-n",
+            "ctrl-w",
+            "ctrl-shift-h",
+            "ctrl-shift-q",
+            "cmd-k",
+            "cmd-n",
+            "cmd-w",
+            "cmd-shift-h",
+            "cmd-q",
+            "ctrl-enter",
+            "cmd-enter",
+        ] {
+            cx.simulate_keystrokes(keys);
+            VisualTestContext::update(cx, |window, cx| {
+                let this = workspace.read(cx);
+                assert_eq!(
+                    this.navigation.active,
+                    Some(active),
+                    "{keys} navigated away from the VM"
+                );
+                assert_eq!(
+                    this.sessions.len(),
+                    2,
+                    "{keys} changed the session registry"
+                );
+                assert!(
+                    this.pending_close.is_none(),
+                    "{keys} opened the close dialog"
+                );
+                assert!(!this.quit_dialog, "{keys} opened the quit dialog");
+                assert!(this.editor.is_none(), "{keys} opened the connection editor");
+                assert_eq!(
+                    window.focused(cx),
+                    Some(this.sessions[1].terminal.read(cx).focus_handle(cx))
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn workspace_shortcuts_still_work_on_home(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            bind_workspace_keys(cx);
+        });
+        let mut workspace = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| fixture(window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        VisualTestContext::update(cx, |window, cx| {
+            workspace.update(cx, |this, cx| this.home(&GoHome, window, cx));
+        });
+        cx.run_until_parked();
+        VisualTestContext::update(cx, |window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_keystrokes("ctrl-n");
+        assert!(workspace.read_with(cx, |this, _| this.editor.is_some()));
     }
 
     #[gpui::test]
