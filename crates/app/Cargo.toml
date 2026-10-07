@@ -1,6 +1,6 @@
 [package]
 name = "opsssh"
-description = "OpsSSH development diagnostics and terminal benchmark harness"
+description = "Native SSH terminal workspace with server profiles and SFTP"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ publish.workspace = true
 
 [features]
 default = ["gui"]
-gui = ["dep:gpui", "dep:gpui-component", "opsssh-platform/gui", "opsssh-term-view/gui"]
+gui = ["dep:gpui", "dep:gpui-component", "dep:gpui-kit-assets", "opsssh-platform/gui", "opsssh-term-view/gui"]
 capture = ["gui", "gpui/test-support", "opsssh-platform/capture"]
 
 [dependencies]
@@ -18,12 +18,12 @@ opsssh-term-core.workspace = true
 opsssh-term-view.workspace = true
 gpui = { workspace = true, optional = true }
 gpui-component = { version = "=0.7.1", optional = true }
+gpui-kit-assets = { version = "=0.7.1", optional = true }
 opsssh-store = { path = "../store", version = "=0.1.0" }
 opsssh-ssh-config = { path = "../ssh-config", version = "=0.1.0" }
 opsssh-ssh-core = { path = "../ssh-core", version = "=0.1.0" }
 shlex = "=2.0.1"
-fluent-bundle = "=0.16.0"
-unic-langid = "=0.9.6"
+opsssh-i18n = { path = "../i18n", version = "=0.1.0" }
 opsssh-sftp = { path = "../sftp", version = "=0.1.0" }
 opsssh-drop = { path = "../drop", version = "=0.1.0" }
 async-channel = "=2.5.0"

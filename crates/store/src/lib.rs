@@ -118,6 +118,12 @@ pub struct Settings {
     pub theme: String,
     pub font_size: u16,
     pub update_check: bool,
+    pub server_view: String,
+    pub sidebar_collapsed: bool,
+    pub reduced_motion: bool,
+    pub sort: String,
+    #[serde(with = "connection_times")]
+    pub last_connected: std::collections::BTreeMap<u64, u64>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -125,6 +131,11 @@ impl Default for Settings {
             theme: "dark".into(),
             font_size: 16,
             update_check: false,
+            server_view: "cards".into(),
+            sidebar_collapsed: false,
+            reduced_motion: false,
+            sort: "name".into(),
+            last_connected: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -185,11 +196,36 @@ impl Store {
         if !(8..=48).contains(&self.settings.font_size) {
             return Err(invalid("font size must be between 8 and 48"));
         }
+        if !matches!(self.settings.theme.as_str(), "dark" | "light" | "system") {
+            return Err(invalid("theme must be dark, light or system"));
+        }
+        if !matches!(
+            self.settings.server_view.as_str(),
+            "cards" | "list" | "compact"
+        ) {
+            return Err(invalid("server view must be cards, list or compact"));
+        }
+        if !matches!(
+            self.settings.sort.as_str(),
+            "name" | "last_connected" | "environment"
+        ) {
+            return Err(invalid("sort must be name, last_connected or environment"));
+        }
+        if self.settings.last_connected.len() > 10000
+            || self
+                .settings
+                .last_connected
+                .iter()
+                .any(|(id, time)| *id == 0 || *time == 0)
+        {
+            return Err(invalid("invalid last-connected timestamps"));
+        }
         Ok(())
     }
     pub fn export(&self) -> io::Result<String> {
         self.validate()?;
         let mut safe = self.clone();
+        safe.settings.last_connected.clear();
         for profile in &mut safe.servers {
             profile.proxy_review_required = true;
             // A program argument can contain a token; never include commands in shared exports.
@@ -235,6 +271,14 @@ impl Store {
         }
         Ok(id)
     }
+    /// Call only after SSH authentication succeeds; attempts do not update recency.
+    pub fn record_connection(&mut self, server_id: u64, unix_seconds: u64) -> io::Result<()> {
+        if unix_seconds == 0 || !self.servers.iter().any(|server| server.id == server_id) {
+            return Err(invalid("a saved server and valid timestamp are required"));
+        }
+        self.settings.last_connected.insert(server_id, unix_seconds);
+        Ok(())
+    }
     pub fn import(&mut self, text: &str) -> io::Result<usize> {
         let imported = Self::parse(text)?;
         let count = imported.servers.len();
@@ -251,9 +295,79 @@ impl Store {
         Ok(count)
     }
 }
+mod connection_times {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+    pub fn serialize<S: Serializer>(
+        values: &BTreeMap<u64, u64>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        values
+            .iter()
+            .map(|(id, time)| (id.to_string(), *time))
+            .collect::<BTreeMap<_, _>>()
+            .serialize(serializer)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<u64, u64>, D::Error> {
+        BTreeMap::<String, u64>::deserialize(deserializer)?
+            .into_iter()
+            .map(|(id, time)| {
+                id.parse()
+                    .map(|id| (id, time))
+                    .map_err(serde::de::Error::custom)
+            })
+            .collect()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn older_settings_receive_new_defaults() {
+        let store = Store::parse(
+            "version = 1\n[settings]\ntheme = 'light'\nfont_size = 18\nupdate_check = false\n",
+        )
+        .unwrap();
+        assert_eq!(store.settings.server_view, "cards");
+        assert_eq!(store.settings.sort, "name");
+        assert!(!store.settings.sidebar_collapsed);
+        assert!(!store.settings.reduced_motion);
+        assert!(store.settings.last_connected.is_empty());
+    }
+    #[test]
+    fn settings_round_trip_recency_is_local_and_values_are_validated() {
+        let mut store = Store::default();
+        let id = store
+            .upsert(Profile {
+                host: "example.test".into(),
+                ..Profile::default()
+            })
+            .unwrap();
+        store.settings.server_view = "compact".into();
+        store.settings.sort = "last_connected".into();
+        store.settings.sidebar_collapsed = true;
+        store.settings.reduced_motion = true;
+        store.record_connection(id, 1720000000).unwrap();
+        let text = toml::to_string(&store).unwrap();
+        let read = Store::parse(&text).unwrap();
+        assert_eq!(read.settings.last_connected[&id], 1720000000);
+        assert!(read.settings.sidebar_collapsed);
+        assert!(
+            Store::parse(&store.export().unwrap())
+                .unwrap()
+                .settings
+                .last_connected
+                .is_empty()
+        );
+        assert!(store.record_connection(id + 1, 1720000000).is_err());
+        store.settings.theme = "unknown".into();
+        assert!(store.validate().is_err());
+        store.settings.theme = "system".into();
+        store.settings.server_view = "unknown".into();
+        assert!(store.validate().is_err());
+    }
     #[test]
     fn round_trip_and_import_reviews_commands() {
         let mut store = Store::default();

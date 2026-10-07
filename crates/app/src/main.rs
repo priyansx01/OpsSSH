@@ -1,10 +1,16 @@
 //! GPU workspace and headless development tools for the local renderer spike.
 
+#[cfg(feature = "gui")]
+mod connection_form;
+#[cfg(any(test, feature = "gui"))]
 mod connections;
+#[cfg(feature = "gui")]
+mod design;
 #[cfg(feature = "gui")]
 mod files;
 #[cfg(feature = "gui")]
 mod gui;
+#[cfg(feature = "gui")]
 mod localization;
 
 use std::hint::black_box;
@@ -34,9 +40,7 @@ fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         }
         [command] if command == "local" => launch(true),
         #[cfg(feature = "capture")]
-        [command, path] if command == "snapshot" || command == "snapshot-local" => {
-            gui::capture(command == "snapshot-local", path.into())
-        }
+        [command, path] if command.starts_with("snapshot") => gui::capture(command, path.into()),
         [command] if command == "--help" || command == "-h" => help(),
         [command] if command == "diagnostics" => diagnostics(),
         [command] if command == "bench" => benchmark(100_000)?,

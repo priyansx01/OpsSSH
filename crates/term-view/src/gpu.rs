@@ -1,3 +1,4 @@
+use opsssh_i18n::text as tr;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,7 +11,12 @@ use gpui::{
     ScrollWheelEvent, ShapedLine, Subscription, Task, TextRun, UTF16Selection, UnderlineStyle,
     Window, canvas, div, fill, font, point, prelude::*, px, rgb, rgba, size,
 };
-use gpui_component::input::{Input, InputState};
+use gpui_component::{
+    ActiveTheme, Disableable, Sizable,
+    button::{Button, ButtonVariants},
+    checkbox::Checkbox,
+    input::{Input, InputState},
+};
 use opsssh_platform::{LocalShellOptions, terminal_font_family};
 use opsssh_ssh_core::{ConnectionOptions, PromptKind, SecretString, SshCommand, SshEvent};
 use opsssh_term_core::{
@@ -121,6 +127,29 @@ impl TerminalView {
     pub fn connection_generation(&self) -> u64 {
         self.connection_generation
     }
+    /// A concise status label suitable for workspace session tabs.
+    pub fn connection_status(&self) -> String {
+        tr(match &self.prompt {
+            Some(ConnectionPrompt::Host { .. }) => "term-status-verify",
+            Some(ConnectionPrompt::Authentication { .. }) => "term-status-auth",
+            None => match self.state() {
+                SessionState::Connected if self.error.is_none() => "term-status-connected",
+                SessionState::Reconnecting => "term-status-reconnecting",
+                _ if self.error.is_some() => "term-status-error",
+                SessionState::Connecting => "term-status-connecting",
+                SessionState::Authenticating => "term-status-signing-in",
+                SessionState::Connected => "term-status-connected",
+                SessionState::Disconnected => "term-status-disconnected",
+                SessionState::NeedsUserAction => "term-status-action",
+                SessionState::Closed => "term-status-ended",
+            },
+        })
+    }
+
+    pub fn session_state(&self) -> SessionState {
+        self.state()
+    }
+
     pub fn at_shell_prompt(&self) -> bool {
         self.at_prompt
     }
@@ -369,47 +398,117 @@ impl TerminalView {
     }
 
     fn prompt_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = cx.theme().semantic_tokens().colors;
+        let warning = cx.theme().warning;
         let panel = div()
-            .p_4()
+            .id("connection-prompt-panel")
+            .max_h(px(420.))
+            .overflow_y_scroll()
+            .px_5()
+            .py_4()
             .border_t_1()
-            .border_color(rgb(0x425162))
-            .bg(rgb(0x1b2530))
+            .border_color(colors.border)
+            .bg(colors.surface)
+            .text_color(colors.surface_foreground)
             .flex()
             .flex_col()
-            .gap_3();
+            .gap_3()
+            .flex_shrink_0();
         match &self.prompt {
             Some(ConnectionPrompt::Host {
                 host, fingerprint, ..
             }) => panel
-                .child("Verify this server before connecting")
-                .child(host.clone())
-                .child(fingerprint.clone())
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(warning)
+                        .child(tr("term-server-identity")),
+                )
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child(tr("term-verify-server")),
+                )
+                .child(div().text_sm().child(format!("First connection to {host}")))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_3()
+                        .p_3()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.background)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(colors.muted_foreground)
+                                        .child(tr("term-fingerprint")),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(terminal_font_family())
+                                        .text_sm()
+                                        .child(fingerprint.clone()),
+                                ),
+                        )
+                        .child(
+                            Button::new("copy-fingerprint")
+                                .small()
+                                .outline()
+                                .label(tr("term-copy-fingerprint"))
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    if let Some(ConnectionPrompt::Host { fingerprint, .. }) =
+                                        &view.prompt
+                                    {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            fingerprint.clone(),
+                                        ));
+                                    }
+                                })),
+                        ),
+                )
                 .child(
                     div()
                         .text_sm()
-                        .child("Check this fingerprint with your server administrator."),
+                        .text_color(colors.muted_foreground)
+                        .child(tr("term-trust-help")),
                 )
                 .child(
                     div()
                         .flex()
-                        .gap_3()
+                        .flex_wrap()
+                        .gap_2()
                         .child(
-                            gpui_component::button::Button::new("trust-once")
-                                .label("Trust once")
-                                .on_click(cx.listener(|view, _, window, cx| {
-                                    view.trust_host(false, window, cx)
-                                })),
-                        )
-                        .child(
-                            gpui_component::button::Button::new("trust-save")
-                                .label("Trust and save")
+                            Button::new("trust-save")
+                                .primary()
+                                .label(tr("term-trust-save"))
                                 .on_click(cx.listener(|view, _, window, cx| {
                                     view.trust_host(true, window, cx)
                                 })),
                         )
                         .child(
-                            gpui_component::button::Button::new("cancel-trust")
-                                .label("Cancel")
+                            Button::new("trust-once")
+                                .outline()
+                                .label(tr("term-trust-once"))
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.trust_host(false, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("cancel-trust")
+                                .ghost()
+                                .label(tr("term-cancel-connection"))
                                 .on_click(cx.listener(|view, _, window, cx| {
                                     view.cancel_prompt(window, cx)
                                 })),
@@ -424,52 +523,80 @@ impl TerminalView {
                 can_save,
                 ..
             }) => panel
-                .child(if name.is_empty() {
-                    "Sign in".to_string()
-                } else {
-                    name.clone()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(colors.muted_foreground)
+                        .child(tr("term-authentication")),
+                )
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child(if name.is_empty() {
+                            tr("term-sign-in-title")
+                        } else {
+                            name.clone()
+                        }),
+                )
+                .when(!instructions.is_empty(), |panel| {
+                    panel.child(
+                        div()
+                            .text_sm()
+                            .text_color(colors.muted_foreground)
+                            .child(instructions.clone()),
+                    )
                 })
-                .child(instructions.clone())
                 .children(fields.iter().map(|(label, input)| {
                     div()
+                        .w_full()
+                        .max_w(px(640.))
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(label.clone())
-                        .child(Input::new(input))
+                        .child(div().text_sm().child(label.clone()))
+                        .child(Input::new(input).aria_label(label.clone()))
                 }))
                 .when(*can_save, |panel| {
                     panel.child(
-                        gpui_component::button::Button::new("save-credential")
-                            .label(if *save {
-                                "✓ Save this credential on your computer"
-                            } else {
-                                "Save this credential on your computer"
-                            })
-                            .on_click(cx.listener(|view, _, _, cx| {
+                        Checkbox::new("save-credential")
+                            .checked(*save)
+                            .label(tr("term-save-credential"))
+                            .on_click(cx.listener(|view, checked, _, cx| {
                                 if let Some(ConnectionPrompt::Authentication { save, .. }) =
                                     &mut view.prompt
                                 {
-                                    *save = !*save;
+                                    *save = *checked;
                                     cx.notify();
                                 }
                             })),
                     )
                 })
+                .when(!*can_save, |panel| {
+                    panel.child(
+                        div()
+                            .text_xs()
+                            .text_color(colors.muted_foreground)
+                            .child(tr("term-otp-help")),
+                    )
+                })
                 .child(
                     div()
                         .flex()
-                        .gap_3()
+                        .flex_wrap()
+                        .gap_2()
                         .child(
-                            gpui_component::button::Button::new("submit-auth")
-                                .label("Continue")
+                            Button::new("submit-auth")
+                                .primary()
+                                .label(tr("term-continue"))
                                 .on_click(
                                     cx.listener(|view, _, window, cx| view.submit_auth(window, cx)),
                                 ),
                         )
                         .child(
-                            gpui_component::button::Button::new("cancel-auth")
-                                .label("Cancel")
+                            Button::new("cancel-auth")
+                                .ghost()
+                                .label(tr("term-cancel-connection"))
                                 .on_click(cx.listener(|view, _, window, cx| {
                                     view.cancel_prompt(window, cx)
                                 })),
@@ -481,23 +608,70 @@ impl TerminalView {
     }
 
     fn paste_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = cx.theme().semantic_tokens().colors;
         let text = self.paste_preview.as_deref().unwrap_or_default();
+        let preview = text.chars().take(500).collect::<String>();
+        let truncated = text.chars().count() > 500;
         div()
-            .p_4()
-            .bg(rgb(0x1b2530))
+            .px_5()
+            .py_4()
+            .border_t_1()
+            .border_color(colors.border)
+            .bg(colors.surface)
+            .text_color(colors.surface_foreground)
             .flex()
             .flex_col()
-            .gap_2()
-            .child("Review multiline paste — it can execute commands")
-            .child(text.chars().take(500).collect::<String>())
+            .gap_3()
+            .flex_shrink_0()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().warning)
+                    .child(tr("term-review-paste")),
+            )
+            .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(format!(
+                "Paste {} lines into this session?",
+                text.lines().count()
+            )))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(colors.muted_foreground)
+                    .child(tr("term-paste-help")),
+            )
+            .child(
+                div()
+                    .id("paste-preview-content")
+                    .max_h(px(144.))
+                    .overflow_y_scroll()
+                    .p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.background)
+                    .font_family(terminal_font_family())
+                    .text_sm()
+                    .child(preview),
+            )
+            .when(truncated, |panel| {
+                panel.child(
+                    div()
+                        .text_xs()
+                        .text_color(colors.muted_foreground)
+                        .child(tr("term-paste-truncated")),
+                )
+            })
             .child(
                 div()
                     .flex()
-                    .gap_3()
+                    .flex_wrap()
+                    .gap_2()
                     .child(
-                        gpui_component::button::Button::new("confirm-paste")
-                            .label("Paste")
-                            .on_click(cx.listener(|view, _, _, cx| {
+                        Button::new("confirm-paste")
+                            .primary()
+                            .label(tr("term-paste-text"))
+                            .disabled(!self.state().accepts_input())
+                            .on_click(cx.listener(|view, _, window, cx| {
                                 if let Some(text) = view.paste_preview.take() {
                                     if let Some(session) = &view.session
                                         && let Ok(bytes) =
@@ -505,15 +679,18 @@ impl TerminalView {
                                     {
                                         view.send(bytes, cx);
                                     }
+                                    view.focus.focus(window, cx);
                                     cx.notify();
                                 }
                             })),
                     )
                     .child(
-                        gpui_component::button::Button::new("cancel-paste")
-                            .label("Cancel")
-                            .on_click(cx.listener(|view, _, _, cx| {
+                        Button::new("cancel-paste")
+                            .ghost()
+                            .label(tr("cancel"))
+                            .on_click(cx.listener(|view, _, window, cx| {
                                 view.paste_preview = None;
+                                view.focus.focus(window, cx);
                                 cx.notify();
                             })),
                     ),
@@ -698,15 +875,40 @@ impl TerminalView {
     }
 
     fn selection_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = cx.theme().semantic_tokens().colors;
         div()
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .flex_shrink_0()
             .px_3()
-            .py_1()
-            .bg(rgb(0x1b2530))
+            .py_2()
+            .border_t_1()
+            .border_color(colors.border)
+            .bg(colors.surface)
+            .text_color(colors.surface_foreground)
             .flex()
+            .items_center()
+            .flex_wrap()
             .gap_2()
             .child(
-                gpui_component::button::Button::new("selection-copy")
-                    .label("Copy")
+                div()
+                    .text_xs()
+                    .text_color(colors.muted_foreground)
+                    .mr_2()
+                    .child(if self.selection.is_some() {
+                        tr("term-selection")
+                    } else {
+                        tr("term-actions")
+                    }),
+            )
+            .child(
+                Button::new("selection-copy")
+                    .small()
+                    .ghost()
+                    .disabled(self.selection.is_none())
+                    .label(tr("term-copy"))
                     .on_click(cx.listener(|view, _, _, cx| {
                         view.copy(cx);
                         view.context_menu = false;
@@ -714,8 +916,11 @@ impl TerminalView {
                     })),
             )
             .child(
-                gpui_component::button::Button::new("selection-paste")
-                    .label("Paste")
+                Button::new("selection-paste")
+                    .small()
+                    .ghost()
+                    .disabled(!self.state().accepts_input())
+                    .label(tr("term-paste"))
                     .on_click(cx.listener(|view, _, _, cx| {
                         if let Some(item) = cx.read_from_clipboard() {
                             view.paste_item(item, cx);
@@ -725,8 +930,10 @@ impl TerminalView {
                     })),
             )
             .child(
-                gpui_component::button::Button::new("selection-all")
-                    .label("Select all")
+                Button::new("selection-all")
+                    .small()
+                    .ghost()
+                    .label(tr("term-select-all"))
                     .on_click(cx.listener(|view, _, _, cx| {
                         if let Some(last) = view.snapshot.rows.last() {
                             view.selection = Some(Selection::Linear {
@@ -741,8 +948,10 @@ impl TerminalView {
                     })),
             )
             .child(
-                gpui_component::button::Button::new("selection-close")
-                    .label("Dismiss")
+                Button::new("selection-close")
+                    .small()
+                    .ghost()
+                    .label(tr("term-dismiss"))
                     .on_click(cx.listener(|view, _, _, cx| {
                         view.context_menu = false;
                         view.selection = None;
@@ -1099,23 +1308,36 @@ impl Render for TerminalView {
         let prepaint_view = cx.entity();
         let paint_view = cx.entity();
         let state = self.state();
+        let colors = cx.theme().semantic_tokens().colors;
+        let status_label = self.connection_status();
+        let status_color = match state {
+            SessionState::Reconnecting | SessionState::NeedsUserAction => cx.theme().warning,
+            _ if self.error.is_some() => colors.destructive,
+            SessionState::Connected => cx.theme().success,
+            _ => colors.muted_foreground,
+        };
         let status = self.error.clone().unwrap_or_else(|| match state {
             SessionState::Connected => self.title.clone(),
-            SessionState::Closed => "Shell exited — return home to open another terminal".into(),
-            _ => crate::SessionPresentation::from(state)
-                .message
-                .unwrap_or("Starting session…")
-                .into(),
+            SessionState::Closed => tr("term-shell-ended"),
+            _ => tr(match state {
+                SessionState::Connecting => "session-connecting",
+                SessionState::Authenticating => "session-authenticating",
+                SessionState::Disconnected => "session-disconnected",
+                SessionState::Reconnecting => "session-reconnecting",
+                SessionState::NeedsUserAction => "session-needs-user-action",
+                _ => "session-closed",
+            }),
         });
         // Retain focus listeners for the lifetime of this view.
         let _ = &self.subscriptions;
         div()
             .id("terminal")
+            .relative()
             .size_full()
             .flex()
             .flex_col()
             .bg(rgb(0x12141a))
-            .text_color(rgb(0xdcdcdc))
+            .text_color(colors.foreground)
             .track_focus(&self.focus)
             .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| {
                 if view.state().accepts_input() {
@@ -1128,12 +1350,37 @@ impl Render for TerminalView {
             .on_key_up(cx.listener(Self::key_up))
             .child(
                 div()
-                    .h(px(32.))
+                    .min_h(px(40.))
                     .px_3()
+                    .py_2()
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .bg(colors.surface)
                     .flex()
-                    .items_center()
+                    .items_start()
+                    .gap_3()
                     .text_sm()
-                    .child(status),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .flex_shrink_0()
+                            .child(div().size(px(6.)).rounded_full().bg(status_color))
+                            .child(div().text_color(status_color).child(status_label)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(if self.error.is_some() {
+                                status_color
+                            } else {
+                                colors.muted_foreground
+                            })
+                            .child(status),
+                    ),
             )
             .child(
                 div()
@@ -1257,15 +1504,23 @@ impl Render for TerminalView {
                     ),
             )
             .when(!self.composition.text.is_empty(), |element| {
-                element.child(div().h(px(26.)).px_3().child(self.composition.text.clone()))
+                element.child(
+                    div()
+                        .min_h(px(26.))
+                        .px_3()
+                        .py_1()
+                        .bg(colors.surface)
+                        .text_color(colors.surface_foreground)
+                        .child(self.composition.text.clone()),
+                )
             })
             .when(self.prompt.is_some(), |element| {
                 element.child(self.prompt_panel(cx))
             })
-            .child(div().h(px(36.)).flex_shrink_0().when(
+            .when(
                 self.prompt.is_none() && (self.context_menu || self.selection.is_some()),
                 |element| element.child(self.selection_panel(cx)),
-            ))
+            )
             .when(self.paste_preview.is_some(), |element| {
                 element.child(self.paste_panel(cx))
             })

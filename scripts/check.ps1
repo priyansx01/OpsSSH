@@ -27,7 +27,7 @@ try {
     }
     & cargo fmt --all -- --check
     if ($LASTEXITCODE -ne 0) { throw 'Formatting check failed' }
-    & cargo test --workspace --locked
+    & cargo test --workspace --all-features --locked
     if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
     & cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
     if ($LASTEXITCODE -ne 0) { throw 'Clippy failed' }

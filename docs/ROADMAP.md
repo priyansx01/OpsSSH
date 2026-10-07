@@ -13,8 +13,8 @@ truth and the decisions that refine that document.
 | 2: SSH terminal | Transport, authentication, strict host verification, OS vault, PTY resize and tmux implemented | Real-server and interactive acceptance |
 | 3: Full-screen acceptance | Protocol tests and fixture tooling available | Claude Code/neovim/htop/less direct and through tmux |
 | 4: Compatibility | Config, jump chains, approved proxy, certificates, CA/revocation and hashed known-host support implemented | OpenSSH/Dropbear/platform matrix; agent-backed security keys; forwarding and legacy opt-in |
-| 5: Servers | Persisted home/search/editor, environments, favorites, retained tabs and import/export implemented | Complete live-config and settings acceptance |
-| 6: Files/drops | Real SFTP, list/transfer/cancel/exclusive-write/resume policy and drop/PNG helpers implemented | Desktop file browser, drag/drop/image acceptance and explicit sudo workflow |
+| 5: Servers | Charcoal/ruby workspace, progressive forms, themes/settings, virtualized servers, retained tabs and import/export implemented | Complete novice, live-config and all-platform UI acceptance |
+| 6: Files/drops | Real SFTP, list/transfer/cancel/exclusive-write/resume policy and drop/PNG helpers implemented | Live desktop browser/transfer, drag/drop/image acceptance and explicit sudo workflow |
 | 7: Recovery | Tmux reconnect and deterministic recovery/VPN state policy implemented | Native sleep/network/VPN integration, tmux history and reconnect acceptance |
 | 8: Release | Three-platform CI, fixture/fuzz hooks and unsigned packages/notices/checksums configured | Accessibility, complete translations, signed installers and all-OS acceptance |
 
@@ -58,3 +58,5 @@ acceptance remains open.
 - The repository was published at the user's request. Commits use the configured
   human Git identity and no AI co-author attribution. Signing identities and
   production services require owner setup.
+
+The charcoal/ruby redesign and its validation limits are described in [UX.md](UX.md).
