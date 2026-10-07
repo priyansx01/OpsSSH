@@ -123,6 +123,11 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
                     if workspace.sessions.is_empty(){workspace.open_local(&OpenLocalTerminal,window,cx);}
                     let tab=workspace.sessions.last_mut().unwrap();
                     tab.name="Atlas development VM".into();tab.endpoint=Some("deploy@atlas.example.test:22".into());tab.environment="Development".into();tab.protected=true;tab.persistent_name=Some("harness".into());
+                    if screen.contains("clipboard") {
+                        let terminal=tab.terminal.clone();
+                        let timer=cx.background_executor().timer(std::time::Duration::from_millis(900));
+                        cx.spawn_in(window,async move|_,cx|{timer.await;let _=terminal.update_in(cx,|view,window,cx|view.preview_clipboard_menu(window,cx));}).detach();
+                    }
                     if screen.contains("infra") {tab.page=SessionPage::Infrastructure;tab.infrastructure=Some(cx.new(|cx|InfrastructureView::preview(window,cx)));}
                     if screen.contains("background") {workspace.navigation.hide(tab.id);}
                     if screen.contains("close") {let id=tab.id;let this=cx.entity().downgrade();window.on_next_frame(move|window,cx|{let _=this.update(cx,|this,cx|this.request_close(id,window,cx));});}

@@ -26,8 +26,11 @@ Ctrl/Cmd+Enter opens a local shell. Ctrl/Cmd+K opens home/search, Ctrl/Cmd+N add
 a server, and Ctrl/Cmd+W closes the active tab. Ctrl/Cmd+Shift+H returns home while
 retaining sessions. Ctrl+Shift+Q (Cmd+Q on macOS) quits.
 
-Select text by dragging; Alt+drag selects a rectangle. Ctrl/Cmd+C copies a
-selection, and Ctrl/Cmd+V or Shift+Insert pastes. Shift bypasses application
+Select text by dragging, then right-click for Copy, Paste, or Select all beside
+the pointer. Alt+drag selects a rectangle. Ctrl/Cmd+C copies a selection;
+Ctrl/Cmd+Shift+C copies without interrupting the shell. Ctrl/Cmd+V, Ctrl/Cmd+Shift+V,
+or Shift+Insert pastes. A simple focus click leaves Ctrl+C available to interrupt
+the shell. Shift bypasses application
 mouse reporting for local selection/scrollback. Input is blocked while disconnected
 and is never queued for later replay. Multiline paste without bracketed-paste mode
 requires review. Ctrl/Cmd-click opens HTTP/HTTPS terminal hyperlinks.

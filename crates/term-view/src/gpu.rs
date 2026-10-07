@@ -16,6 +16,7 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
     input::{Input, InputState},
+    menu::{ContextMenuExt, PopupMenuItem},
 };
 use opsssh_platform::{LocalShellOptions, terminal_font_family};
 use opsssh_ssh_core::{ConnectionOptions, PromptKind, SecretString, SshCommand, SshEvent};
@@ -84,7 +85,6 @@ pub struct TerminalView {
     connection_generation: u64,
     at_prompt: bool,
     paste_preview: Option<String>,
-    context_menu: bool,
     error: Option<String>,
     title: String,
     frame_pending: bool,
@@ -213,6 +213,36 @@ impl TerminalView {
         self.focus.focus(window, cx);
     }
 
+    /// Open the real context menu for development-only native render captures.
+    #[cfg(feature = "test-support")]
+    pub fn preview_clipboard_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(row) = self.snapshot.rows.first()
+            && !row.cells.is_empty()
+        {
+            self.selection = Some(Selection::Linear {
+                start: Position { row: 0, column: 0 },
+                end: Position {
+                    row: 0,
+                    column: 9.min(row.cells.len() - 1),
+                },
+            });
+        }
+        let position = self.bounds.origin + point(px(120.), px(60.));
+        window.defer(cx, move |window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Right,
+                    position,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+        });
+        cx.notify();
+    }
+
     fn start(
         remote: Option<ConnectionOptions>,
         window: &mut Window,
@@ -293,7 +323,6 @@ impl TerminalView {
             connection_generation: 0,
             at_prompt: false,
             paste_preview: None,
-            context_menu: false,
             error: None,
             title: "Local terminal".into(),
             frame_pending: false,
@@ -887,12 +916,30 @@ impl TerminalView {
     fn copy(&mut self, cx: &mut Context<Self>) {
         if let Some(selection) = self.selection
             && let Ok(text) = self.snapshot.copy_selection(selection)
+            && !text.is_empty()
         {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
 
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.anchor = None;
+        if let Some(last) = self.snapshot.rows.last() {
+            self.selection = Some(Selection::Linear {
+                start: Position { row: 0, column: 0 },
+                end: Position {
+                    row: self.snapshot.rows.len() - 1,
+                    column: last.cells.len().saturating_sub(1),
+                },
+            });
+            cx.notify();
+        }
+    }
+
     fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if !self.state().accepts_input() || self.prompt.is_some() {
+            return;
+        }
         if let Some(session) = &self.session {
             if !session.modes().bracketed_paste && (text.contains('\n') || text.contains('\r')) {
                 self.paste_preview = Some(text.to_string());
@@ -902,7 +949,10 @@ impl TerminalView {
             match encode_paste(session.state(), session.modes(), text) {
                 Ok(bytes) => {
                     self.selection = None;
+                    self.anchor = None;
+                    session.scroll_to_bottom();
                     self.send(bytes, cx);
+                    cx.notify();
                 }
                 Err(error) => {
                     self.error = Some(error.to_string());
@@ -928,93 +978,6 @@ impl TerminalView {
         }
     }
 
-    fn selection_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let colors = cx.theme().semantic_tokens().colors;
-        div()
-            .absolute()
-            .bottom_0()
-            .left_0()
-            .right_0()
-            .flex_shrink_0()
-            .px_3()
-            .py_2()
-            .border_t_1()
-            .border_color(colors.border)
-            .bg(colors.surface)
-            .text_color(colors.surface_foreground)
-            .flex()
-            .items_center()
-            .flex_wrap()
-            .gap_2()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(colors.muted_foreground)
-                    .mr_2()
-                    .child(if self.selection.is_some() {
-                        tr("term-selection")
-                    } else {
-                        tr("term-actions")
-                    }),
-            )
-            .child(
-                Button::new("selection-copy")
-                    .small()
-                    .ghost()
-                    .disabled(self.selection.is_none())
-                    .label(tr("term-copy"))
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.copy(cx);
-                        view.context_menu = false;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Button::new("selection-paste")
-                    .small()
-                    .ghost()
-                    .disabled(!self.state().accepts_input())
-                    .label(tr("term-paste"))
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        if let Some(item) = cx.read_from_clipboard() {
-                            view.paste_item(item, cx);
-                        }
-                        view.context_menu = false;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Button::new("selection-all")
-                    .small()
-                    .ghost()
-                    .label(tr("term-select-all"))
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        if let Some(last) = view.snapshot.rows.last() {
-                            view.selection = Some(Selection::Linear {
-                                start: Position { row: 0, column: 0 },
-                                end: Position {
-                                    row: view.snapshot.rows.len() - 1,
-                                    column: last.cells.len().saturating_sub(1),
-                                },
-                            });
-                            cx.notify();
-                        }
-                    })),
-            )
-            .child(
-                Button::new("selection-close")
-                    .small()
-                    .ghost()
-                    .label(tr("term-dismiss"))
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.context_menu = false;
-                        view.selection = None;
-                        cx.notify();
-                    })),
-            )
-            .into_any_element()
-    }
-
     fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if self.prompt.is_some() || self.paste_preview.is_some() {
             return;
@@ -1033,7 +996,7 @@ impl TerminalView {
         {
             return;
         }
-        if primary && key.key == "c" && self.selection.is_some() {
+        if primary && key.key == "c" && (self.selection.is_some() || key.modifiers.shift) {
             self.copy(cx);
             cx.stop_propagation();
             return;
@@ -1153,7 +1116,6 @@ impl TerminalView {
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.focus.focus(window, cx);
-        self.context_menu = false;
         if event.modifiers.control || event.modifiers.platform {
             let position = self.position(event.position);
             if let Some(uri) = self
@@ -1174,24 +1136,27 @@ impl TerminalView {
         }
         let position = self.position(event.position);
         self.anchor = Some((position, event.modifiers.alt));
-        self.selection = Some(Selection::Linear {
-            start: position,
-            end: position,
-        });
+        // A focus click is not a selection: Ctrl+C must still interrupt the shell.
+        self.selection = None;
         cx.notify();
     }
 
     fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.mouse_report(event.position, 0, true, event.modifiers, cx) {
+        let selecting = self.anchor.take().is_some();
+        if selecting {
             return;
         }
-        self.anchor = None;
+        self.mouse_report(event.position, 0, true, event.modifiers, cx);
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if let Some((start, rectangle)) = self.anchor {
+            if event.pressed_button != Some(MouseButton::Left) {
+                self.anchor = None;
+                return;
+            }
             let end = self.position(event.position);
-            self.selection = Some(if rectangle {
+            self.selection = (start != end).then_some(if rectangle {
                 Selection::Rectangle { start, end }
             } else {
                 Selection::Linear { start, end }
@@ -1361,6 +1326,7 @@ impl Render for TerminalView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let prepaint_view = cx.entity();
         let paint_view = cx.entity();
+        let menu_view = cx.entity().downgrade();
         let state = self.state();
         let colors = cx.theme().semantic_tokens().colors;
         let status_label = self.connection_status();
@@ -1456,15 +1422,17 @@ impl Render for TerminalView {
             })
             .child(
                 div()
+                    .id("terminal-content")
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
+                    .cursor_text()
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
                     .on_mouse_down(
                         MouseButton::Right,
-                        cx.listener(|view, _, _, cx| {
-                            view.context_menu = true;
-                            cx.notify();
+                        cx.listener(|view, _, window, cx| {
+                            view.anchor = None;
+                            view.focus.focus(window, cx);
                         }),
                     )
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
@@ -1573,7 +1541,55 @@ impl Render for TerminalView {
                             },
                         )
                         .size_full(),
-                    ),
+                    )
+                    .context_menu(move |menu, _, cx| {
+                        let Some(view) = menu_view.upgrade() else {
+                            return menu;
+                        };
+                        let terminal = view.read(cx);
+                        let copy_enabled = terminal.selection.is_some();
+                        let paste_enabled = terminal.state().accepts_input()
+                            && terminal.prompt.is_none()
+                            && terminal.paste_preview.is_none()
+                            && cx.read_from_clipboard().is_some();
+                        let copy_view = menu_view.clone();
+                        let paste_view = menu_view.clone();
+                        let select_view = menu_view.clone();
+                        menu.item(
+                            PopupMenuItem::new(tr("term-copy"))
+                                .disabled(!copy_enabled)
+                                .on_click(move |_, window, cx| {
+                                    let _ = copy_view.update(cx, |view, cx| {
+                                        view.copy(cx);
+                                        view.focus.focus(window, cx);
+                                    });
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new(tr("term-paste"))
+                                .disabled(!paste_enabled)
+                                .on_click(move |_, window, cx| {
+                                    let _ = paste_view.update(cx, |view, cx| {
+                                        if let Some(item) = cx.read_from_clipboard() {
+                                            view.paste_item(item, cx);
+                                        }
+                                        view.focus.focus(window, cx);
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                        .separator()
+                        .item(
+                            PopupMenuItem::new(tr("term-select-all")).on_click(
+                                move |_, window, cx| {
+                                    let _ = select_view.update(cx, |view, cx| {
+                                        view.select_all(cx);
+                                        view.focus.focus(window, cx);
+                                    });
+                                },
+                            ),
+                        )
+                    }),
             )
             .when(!self.composition.text.is_empty(), |element| {
                 element.child(
@@ -1589,10 +1605,6 @@ impl Render for TerminalView {
             .when(self.prompt.is_some(), |element| {
                 element.child(self.prompt_panel(cx))
             })
-            .when(
-                self.prompt.is_none() && (self.context_menu || self.selection.is_some()),
-                |element| element.child(self.selection_panel(cx)),
-            )
             .when(self.paste_preview.is_some(), |element| {
                 element.child(self.paste_panel(cx))
             })
@@ -1757,5 +1769,259 @@ impl EntityInputHandler for TerminalView {
     }
     fn paste(&mut self, item: ClipboardItem, _: &mut Window, cx: &mut Context<Self>) {
         self.paste_item(item, cx);
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod clipboard_tests {
+    use super::*;
+    use gpui::{Entity, TestAppContext, VisualTestContext};
+    use opsssh_term_core::Cell;
+
+    fn fixture(window: &mut Window, cx: &mut Context<TerminalView>) -> TerminalView {
+        // Invalid options fail before opening any SSH connection.
+        let mut view =
+            TerminalView::connect(ConnectionOptions::new("", "", PathBuf::new()), window, cx);
+        view.disconnect(cx);
+        view.snapshot.rows = ["alpha beta", "gamma delta"]
+            .into_iter()
+            .map(|text| {
+                Arc::new(Row {
+                    cells: text
+                        .chars()
+                        .map(|character| Cell {
+                            text: character.to_string(),
+                            ..Cell::default()
+                        })
+                        .collect(),
+                    soft_wrapped: false,
+                })
+            })
+            .collect();
+        view
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
+
+    fn shortcut(cx: &mut VisualTestContext, keys: &str) {
+        let primary = if opsssh_platform::info().primary_modifier == "Cmd" {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        cx.simulate_keystrokes(&keys.replace("primary", primary));
+    }
+
+    fn cell(
+        view: &Entity<TerminalView>,
+        cx: &VisualTestContext,
+        row: usize,
+        column: usize,
+    ) -> Point<Pixels> {
+        view.read_with(cx, |view, _| {
+            point(
+                view.bounds.left() + view.cell_width * (column as f32 + 0.5),
+                view.bounds.top() + view.cell_height * (row as f32 + 0.5),
+            )
+        })
+    }
+
+    fn drag(
+        view: &Entity<TerminalView>,
+        cx: &mut VisualTestContext,
+        start: (usize, usize),
+        end: (usize, usize),
+        modifiers: gpui::Modifiers,
+    ) {
+        let start = cell(view, cx, start.0, start.1);
+        let end = cell(view, cx, end.0, end.1);
+        cx.simulate_mouse_down(start, MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(end, Some(MouseButton::Left), modifiers);
+        cx.simulate_mouse_up(end, MouseButton::Left, modifiers);
+        draw(cx);
+    }
+
+    #[gpui::test]
+    fn drag_then_right_click_copy_uses_the_selection_and_restores_focus(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(fixture);
+        draw(cx);
+        drag(&view, cx, (0, 0), (0, 4), Default::default());
+        let selection = view.read_with(cx, |view, _| view.selection);
+        let pointer = cell(&view, cx, 1, 8);
+        cx.simulate_mouse_down(pointer, MouseButton::Right, Default::default());
+        draw(cx);
+        assert_eq!(view.read_with(cx, |view, _| view.selection), selection);
+        // Click Copy beside the pointer, exercising the actual mouse menu path.
+        cx.simulate_click(pointer + point(px(24.), px(17.)), Default::default());
+        draw(cx);
+        cx.update(|window, cx| {
+            assert_eq!(
+                cx.read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some("alpha")
+            );
+            assert_eq!(window.focused(cx), Some(view.read(cx).focus.clone()));
+        });
+    }
+
+    #[gpui::test]
+    fn reverse_and_rectangle_drags_copy_displayed_text(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(fixture);
+        draw(cx);
+        drag(&view, cx, (1, 4), (0, 0), Default::default());
+        shortcut(cx, "primary-c");
+        cx.update(|_, cx| {
+            assert_eq!(
+                cx.read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some("alpha beta\ngamma")
+            );
+        });
+        drag(
+            &view,
+            cx,
+            (0, 0),
+            (1, 4),
+            gpui::Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+        );
+        shortcut(cx, "primary-shift-c");
+        cx.update(|_, cx| {
+            assert_eq!(
+                cx.read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some("alpha\ngamma")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn focus_click_and_escape_do_not_create_or_destroy_a_selection(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(fixture);
+        draw(cx);
+        let pointer = cell(&view, cx, 0, 2);
+        cx.simulate_click(pointer, Default::default());
+        assert!(view.read_with(cx, |view, _| view.selection.is_none()));
+        cx.update(|_, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string("keep clipboard".into()))
+        });
+        shortcut(cx, "primary-shift-c");
+        drag(&view, cx, (0, 0), (0, 4), Default::default());
+        let selection = view.read_with(cx, |view, _| view.selection);
+        cx.simulate_mouse_down(pointer, MouseButton::Right, Default::default());
+        draw(cx);
+        cx.simulate_keystrokes("escape");
+        draw(cx);
+        assert_eq!(view.read_with(cx, |view, _| view.selection), selection);
+        cx.update(|window, cx| {
+            assert_eq!(
+                cx.read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some("keep clipboard")
+            );
+            assert_eq!(window.focused(cx), Some(view.read(cx).focus.clone()));
+        });
+    }
+
+    #[gpui::test]
+    fn menu_paste_and_keyboard_shortcuts_share_multiline_confirmation(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let session = Session::local(LocalShellOptions::default()).unwrap();
+        let (view, cx) = cx.add_window_view(fixture);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.stopped = false;
+                view.session = Some(session);
+            });
+            cx.write_to_clipboard(ClipboardItem::new_string("first\nsecond".into()));
+        });
+        draw(cx);
+        let pointer = cell(&view, cx, 0, 2);
+        cx.simulate_mouse_down(pointer, MouseButton::Right, Default::default());
+        draw(cx);
+        // Paste is the second row, directly beside the original pointer.
+        cx.simulate_click(pointer + point(px(24.), px(45.)), Default::default());
+        draw(cx);
+        cx.update(|window, cx| {
+            assert_eq!(
+                view.read(cx).paste_preview.as_deref(),
+                Some("first\nsecond")
+            );
+            assert_eq!(window.focused(cx), Some(view.read(cx).focus.clone()));
+        });
+        for keys in ["primary-v", "primary-shift-v", "shift-insert"] {
+            cx.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.paste_preview = None;
+                    view.focus.focus(window, cx);
+                    cx.notify();
+                });
+            });
+            draw(cx);
+            shortcut(cx, keys);
+            assert_eq!(
+                view.read_with(cx, |view, _| view.paste_preview.clone())
+                    .as_deref(),
+                Some("first\nsecond")
+            );
+        }
+        // A single-line paste should go straight to the PTY, once, without review.
+        let command = if opsssh_platform::info().os == "windows" {
+            "Write-Output ('OPSSSH_' + 'PASTE_OK')"
+        } else {
+            "printf 'OPSSSH_%s\\n' PASTE_OK"
+        };
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.paste_preview = None;
+                view.focus.focus(window, cx);
+                cx.notify();
+            });
+            cx.write_to_clipboard(ClipboardItem::new_string(command.into()));
+        });
+        draw(cx);
+        let pointer = cell(&view, cx, 0, 2);
+        cx.simulate_mouse_down(pointer, MouseButton::Right, Default::default());
+        draw(cx);
+        cx.simulate_click(pointer + point(px(24.), px(45.)), Default::default());
+        draw(cx);
+        assert!(view.read_with(cx, |view, _| view.paste_preview.is_none()));
+        cx.simulate_keystrokes("enter");
+        let deadline = Instant::now() + std::time::Duration::from_secs(15);
+        let mut found = false;
+        while Instant::now() < deadline {
+            let text = view.read_with(cx, |view, _| {
+                view.session
+                    .as_ref()
+                    .unwrap()
+                    .snapshot()
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.cells.iter())
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+            });
+            if text.contains("OPSSSH_PASTE_OK") {
+                found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        cx.update(|_, cx| view.update(cx, |view, cx| view.disconnect(cx)));
+        assert!(found, "right-click paste did not reach the interactive PTY");
     }
 }

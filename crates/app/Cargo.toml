@@ -10,7 +10,7 @@ publish.workspace = true
 [features]
 default = ["gui"]
 gui = ["dep:gpui", "dep:gpui-component", "dep:gpui-kit-assets", "opsssh-platform/gui", "opsssh-term-view/gui"]
-capture = ["gui", "gpui/test-support", "opsssh-platform/capture"]
+capture = ["gui", "gpui/test-support", "opsssh-platform/capture", "opsssh-term-view/test-support"]
 
 [dependencies]
 opsssh-platform.workspace = true

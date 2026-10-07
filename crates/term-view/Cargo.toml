@@ -9,6 +9,7 @@ publish.workspace = true
 
 [features]
 gui = ["dep:gpui", "dep:gpui-component", "dep:opsssh-i18n", "opsssh-platform/gui"]
+test-support = ["gui", "gpui/test-support"]
 
 [dependencies]
 opsssh-term-core.workspace = true

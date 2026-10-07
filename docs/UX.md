@@ -102,3 +102,22 @@ connection form, and close-modal screens were inspected at 125% scaling with
 1280x820 and 1024x768 logical windows. File chrome was compacted after review to
 leave room for two grid rows or several list entries at the smaller size. Other
 OS/DPI and live Linux-server acceptance remain release checks.
+
+## Terminal clipboard
+
+Drag to select text, then right-click for the GPUI Kit Copy, Paste, and Select all
+menu beside the pointer. Selection remains visible while the menu is open;
+Copy, Paste, Select all, and Escape restore terminal focus. A focus click does
+not select a character, leaving Ctrl+C available to interrupt the shell.
+Alt+drag selects a rectangle; Shift+drag bypasses a terminal application's
+mouse reporting. Copy also supports Ctrl/Cmd+C and Ctrl/Cmd+Shift+C. Paste
+supports Ctrl/Cmd+V, Ctrl/Cmd+Shift+V, and Shift+Insert. Single-line text pastes
+immediately. Multiline text still requires review when bracketed paste is off,
+and disconnected sessions reject input.
+
+Four GPUI regressions cover actual mouse clicks on Copy and Paste, forward,
+reverse and rectangular selection, focus clicks, Escape, clipboard shortcuts,
+multiline review, and a real local PTY paste followed by Enter. The workspace
+suite passed 110 tests and strict Clippy passed. The native Windows right-click
+menu was rendered and inspected at 125% scaling. Reproduce that review with
+`snapshot-session-clipboard` using the development `capture` feature.
