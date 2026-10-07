@@ -73,6 +73,7 @@ pub struct AlacrittyTerminal {
     size: TerminalSize,
     generation: u64,
     rows: Vec<Arc<Row>>,
+    side_effects: crate::osc::Observer,
 }
 
 impl std::fmt::Debug for AlacrittyTerminal {
@@ -108,6 +109,7 @@ impl AlacrittyTerminal {
             size,
             generation: 0,
             rows: Vec::new(),
+            side_effects: crate::osc::Observer::default(),
         }
     }
 
@@ -202,6 +204,7 @@ impl TerminalBackend for AlacrittyTerminal {
         self.parser.advance(&mut self.term, bytes);
         self.generation += 1;
         let mut events = self.drain_events();
+        events.extend(self.side_effects.ingest(bytes));
         let after = self.sync_deadline().is_some();
         if before != after {
             events.push(TerminalEvent::SynchronizedOutput(after));
@@ -292,6 +295,7 @@ impl TerminalBackend for AlacrittyTerminal {
                 wide_continuation: cell
                     .flags
                     .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
+                hyperlink: cell.hyperlink().map(|link| link.uri().to_string()),
             };
         }
         for (index, update) in updates.into_iter().enumerate() {

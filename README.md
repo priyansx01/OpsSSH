@@ -3,7 +3,7 @@
 A Rust SSH workspace for people who work on remote servers: a fast server list,
 a responsive terminal, and SFTP with remote file drops.
 
-**Status: runnable local terminal spike; SSH and SFTP are not implemented.**
+**Status: development preview with local/SSH terminals and SFTP.**
 The desktop app uses GPUI, Alacritty's VT emulator, and real ConPTY/openpty.
 See [the roadmap](docs/ROADMAP.md) and [the original product intent](intent.md).
 
@@ -16,13 +16,21 @@ cargo run -p opsssh
 cargo run -p opsssh -- local
 ```
 
-The home screen contains labelled sample servers and an **Open local terminal**
-button. Ctrl/Cmd+Enter opens the local shell from home. Ctrl/Cmd+Shift+H returns
-home and closes the shell. Ctrl+Shift+Q (Cmd+Q on macOS) quits.
+The home screen reads saved servers and concrete aliases from SSH config. Add or
+edit a server, select authentication, and connect. Unknown host keys require an
+explicit trust decision; changed or revoked keys stop the connection. Passwords
+and passphrases are saved in the OS credential store only when you opt in. OTP
+responses are never saved.
+
+Ctrl/Cmd+Enter opens a local shell. Ctrl/Cmd+K opens home/search, Ctrl/Cmd+N adds
+a server, and Ctrl/Cmd+W closes the active tab. Ctrl/Cmd+Shift+H returns home while
+retaining sessions. Ctrl+Shift+Q (Cmd+Q on macOS) quits.
 
 Select text by dragging; Alt+drag selects a rectangle. Ctrl/Cmd+C copies a
 selection, and Ctrl/Cmd+V or Shift+Insert pastes. Shift bypasses application
-mouse reporting for local selection/scrollback. Input is blocked after exit.
+mouse reporting for local selection/scrollback. Input is blocked while disconnected
+and is never queued for later replay. Multiline paste without bracketed-paste mode
+requires review. Ctrl/Cmd-click opens HTTP/HTTPS terminal hyperlinks.
 
 ## Development tools
 
@@ -49,17 +57,26 @@ can contain local paths and shell output; review them before sharing.
 
 ## Implemented
 
-- GPUI home and terminal screens, fixed cell text, colors/styles, cursor, selection.
+- Persisted server editor, fuzzy search, environments, favorites, import/export,
+  SSH config aliases, quick-connect parsing, and retained terminal tabs.
+- GPUI terminal grid, colors/styles, cursor blinking, selection and clipboard actions.
 - Alacritty VT parsing, alternate screen, Unicode snapshots, 100,000-line history.
 - Shared unchanged rows, display-frame coalescing, 150 ms synchronized-output hold.
 - Background PTY/parser/writer workers, resize, process exit, and shell cleanup.
-- Cursor/control keys, selected Kitty enhancements, focus, bracketed paste, and
-  text/IME commit plumbing. OSC 52 can write but cannot read the clipboard.
-- Real PTY integration and protocol tests; three-platform CI configuration.
+- Cursor/control/function keys, selected Kitty enhancements, focus, bracketed paste,
+  UTF-16 IME composition editing, OSC 7/133 metadata and OSC 8 links. OSC 52 can
+  write but cannot read the clipboard.
+- Background SSH transport, password/key/agent/keyboard-interactive authentication,
+  certificates, strict known-host verification, jump chains and reviewed proxies.
+- SFTP listing/transfers, cancellation, exclusive creation, explicit overwrite and
+  identity-checked resume; drop quoting, private staging and PNG encoding.
+- Tmux reconnect with bounded backoff and disconnected input rejection.
+- Real PTY, SSH loopback and SFTP protocol tests, three-platform CI, compatibility
+  fixtures and unsigned package tooling.
 
-GPU performance, screen readers, native IMEs, monitor changes, and full-screen
-application acceptance still need validation. Function/keypad input, cursor
-blinking, persisted servers, SSH, vaults, and SFTP remain future work.
+GPU performance, screen readers, native IMEs, monitor changes, full-screen
+application acceptance and signed installers still need validation. This preview
+does not establish the compatibility or performance targets in `intent.md`.
 
 See [architecture](docs/ARCHITECTURE.md), [compatibility](docs/COMPATIBILITY.md),
 and [performance methodology](docs/PERFORMANCE.md). Windows leads development;

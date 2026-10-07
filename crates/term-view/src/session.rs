@@ -15,12 +15,13 @@ use opsssh_term_core::{
     TerminalSnapshot,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum SessionNotice {
     Updated,
     Event(TerminalEvent),
     Closed,
     Error(String),
+    Ssh(opsssh_ssh_core::SshEvent),
 }
 
 enum Command {

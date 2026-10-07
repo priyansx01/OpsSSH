@@ -36,6 +36,7 @@ pub enum Key {
     Delete,
     PageUp,
     PageDown,
+    Function(u8),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -67,6 +68,7 @@ pub struct InputModes {
 pub enum InputBlocked {
     NotConnected,
     UnsafePaste,
+    UnsupportedKey,
 }
 
 impl std::fmt::Display for InputBlocked {
@@ -74,6 +76,7 @@ impl std::fmt::Display for InputBlocked {
         match self {
             Self::NotConnected => f.write_str("session is not connected"),
             Self::UnsafePaste => f.write_str("paste contains a bracketed-paste control sequence"),
+            Self::UnsupportedKey => f.write_str("unsupported function key"),
         }
     }
 }
@@ -96,6 +99,9 @@ pub fn encode_key(
     kind: KeyEventKind,
 ) -> Result<Vec<u8>, InputBlocked> {
     require_connected(state)?;
+    if matches!(key, Key::Function(number) if !(1..=35).contains(&number)) {
+        return Err(InputBlocked::UnsupportedKey);
+    }
     let plain_control =
         matches!(key, Key::Enter | Key::Tab | Key::Backspace) && modifiers.parameter() == 1;
     let produces_text = matches!(key, Key::Character(_))
@@ -152,12 +158,47 @@ fn encode_kitty(key: Key, modifiers: Modifiers, kind: KeyEventKind, events: bool
         Key::Delete => (3, '~'),
         Key::PageUp => (5, '~'),
         Key::PageDown => (6, '~'),
+        Key::Function(1) => (1, 'P'),
+        Key::Function(2) => (1, 'Q'),
+        Key::Function(3) => (13, '~'),
+        Key::Function(4) => (1, 'S'),
+        Key::Function(number @ 5..=12) => (function_tilde(number), '~'),
+        Key::Function(number) => (57363 + u32::from(number), 'u'),
     };
     format!("\x1b[{code};{}{event}{final_byte}", modifiers.parameter()).into_bytes()
 }
 
 fn encode_legacy(key: Key, modifiers: Modifiers, application_cursor: bool) -> Vec<u8> {
     let parameter = modifiers.parameter();
+    if let Key::Function(number) = key {
+        if number > 12 {
+            if number <= 24 {
+                return encode_legacy(
+                    Key::Function(number - 12),
+                    Modifiers {
+                        shift: true,
+                        ..modifiers
+                    },
+                    application_cursor,
+                );
+            }
+            return Vec::new();
+        }
+        if number <= 4 {
+            let final_byte = char::from(b'P' + number - 1);
+            return if parameter == 1 {
+                format!("\x1bO{final_byte}").into_bytes()
+            } else {
+                format!("\x1b[1;{parameter}{final_byte}").into_bytes()
+            };
+        }
+        let code = function_tilde(number);
+        return if parameter == 1 {
+            format!("\x1b[{code}~").into_bytes()
+        } else {
+            format!("\x1b[{code};{parameter}~").into_bytes()
+        };
+    }
     let cursor = match key {
         Key::Up => Some('A'),
         Key::Down => Some('B'),
@@ -216,6 +257,20 @@ fn encode_legacy(key: Key, modifiers: Modifiers, application_cursor: bool) -> Ve
     bytes
 }
 
+fn function_tilde(number: u8) -> u32 {
+    match number {
+        5 => 15,
+        6 => 17,
+        7 => 18,
+        8 => 19,
+        9 => 20,
+        10 => 21,
+        11 => 23,
+        12 => 24,
+        _ => 0,
+    }
+}
+
 /// IME text commits are text, not synthesized physical key presses.
 pub fn encode_text(state: SessionState, text: &str) -> Result<Vec<u8>, InputBlocked> {
     require_connected(state)?;
@@ -254,6 +309,51 @@ pub fn encode_focus(state: SessionState, modes: InputModes, focused: bool) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn function_keys_preserve_legacy_and_kitty_f3_disambiguation() {
+        assert_eq!(
+            key(
+                InputModes::default(),
+                Key::Function(1),
+                Modifiers::default()
+            ),
+            b"\x1bOP"
+        );
+        assert_eq!(
+            key(
+                InputModes::default(),
+                Key::Function(12),
+                Modifiers::default()
+            ),
+            b"\x1b[24~"
+        );
+        let modes = InputModes {
+            kitty: KittyMode {
+                disambiguate: true,
+                ..KittyMode::default()
+            },
+            ..InputModes::default()
+        };
+        assert_eq!(
+            key(modes, Key::Function(3), Modifiers::default()),
+            b"\x1b[13;1~"
+        );
+        assert_eq!(
+            key(modes, Key::Function(13), Modifiers::default()),
+            b"\x1b[57376;1u"
+        );
+        assert_eq!(
+            encode_key(
+                SessionState::Connected,
+                modes,
+                Key::Function(0),
+                Modifiers::default(),
+                KeyEventKind::Press
+            ),
+            Err(InputBlocked::UnsupportedKey)
+        );
+    }
 
     fn key(modes: InputModes, key: Key, modifiers: Modifiers) -> Vec<u8> {
         encode_key(

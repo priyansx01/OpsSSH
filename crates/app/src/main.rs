@@ -1,7 +1,11 @@
 //! GPU workspace and headless development tools for the local renderer spike.
 
+mod connections;
+#[cfg(feature = "gui")]
+mod files;
 #[cfg(feature = "gui")]
 mod gui;
+mod localization;
 
 use std::hint::black_box;
 use std::process::ExitCode;

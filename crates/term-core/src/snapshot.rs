@@ -20,6 +20,7 @@ pub struct Cell {
     pub background: Rgb,
     pub style: CellStyle,
     pub wide_continuation: bool,
+    pub hyperlink: Option<String>,
 }
 
 impl Default for Cell {
@@ -30,6 +31,7 @@ impl Default for Cell {
             background: Rgb(18, 20, 26),
             style: CellStyle::default(),
             wide_continuation: false,
+            hyperlink: None,
         }
     }
 }

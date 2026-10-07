@@ -1,0 +1,31 @@
+name: opsssh-compat
+services:
+  openssh:
+    build:
+      context: .
+      dockerfile: openssh.Dockerfile
+    ports: ["127.0.0.1:22220:22"]
+    volumes: ["../../artifacts/compat/keys:/fixtures:ro"]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/sshd.pid"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+  alpine:
+    build:
+      context: .
+      dockerfile: alpine.Dockerfile
+    ports: ["127.0.0.1:22221:22"]
+    volumes: ["../../artifacts/compat/keys:/fixtures:ro"]
+  dropbear:
+    build:
+      context: .
+      dockerfile: dropbear.Dockerfile
+    ports: ["127.0.0.1:22222:22"]
+    volumes: ["../../artifacts/compat/keys:/fixtures:ro"]
+  bastion:
+    build:
+      context: .
+      dockerfile: openssh.Dockerfile
+    ports: ["127.0.0.1:22223:22"]
+    volumes: ["../../artifacts/compat/keys:/fixtures:ro"]

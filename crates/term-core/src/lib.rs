@@ -5,6 +5,7 @@
 
 mod emulator;
 mod input;
+mod osc;
 mod snapshot;
 
 pub use emulator::AlacrittyTerminal;
@@ -59,6 +60,7 @@ pub enum TerminalEvent {
     PromptStarted,
     CommandStarted,
     CommandFinished,
+    Notification(String),
     SynchronizedOutput(bool),
 }
 

@@ -9,12 +9,14 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "GPUI/pulp depend on paste; maintenance-only exception for pinned renderer spike; review before release" },
     { id = "RUSTSEC-2026-0206", reason = "GPUI/usvg depend on rustybuzz; maintenance-only exception for pinned renderer spike; review before release" },
     { id = "RUSTSEC-2026-0192", reason = "GPUI/fontdb depend on ttf-parser; maintenance-only exception for pinned renderer spike; review before release" },
+    { id = "RUSTSEC-2024-0384", reason = "Pinned GPUI component 0.7.1 depends on instant; maintenance-only exception, review before release" },
+    { id = "RUSTSEC-2025-0134", reason = "GPUI's optional wasm HTTP client depends on rustls-pemfile; unused on supported desktop targets; maintenance-only exception, review before release" },
 ]
 
 [licenses]
 version = 2
 confidence-threshold = 0.93
-allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unicode-3.0", "MPL-2.0", "CC0-1.0", "bzip2-1.0.6"]
+allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unicode-3.0", "MPL-2.0", "CC0-1.0", "bzip2-1.0.6", "0BSD"]
 
 [bans]
 multiple-versions = "warn"

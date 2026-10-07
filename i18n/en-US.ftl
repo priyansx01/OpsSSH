@@ -1,4 +1,17 @@
 app-name = OpsSSH
+home-title = Servers
+new-server = New server
+search-servers = Search servers
+connect-server = Connect
+save-connect = Save & connect
+save-server = Save
+cancel = Cancel
+import-servers = Import servers
+export-servers = Export servers
+settings = Settings
+files = Files
+hide-files = Hide files
+close-tab = Close tab
 session-connecting = Connecting…
 session-authenticating = Signing in…
 session-disconnected = Connection lost. Waiting for the network…

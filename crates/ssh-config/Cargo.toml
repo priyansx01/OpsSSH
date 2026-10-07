@@ -1,0 +1,15 @@
+[package]
+name = "opsssh-ssh-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+[dependencies]
+opsssh-store = { path = "../store", version = "=0.1.0" }
+shlex = "=2.0.1"
+glob = "=0.3.3"
+[dev-dependencies]
+tempfile = "=3.27.0"
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>OpsSSH third-party licenses</title>
+<style>body{max-width:70rem;margin:3rem auto;font-family:system-ui;line-height:1.5}pre{white-space:pre-wrap}h2{margin-top:3rem}</style></head>
+<body><h1>OpsSSH third-party licenses</h1>
+<p>This build includes the following third-party components. OpsSSH itself is dual licensed under MIT OR Apache-2.0.</p>
+{{#each licenses}}
+<h2>{{name}}</h2>
+<ul>{{#each used_by}}<li>{{crate.name}} {{crate.version}}{{#if crate.repository}} — {{crate.repository}}{{/if}}</li>{{/each}}</ul>
+<pre>{{text}}</pre>
+{{/each}}
+</body></html>

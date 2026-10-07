@@ -14,6 +14,9 @@ capture = ["gui", "gpui-platform/test-support"]
 [dependencies]
 opsssh-term-core.workspace = true
 portable-pty.workspace = true
+directories = "=6.0.0"
+russh = { version = "=0.64.1", default-features = false, features = ["ring"] }
+tokio = { version = "=1.53.2", features = ["net"] }
 gpui = { workspace = true, optional = true }
 gpui-platform = { workspace = true, optional = true }
 

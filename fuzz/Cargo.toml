@@ -1,0 +1,27 @@
+[package]
+name = "opsssh-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+[package.metadata]
+cargo-fuzz = true
+[workspace]
+members = ["."]
+[dependencies]
+libfuzzer-sys = "=0.4.12"
+opsssh-term-core = { path = "../crates/term-core" }
+opsssh-ssh-config = { path = "../crates/ssh-config" }
+opsssh-drop = { path = "../crates/drop" }
+opsssh-net-watch = { path = "../crates/net-watch" }
+[[bin]]
+name = "terminal_osc"
+path = "fuzz_targets/terminal_osc.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "commands_and_paths"
+path = "fuzz_targets/commands_and_paths.rs"
+test = false
+doc = false
+bench = false

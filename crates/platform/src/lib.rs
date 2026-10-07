@@ -2,6 +2,7 @@
 //!
 //! Local terminals use portable-pty's ConPTY/openpty implementations.
 
+pub mod agent;
 mod pty;
 pub use pty::{NativeTerminal, NativeTerminalFactory, TerminalKiller};
 
@@ -66,6 +67,36 @@ pub fn default_shell() -> PathBuf {
 
 pub fn terminal_font_family() -> &'static str {
     native::TERMINAL_FONT
+}
+
+pub fn home_dir() -> io::Result<PathBuf> {
+    directories::BaseDirs::new()
+        .map(|paths| paths.home_dir().to_path_buf())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Home directory is unavailable"))
+}
+
+/// Return the current account name when the operating system exposes it.
+pub fn default_username() -> Option<String> {
+    ["USER", "USERNAME"]
+        .into_iter()
+        .find_map(std::env::var_os)
+        .map(|value| value.to_string_lossy().into_owned())
+        .filter(|value| !value.is_empty() && !value.chars().any(|character| character.is_control()))
+}
+
+pub fn app_data_dir() -> io::Result<PathBuf> {
+    directories::ProjectDirs::from("", "", "opsssh")
+        .map(|paths| paths.config_dir().to_path_buf())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Application directory is unavailable",
+            )
+        })
+}
+
+pub fn default_known_hosts() -> io::Result<PathBuf> {
+    Ok(home_dir()?.join(".ssh").join("known_hosts"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

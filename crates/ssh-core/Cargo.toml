@@ -1,0 +1,25 @@
+[package]
+name = "opsssh-ssh-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+[dependencies]
+russh = { version = "=0.64.1", default-features = false, features = ["ring"] }
+tokio = { version = "=1.53.2", features = ["rt-multi-thread", "net", "io-util", "process", "time", "sync", "macros"] }
+async-channel = "=2.5.0"
+zeroize = "=1.9.0"
+anyhow = "=1.0.104"
+base64 = "=0.22.1"
+hmac = "=0.12.1"
+sha1 = "=0.10.6"
+opsssh-platform = { path = "../platform", version = "=0.1.0" }
+opsssh-term-core = { path = "../term-core", version = "=0.1.0" }
+opsssh-vault = { path = "../vault", version = "=0.1.0" }
+[dev-dependencies]
+opsssh-sftp = { path = "../sftp", version = "=0.1.0" }
+rand = "=0.10.3"
+tempfile = "=3.27.0"
+[lints]
+workspace = true

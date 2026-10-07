@@ -1,12 +1,18 @@
 //! Local PTY workers, damage-based scheduling, and the optional GPUI terminal view.
 
+#[cfg(any(feature = "gui", test))]
+mod composition;
+#[cfg(feature = "gui")]
+mod remote;
 mod session;
+#[cfg(feature = "gui")]
+pub(crate) use remote::Session;
 pub use session::{LocalSession, SessionNotice};
 
 #[cfg(feature = "gui")]
 mod gpu;
 #[cfg(feature = "gui")]
-pub use gpu::TerminalView;
+pub use gpu::{TerminalView, TerminalViewEvent};
 
 use std::collections::BTreeSet;
 use std::time::Duration;
