@@ -89,6 +89,16 @@ pub fn apply(theme: &str, window: &mut Window, cx: &mut App) {
         let c = &mut theme.colors;
         c.background = color(p.canvas);
         c.foreground = color(p.text);
+        c.success = color(if theme.mode.is_dark() {
+            0x7bcba2
+        } else {
+            0x176e46
+        });
+        c.warning = color(if theme.mode.is_dark() {
+            0xe4bc77
+        } else {
+            0x885805
+        });
         c.border = color(p.border);
         c.primary = color(p.ruby);
         c.primary_hover = color(p.ruby_hover);
@@ -176,6 +186,7 @@ pub fn set_reduced_motion(reduced: bool, cx: &mut App) {
         cx.set_global(Preference::default());
     }
     cx.global_mut::<Preference>().reduced_motion = reduced;
+    cx.set_reduce_motion(reduced);
     Theme::update(cx, |theme| {
         theme.motion = Default::default();
         if reduced {

@@ -130,10 +130,28 @@ impl server::Handler for Echo {
     async fn exec_request(
         &mut self,
         channel: ChannelId,
-        _: &[u8],
+        command: &[u8],
         session: &mut server::Session,
     ) -> std::result::Result<(), Self::Error> {
         session.channel_success(channel)?;
+        match command {
+            b"exec-fixture" => {
+                session.data(channel, b"stdout-marker".to_vec())?;
+                session.extended_data(channel, 1, b"stderr-marker".to_vec())?;
+                session.exit_status_request(channel, 7)?;
+                session.eof(channel)?;
+                session.close(channel)?;
+                return Ok(());
+            }
+            b"large-exec-fixture" => {
+                session.data(channel, vec![b'x'; 4096])?;
+                session.exit_status_request(channel, 0)?;
+                session.close(channel)?;
+                return Ok(());
+            }
+            b"slow-exec-fixture" => return Ok(()),
+            _ => {}
+        }
         session.data(channel, b"fixture-ready".to_vec())?;
         Ok(())
     }
@@ -145,6 +163,10 @@ impl server::Handler for Echo {
     ) -> std::result::Result<(), Self::Error> {
         if data == b"disconnect-fixture" {
             return Err(russh::Error::Disconnect);
+        }
+        if data == b"close-without-status-fixture" {
+            session.close(channel)?;
+            return Ok(());
         }
         if !self.forwarded.contains(&channel) {
             session.data(channel, data.to_vec())?;
@@ -158,6 +180,7 @@ struct Fixture {
     user_key: PrivateKey,
     sizes: Arc<Mutex<Vec<(u32, u32)>>>,
     task: tokio::task::JoinHandle<()>,
+    fail_handshakes: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl Fixture {
     async fn new() -> Self {
@@ -179,8 +202,21 @@ impl Fixture {
             key: user_key.public_key().clone(),
             forwarded: Default::default(),
         };
+        let fail_handshakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failed = fail_handshakes.clone();
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
+                if failed
+                    .try_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |n| n.checked_sub(1),
+                    )
+                    .is_ok()
+                {
+                    drop(stream);
+                    continue;
+                }
                 let config = config.clone();
                 let handler = handler.clone();
                 tokio::spawn(async move {
@@ -196,6 +232,7 @@ impl Fixture {
             user_key,
             sizes,
             task,
+            fail_handshakes,
         }
     }
     fn options(&self, path: std::path::PathBuf) -> ConnectionOptions {
@@ -231,6 +268,236 @@ async fn trust_and_connect(session: &SshSession) {
                 .unwrap(),
             SshEvent::Connected => break,
             SshEvent::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+}
+async fn start_exec(
+    session: &SshSession,
+    request: ExecRequest,
+) -> async_channel::Receiver<std::result::Result<ExecOutput, String>> {
+    let (reply, receive) = async_channel::bounded(1);
+    session
+        .commands()
+        .send(SshCommand::Exec { request, reply })
+        .await
+        .unwrap();
+    receive
+}
+async fn exec_reply(
+    receive: async_channel::Receiver<std::result::Result<ExecOutput, String>>,
+) -> std::result::Result<ExecOutput, String> {
+    tokio::time::timeout(Duration::from_secs(3), receive.recv())
+        .await
+        .unwrap()
+        .unwrap()
+}
+#[tokio::test]
+async fn separate_exec_preserves_stdout_stderr_and_exit_status() {
+    let fixture = Fixture::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let session = SshSession::spawn(
+        fixture.options(dir.path().join("known_hosts")),
+        TerminalSize::new(80, 24).unwrap(),
+    )
+    .unwrap();
+    trust_and_connect(&session).await;
+    let output = exec_reply(start_exec(&session, ExecRequest::new("exec-fixture")).await)
+        .await
+        .unwrap();
+    assert_eq!(output.stdout, b"stdout-marker");
+    assert_eq!(output.stderr, b"stderr-marker");
+    assert_eq!(output.exit_status, Some(7));
+}
+#[tokio::test]
+async fn timed_out_exec_does_not_block_interactive_terminal() {
+    let fixture = Fixture::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let session = SshSession::spawn(
+        fixture.options(dir.path().join("known_hosts")),
+        TerminalSize::new(80, 24).unwrap(),
+    )
+    .unwrap();
+    trust_and_connect(&session).await;
+    let mut request = ExecRequest::new("slow-exec-fixture");
+    request.timeout = Duration::from_millis(500);
+    let receive = start_exec(&session, request).await;
+    session
+        .commands()
+        .send(SshCommand::Write(b"interactive-during-exec".to_vec()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_millis(400), async {
+        loop {
+            if let SshEvent::Data(data) = session.events().recv().await.unwrap()
+                && data == b"interactive-during-exec"
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("Exec blocked the PTY");
+    assert!(exec_reply(receive).await.unwrap_err().contains("timed out"));
+}
+#[tokio::test]
+async fn exec_can_be_cancelled_and_output_is_bounded() {
+    let fixture = Fixture::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let session = SshSession::spawn(
+        fixture.options(dir.path().join("known_hosts")),
+        TerminalSize::new(80, 24).unwrap(),
+    )
+    .unwrap();
+    trust_and_connect(&session).await;
+    let request = ExecRequest::new("slow-exec-fixture");
+    let control = request.control.clone();
+    let receive = start_exec(&session, request).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    control.cancel();
+    assert!(exec_reply(receive).await.unwrap_err().contains("cancelled"));
+    let mut request = ExecRequest::new("large-exec-fixture");
+    request.output_limit = 512;
+    assert!(
+        exec_reply(start_exec(&session, request).await)
+            .await
+            .unwrap_err()
+            .contains("output exceeds")
+    );
+    let output = exec_reply(start_exec(&session, ExecRequest::new("exec-fixture")).await)
+        .await
+        .unwrap();
+    assert_eq!(output.exit_status, Some(7));
+}
+#[tokio::test]
+async fn protected_session_recovers_from_close_without_status_and_rejects_stale_exec() {
+    let fixture = Fixture::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = fixture.options(dir.path().join("known_hosts"));
+    options.tmux = Some(TmuxOptions {
+        session_name: "exec-recovery".into(),
+    });
+    let session = SshSession::spawn(options, TerminalSize::new(80, 24).unwrap()).unwrap();
+    trust_and_connect(&session).await;
+    session
+        .commands()
+        .send(SshCommand::Write(b"close-without-status-fixture".to_vec()))
+        .await
+        .unwrap();
+    let mut recovering = false;
+    loop {
+        match next(&session.events()).await {
+            SshEvent::Reconnecting { .. } => {
+                recovering = true;
+                let error =
+                    exec_reply(start_exec(&session, ExecRequest::new("exec-fixture")).await)
+                        .await
+                        .unwrap_err();
+                assert!(error.contains("recovering"));
+            }
+            SshEvent::Connected => {
+                assert!(recovering);
+                break;
+            }
+            SshEvent::Error(error) => panic!("{error}"),
+            SshEvent::Closed { .. } => panic!("Protected session closed unexpectedly"),
+            _ => {}
+        }
+    }
+    let output = exec_reply(start_exec(&session, ExecRequest::new("exec-fixture")).await)
+        .await
+        .unwrap();
+    assert_eq!(output.stdout, b"stdout-marker");
+}
+#[tokio::test]
+async fn stalled_sftp_does_not_block_terminal_or_disconnect() {
+    let fixture = Fixture::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let session = SshSession::spawn(
+        fixture.options(dir.path().join("known_hosts")),
+        TerminalSize::new(80, 24).unwrap(),
+    )
+    .unwrap();
+    trust_and_connect(&session).await;
+    // The fixture's default subsystem handler deliberately never replies.
+    let (reply, receive) = async_channel::bounded(1);
+    session
+        .commands()
+        .send(SshCommand::OpenSftp { reply })
+        .await
+        .unwrap();
+    session
+        .commands()
+        .send(SshCommand::Write(b"interactive-during-sftp".to_vec()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let SshEvent::Data(data) = session.events().recv().await.unwrap()
+                && data == b"interactive-during-sftp"
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("SFTP subsystem request blocked PTY input");
+    session
+        .commands()
+        .send(SshCommand::Disconnect)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(
+                session.events().recv().await.unwrap(),
+                SshEvent::Closed { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("Stalled SFTP blocked disconnect");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), receive.recv())
+            .await
+            .unwrap()
+            .is_err()
+    );
+}
+#[tokio::test]
+async fn protected_reconnect_retries_transient_handshake_loss() {
+    let fixture = Fixture::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = fixture.options(dir.path().join("known_hosts"));
+    options.tmux = Some(TmuxOptions {
+        session_name: "transient-handshake".into(),
+    });
+    let session = SshSession::spawn(options, TerminalSize::new(80, 24).unwrap()).unwrap();
+    trust_and_connect(&session).await;
+    // Drop the readiness probe and the first real recovery handshake, then accept normally.
+    fixture
+        .fail_handshakes
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    session
+        .commands()
+        .send(SshCommand::Write(b"disconnect-fixture".to_vec()))
+        .await
+        .unwrap();
+    let mut reconnects = 0;
+    loop {
+        match next(&session.events()).await {
+            SshEvent::Reconnecting { .. } => reconnects += 1,
+            SshEvent::Connected => {
+                assert!(reconnects >= 2, "Transient handshake did not retry");
+                break;
+            }
+            SshEvent::Error(error) => panic!("{error}"),
+            SshEvent::HostKeyPrompt { .. } => {
+                panic!("Recovery unexpectedly prompted for host trust")
+            }
+            SshEvent::Closed { .. } => panic!("Recovery unexpectedly closed"),
             _ => {}
         }
     }

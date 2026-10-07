@@ -11,6 +11,8 @@ mod files;
 #[cfg(feature = "gui")]
 mod gui;
 #[cfg(feature = "gui")]
+mod infrastructure;
+#[cfg(feature = "gui")]
 mod localization;
 
 use std::hint::black_box;

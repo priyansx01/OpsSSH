@@ -163,6 +163,45 @@ pub enum SshEvent {
     },
 }
 pub type SftpStream = russh::ChannelStream<russh::client::Msg>;
+/// Cancellation shared by a caller and its independent SSH exec channel.
+#[derive(Debug, Clone, Default)]
+pub struct ExecControl(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl ExecControl {
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+/// Explicit remote shell command. Debug output never includes the command text.
+pub struct ExecRequest {
+    pub command: String,
+    pub timeout: Duration,
+    pub output_limit: usize,
+    pub control: ExecControl,
+}
+impl ExecRequest {
+    pub fn new(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            timeout: Duration::from_secs(5),
+            output_limit: 2 * 1024 * 1024,
+            control: ExecControl::default(),
+        }
+    }
+}
+impl fmt::Debug for ExecRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecRequest").finish_non_exhaustive()
+    }
+}
+#[derive(Debug, Default)]
+pub struct ExecOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_status: Option<u32>,
+}
 pub enum SshCommand {
     Write(Vec<u8>),
     Resize(TerminalSize),
@@ -179,6 +218,10 @@ pub enum SshCommand {
     OpenSftp {
         reply: Sender<std::result::Result<SftpStream, String>>,
     },
+    Exec {
+        request: ExecRequest,
+        reply: Sender<std::result::Result<ExecOutput, String>>,
+    },
     Disconnect,
 }
 impl fmt::Debug for SshCommand {
@@ -189,6 +232,7 @@ impl fmt::Debug for SshCommand {
             Self::TrustHost { .. } => "TrustHost",
             Self::AuthResponse { .. } => "AuthResponse([REDACTED])",
             Self::OpenSftp { .. } => "OpenSftp",
+            Self::Exec { .. } => "Exec([REDACTED])",
             Self::Disconnect => "Disconnect",
         })
     }

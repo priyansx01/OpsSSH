@@ -49,7 +49,7 @@ acceptance remains open.
   controlled hardware. No absolute GPU budgets pass yet; parallel feature work
   was explicitly requested without waiving release acceptance.
 - Block offline typing and paste; do not retain or automatically replay input.
-- Give distinct terminal tabs unique tmux session identities.
+- Reopen the existing session for the same server and configured tmux name; use different names for distinct protected workspaces.
 - Keep the planned MIT/Apache dual licence and human DCO sign-offs.
 - Verify the dependency table rather than treating its versions as audited.
 - Advertise only input protocol enhancements actually implemented by the adapter.
@@ -60,3 +60,15 @@ acceptance remains open.
   production services require owner setup.
 
 The charcoal/ruby redesign and its validation limits are described in [UX.md](UX.md).
+
+
+## Server workspace phase
+
+Implemented Terminal / File Manager / Linux Infrastructure navigation, stable
+session identities, per-tab close choices, background-session reopening, optional
+tmux protection and visible recovery, full-page SFTP grid/list views, interrupted
+transfer retry, and independent bounded metrics/process-operation channels.
+See [SESSION_RECOVERY.md](SESSION_RECOVERY.md) for persistence behavior. Remote
+process termination uses confirmed SIGTERM with identity revalidation and no
+sudo. Deployments, AI assistance, PM2, backups, logs, alerts, cron and Docker
+remain later phases.

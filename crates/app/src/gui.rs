@@ -1,6 +1,8 @@
 use crate::connection_form::{ConnectionForm, FormEvent};
 use crate::files::{FilePane, FilePaneEvent};
+mod session_tabs;
 mod views;
+use crate::infrastructure::InfrastructureView;
 use crate::localization::text as tr;
 use gpui::{
     App, Bounds, Context, Entity, FocusHandle, KeyBinding, Render, Window, WindowBounds,
@@ -13,12 +15,27 @@ use gpui_component::{
 };
 use opsssh_store::{Profile, Store};
 use opsssh_term_view::{TerminalView, TerminalViewEvent};
+use session_tabs::{SessionId, SessionTabs};
 use std::{path::PathBuf, time::Instant};
 actions!(
     opsssh,
     [OpenLocalTerminal, GoHome, NewServer, CloseTab, Quit]
 );
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionPage {
+    Terminal,
+    Files,
+    Infrastructure,
+}
+
 struct Tab {
+    id: SessionId,
+    endpoint: Option<String>,
+    persistent_name: Option<String>,
+    protected: bool,
+    connected_at: Option<Instant>,
+    page: SessionPage,
+    infrastructure: Option<Entity<InfrastructureView>>,
     name: String,
     terminal: Entity<TerminalView>,
     color: u32,
@@ -28,14 +45,19 @@ struct Tab {
     follow: bool,
     followed_directory: Option<String>,
     file_generation: u64,
+    files_needs_rebind: bool,
 }
 struct Workspace {
     home_focus: FocusHandle,
     search: Entity<InputState>,
     store: Store,
     path: PathBuf,
-    tabs: Vec<Tab>,
-    active: Option<usize>,
+    sessions: Vec<Tab>,
+    navigation: SessionTabs,
+    transition: u64,
+    pending_close: Option<SessionId>,
+    quit_dialog: bool,
+    uptime_timer: Option<gpui::Task<()>>,
     editor: Option<Entity<ConnectionForm>>,
     settings_page: bool,
     help_page: bool,
@@ -75,7 +97,7 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
             let (path,mut message)=match opsssh_platform::app_data_dir(){Ok(dir)=>(dir.join("servers.toml"),String::new()),Err(error)=>(PathBuf::new(),format!("Cannot locate settings folder: {error}"))};
             let mut load_failed=false;
             let store=if path.as_os_str().is_empty(){load_failed=true;Store::default()}else{match Store::load(&path){Ok(store)=>store,Err(error)=>{message=format!("Cannot load servers. Fix the settings file before saving: {error}");load_failed=true;Store::default()}}};
-            let mut workspace=Workspace{home_focus,search,store,path,tabs:vec![],active:None,editor:None,settings_page:false,help_page:false,message,filter:"All servers".into(),config:vec![],launched,first_frame_recorded:false,load_failed};
+            let mut workspace=Workspace{home_focus,search,store,path,sessions:vec![],navigation:SessionTabs::default(),transition:0,pending_close:None,quit_dialog:false,uptime_timer:None,editor:None,settings_page:false,help_page:false,message,filter:"All servers".into(),config:vec![],launched,first_frame_recorded:false,load_failed};
             crate::design::apply(&workspace.store.settings.theme,window,cx);
             crate::design::set_reduced_motion(workspace.store.settings.reduced_motion,cx);
             crate::design::observe_system(window).detach();
@@ -93,8 +115,17 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
                 if screen.contains("light") {crate::design::apply("light",window,cx);}
                 if screen.contains("files") {
                     workspace.open_local(&OpenLocalTerminal,window,cx);
-                    let files=cx.new(|cx|FilePane::preview(window,cx));
-                    let tab=workspace.tabs.last_mut().unwrap();tab.files=Some(files);tab.files_visible=true;
+                    let files=cx.new(|cx|if screen.contains("files-list") {FilePane::preview_list(window,cx)}else{FilePane::preview(window,cx)});
+                    let tab=workspace.sessions.last_mut().unwrap();tab.files=Some(files);tab.files_visible=true;
+                    if screen.contains("session") {tab.page=SessionPage::Files;tab.files.as_ref().unwrap().update(cx,|f,cx|f.set_full_page(true,cx));}
+                }
+                if screen.contains("session") || screen.contains("close") || screen.contains("background") {
+                    if workspace.sessions.is_empty(){workspace.open_local(&OpenLocalTerminal,window,cx);}
+                    let tab=workspace.sessions.last_mut().unwrap();
+                    tab.name="Atlas development VM".into();tab.endpoint=Some("deploy@atlas.example.test:22".into());tab.environment="Development".into();tab.protected=true;tab.persistent_name=Some("harness".into());
+                    if screen.contains("infra") {tab.page=SessionPage::Infrastructure;tab.infrastructure=Some(cx.new(|cx|InfrastructureView::preview(window,cx)));}
+                    if screen.contains("background") {workspace.navigation.hide(tab.id);}
+                    if screen.contains("close") {let id=tab.id;let this=cx.entity().downgrade();window.on_next_frame(move|window,cx|{let _=this.update(cx,|this,cx|this.request_close(id,window,cx));});}
                 }
                 if screen.contains("settings") {workspace.settings_page=true;}
                 if screen.contains("connection") {let this=cx.entity().downgrade();window.on_next_frame(move|window,cx|{let _=this.update(cx,|this,cx|this.new_server(&NewServer,window,cx));});}
@@ -103,6 +134,8 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
             #[cfg(not(feature="capture"))]let _=capture_path;
             workspace
         });
+        let weak=workspace.downgrade();
+        window.on_window_should_close(cx,move|window,cx| {weak.update(cx,|this,cx| this.quit(&Quit,window,cx)).is_err()});
         cx.new(|cx|Root::new(workspace,window,cx))
     });if let Err(error)=result{eprintln!("Could not open OpsSSH: {error}");cx.quit();return;}cx.activate(true);
 });
@@ -150,7 +183,15 @@ impl Workspace {
     fn open_local(&mut self, _: &OpenLocalTerminal, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_page = false;
         self.help_page = false;
-        self.tabs.push(Tab {
+        let id = self.navigation.allocate();
+        self.sessions.push(Tab {
+            id,
+            endpoint: None,
+            persistent_name: None,
+            protected: false,
+            connected_at: Some(Instant::now()),
+            page: SessionPage::Terminal,
+            infrastructure: None,
             name: "Local".into(),
             terminal: cx.new(|cx| {
                 let mut terminal = TerminalView::new(window, cx);
@@ -164,15 +205,19 @@ impl Workspace {
             follow: true,
             followed_directory: None,
             file_generation: 0,
+            files_needs_rebind: false,
         });
-        self.active = Some(self.tabs.len() - 1);
+        self.transition = self.transition.wrapping_add(1);
+        self.sync_visibility(cx);
         self.editor = None;
         cx.notify();
     }
     fn home(&mut self, _: &GoHome, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_page = false;
         self.help_page = false;
-        self.active = None;
+        self.navigation.active = None;
+        self.transition = self.transition.wrapping_add(1);
+        self.sync_visibility(cx);
         self.editor = None;
         self.reload_config();
         self.search.update(cx, |state, cx| state.focus(window, cx));
@@ -188,29 +233,326 @@ impl Workspace {
             cx,
         );
     }
-    fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings_page || self.help_page || self.editor.is_some() {
+    fn session_index(&self, id: SessionId) -> Option<usize> {
+        self.sessions.iter().position(|session| session.id == id)
+    }
+    fn sync_visibility(&mut self, cx: &mut Context<Self>) {
+        if self.navigation.active.is_none() || self.settings_page || self.help_page {
+            self.uptime_timer = None;
+        } else if self.uptime_timer.is_none() {
+            self.uptime_timer = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(30))
+                        .await;
+                    if !this
+                        .update(cx, |this, cx| {
+                            cx.notify();
+                            this.navigation.active.is_some()
+                                && !this.settings_page
+                                && !this.help_page
+                        })
+                        .unwrap_or(false)
+                    {
+                        break;
+                    }
+                }
+            }));
+        }
+        for session in &self.sessions {
+            if let Some(infra) = &session.infrastructure {
+                let visible = self.navigation.active == Some(session.id)
+                    && !self.settings_page
+                    && !self.help_page
+                    && session.page == SessionPage::Infrastructure
+                    && session.terminal.read(cx).session_state()
+                        == opsssh_term_core::SessionState::Connected;
+                infra.update(cx, |view, cx| view.set_visible(visible, cx));
+            }
+            if let Some(files) = &session.files {
+                files.update(cx, |view, cx| {
+                    view.set_full_page(session.page == SessionPage::Files, cx)
+                });
+            }
+        }
+    }
+    fn activate_session(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.session_index(id) else {
             return;
-        }
-        if let Some(index) = self.active {
-            self.tabs.remove(index);
-            self.active = if self.tabs.is_empty() {
-                None
-            } else {
-                Some(index.min(self.tabs.len() - 1))
-            };
-        }
-        if let Some(index) = self.active {
-            self.tabs[index]
+        };
+        self.navigation.show(id);
+        self.settings_page = false;
+        self.help_page = false;
+        self.transition = self.transition.wrapping_add(1);
+        self.sync_visibility(cx);
+        if self.sessions[index].page == SessionPage::Terminal {
+            self.sessions[index]
                 .terminal
-                .update(cx, |terminal, cx| terminal.focus(window, cx));
+                .update(cx, |t, cx| t.focus(window, cx));
+        } else {
+            self.home_focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+    fn select_page(
+        &mut self,
+        id: SessionId,
+        page: SessionPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.session_index(id) else {
+            return;
+        };
+        if page == SessionPage::Files {
+            let terminal = self.sessions[index].terminal.clone();
+            if self.ensure_files(&terminal, window, cx).is_none() {
+                return;
+            }
+        }
+        if page == SessionPage::Infrastructure && self.sessions[index].infrastructure.is_none() {
+            let terminal = self.sessions[index].terminal.read(cx);
+            if terminal.session_state() != opsssh_term_core::SessionState::Connected {
+                self.message = tr("infra-connect-first");
+                cx.notify();
+                return;
+            }
+            let Some(commands) = terminal.ssh_commands() else {
+                return;
+            };
+            let generation = terminal.connection_generation();
+            self.sessions[index].infrastructure =
+                Some(cx.new(|cx| InfrastructureView::new(commands, generation, window, cx)));
+        }
+        self.sessions[index].page = page;
+        self.activate_session(id, window, cx);
+    }
+    fn finish_close(
+        &mut self,
+        id: SessionId,
+        disconnect: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_close = None;
+        self.navigation.hide(id);
+        if disconnect && let Some(index) = self.session_index(id) {
+            let session = self.sessions.remove(index);
+            if let Some(files) = session.files {
+                files.update(cx, |files, cx| files.cancel_transfers(cx));
+            }
+            session
+                .terminal
+                .update(cx, |terminal, cx| terminal.disconnect(cx));
+        }
+        self.transition = self.transition.wrapping_add(1);
+        self.sync_visibility(cx);
+        if let Some(active) = self.navigation.active {
+            self.activate_session(active, window, cx);
         } else {
             self.search.update(cx, |s, cx| s.focus(window, cx));
         }
         cx.notify();
     }
-    fn quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
-        cx.quit();
+    fn request_close(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_close.is_some() || self.editor.is_some() || self.quit_dialog {
+            return;
+        }
+        let Some(index) = self.session_index(id) else {
+            return;
+        };
+        let session = &self.sessions[index];
+        if matches!(
+            session.terminal.read(cx).session_state(),
+            opsssh_term_core::SessionState::Closed | opsssh_term_core::SessionState::Disconnected
+        ) {
+            self.finish_close(id, true, window, cx);
+            return;
+        }
+        let remote = session.endpoint.is_some();
+        let name = session.name.clone();
+        let protected = session.protected;
+        let transfers = session
+            .files
+            .as_ref()
+            .map(|f| f.read(cx).active_transfers())
+            .unwrap_or(0);
+        self.pending_close = Some(id);
+        let weak = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let stay = weak.clone();
+            let exit = weak.clone();
+            let cancel = weak.clone();
+            let cancel_button = weak.clone();
+            dialog
+                .title(format!("{} {}", tr("close-session"), name))
+                .width(px(490.))
+                .overlay_closable(false)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .child(tr(if remote {
+                            "close-session-help"
+                        } else {
+                            "close-local-help"
+                        }))
+                        .when(protected, |d| d.child(tr("close-tmux-help")))
+                        .when(transfers > 0, |d| {
+                            d.child(format!("{transfers} {}", tr("close-active-transfers")))
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .when(remote, |d| {
+                                    d.child(
+                                        Button::new("stay-connected")
+                                            .primary()
+                                            .label(tr("stay-connected"))
+                                            .on_click(move |_, window, cx| {
+                                                let _ = stay.update(cx, |this, cx| {
+                                                    this.finish_close(id, false, window, cx)
+                                                });
+                                                window.close_dialog(cx);
+                                            }),
+                                    )
+                                })
+                                .child(
+                                    Button::new("disconnect-session")
+                                        .danger()
+                                        .label(tr(if remote {
+                                            "disconnect"
+                                        } else {
+                                            "exit-terminal"
+                                        }))
+                                        .on_click(move |_, window, cx| {
+                                            let _ = exit.update(cx, |this, cx| {
+                                                this.finish_close(id, true, window, cx)
+                                            });
+                                            window.close_dialog(cx);
+                                        }),
+                                )
+                                .child(Button::new("cancel-close").label(tr("cancel")).on_click(
+                                    move |_, window, cx| {
+                                        let _ = cancel_button.update(cx, |this, cx| {
+                                            this.pending_close = None;
+                                            cx.notify();
+                                        });
+                                        window.close_dialog(cx);
+                                    },
+                                )),
+                        ),
+                )
+                .on_close(move |_, _, cx| {
+                    let _ = cancel.update(cx, |this, cx| {
+                        this.pending_close = None;
+                        cx.notify();
+                    });
+                })
+        });
+    }
+    fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.settings_page
+            && !self.help_page
+            && let Some(id) = self.navigation.active
+        {
+            self.request_close(id, window, cx);
+        }
+    }
+    fn quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quit_dialog || self.pending_close.is_some() || self.editor.is_some() {
+            return;
+        }
+        let active = self
+            .sessions
+            .iter()
+            .filter(|s| {
+                !matches!(
+                    s.terminal.read(cx).session_state(),
+                    opsssh_term_core::SessionState::Closed
+                        | opsssh_term_core::SessionState::Disconnected
+                )
+            })
+            .count();
+        let transfers: usize = self
+            .sessions
+            .iter()
+            .filter_map(|s| s.files.as_ref())
+            .map(|f| f.read(cx).active_transfers())
+            .sum();
+        if active == 0 && transfers == 0 {
+            cx.quit();
+            return;
+        }
+        let protected = self.sessions.iter().filter(|s| s.protected).count();
+        self.quit_dialog = true;
+        let weak = cx.entity().downgrade();
+        let close = weak.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let exit = weak.clone();
+            let cancel = weak.clone();
+            dialog
+                .title(tr("quit-title"))
+                .width(px(480.))
+                .overlay_closable(false)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .child(format!(
+                            "{active} {} · {transfers} {}",
+                            tr("quit-sessions"),
+                            tr("close-active-transfers")
+                        ))
+                        .child(format!("{protected} {}", tr("quit-protected")))
+                        .child(tr("quit-help"))
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    Button::new("quit-confirmed")
+                                        .danger()
+                                        .label(tr("quit"))
+                                        .on_click(move |_, _, cx| {
+                                            let _ = exit.update(cx, |this, cx| {
+                                                for s in &this.sessions {
+                                                    if let Some(f) = &s.files {
+                                                        f.update(cx, |f, cx| {
+                                                            f.cancel_transfers(cx)
+                                                        });
+                                                    }
+                                                    s.terminal.update(cx, |t, cx| t.disconnect(cx));
+                                                }
+                                                cx.quit();
+                                            });
+                                        }),
+                                )
+                                .child(Button::new("quit-cancel").label(tr("cancel")).on_click(
+                                    move |_, w, cx| {
+                                        let _ = cancel.update(cx, |this, cx| {
+                                            this.quit_dialog = false;
+                                            cx.notify();
+                                        });
+                                        w.close_dialog(cx);
+                                    },
+                                )),
+                        ),
+                )
+                .on_close({
+                    let close = close.clone();
+                    move |_, _, cx| {
+                        let _ = close.update(cx, |this, cx| {
+                            this.quit_dialog = false;
+                            cx.notify();
+                        });
+                    }
+                })
+        });
     }
     fn edit(&mut self, profile: Profile, window: &mut Window, cx: &mut Context<Self>) {
         let warnings = if profile.id == 0 {
@@ -300,6 +642,25 @@ impl Workspace {
             cx.notify();
             return;
         }
+        let endpoint = format!("{}@{}:{}", profile.user, profile.host, profile.port);
+        if profile.tmux_session.is_some()
+            && let Some(id) = self
+                .sessions
+                .iter()
+                .find(|s| {
+                    s.endpoint.as_deref() == Some(&endpoint)
+                        && s.persistent_name == profile.tmux_session
+                        && !matches!(
+                            s.terminal.read(cx).session_state(),
+                            opsssh_term_core::SessionState::Closed
+                                | opsssh_term_core::SessionState::Disconnected
+                        )
+                })
+                .map(|s| s.id)
+        {
+            self.activate_session(id, window, cx);
+            return;
+        }
         match crate::connections::options(&profile, &self.store) {
             Ok(options) => {
                 let terminal = cx.new(|cx| {
@@ -334,7 +695,7 @@ impl Workspace {
                     }
                 })
                 .detach();
-                cx.observe_in(&terminal, window, move |this, terminal, _, cx| {
+                cx.observe_in(&terminal, window, move |this, terminal, window, cx| {
                     if !recorded
                         && terminal.read(cx).session_state()
                             == opsssh_term_core::SessionState::Connected
@@ -353,11 +714,51 @@ impl Workspace {
                     }
                     let directory = terminal.read(cx).current_directory().map(str::to_owned);
                     let generation = terminal.read(cx).connection_generation();
-                    if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.terminal == terminal) {
+                    if let Some(tab) = this
+                        .sessions
+                        .iter_mut()
+                        .find(|tab| tab.terminal == terminal)
+                    {
+                        if tab.connected_at.is_none()
+                            && terminal.read(cx).session_state()
+                                == opsssh_term_core::SessionState::Connected
+                        {
+                            tab.connected_at = Some(Instant::now());
+                        }
+                        tab.protected = terminal.read(cx).is_tmux_protected();
+                        if tab
+                            .infrastructure
+                            .as_ref()
+                            .is_some_and(|view| view.read(cx).generation() != generation)
+                        {
+                            tab.infrastructure = None;
+                        }
                         if tab.files.is_some() && tab.file_generation != generation {
-                            tab.files = None;
-                            tab.files_visible = false;
+                            if let Some(files) = &tab.files {
+                                files.update(cx, |pane, cx| pane.suspend(cx));
+                            }
+                            tab.file_generation = generation;
+                            tab.files_needs_rebind = true;
                             tab.followed_directory = None;
+                        }
+                        if tab.files_needs_rebind
+                            && terminal.read(cx).session_state()
+                                == opsssh_term_core::SessionState::Connected
+                            && let (Some(files), Some(commands), Some(fingerprint)) = (
+                                &tab.files,
+                                terminal.read(cx).ssh_commands(),
+                                terminal.read(cx).verified_host_key().map(str::to_owned),
+                            )
+                        {
+                            let folder = if tab.follow {
+                                directory.clone().unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
+                            files.update(cx, |pane, cx| {
+                                pane.rebind(commands, fingerprint, folder, window, cx)
+                            });
+                            tab.files_needs_rebind = false;
                         }
                         if tab.follow
                             && tab.followed_directory != directory
@@ -369,10 +770,38 @@ impl Workspace {
                             tab.followed_directory = Some(directory.clone());
                         }
                     }
+                    if terminal.read(cx).session_state()
+                        == opsssh_term_core::SessionState::Connected
+                        && let Some((id, page)) = this
+                            .sessions
+                            .iter()
+                            .find(|s| {
+                                s.terminal == terminal
+                                    && this.navigation.active == Some(s.id)
+                                    && ((s.page == SessionPage::Infrastructure
+                                        && s.infrastructure.is_none())
+                                        || (s.page == SessionPage::Files && s.files.is_none()))
+                            })
+                            .map(|s| (s.id, s.page))
+                    {
+                        this.select_page(id, page, window, cx);
+                    }
+                    this.sync_visibility(cx);
                     cx.notify();
                 })
                 .detach();
-                self.tabs.push(Tab {
+                let id = self.navigation.allocate();
+                self.sessions.push(Tab {
+                    id,
+                    endpoint: Some(format!(
+                        "{}@{}:{}",
+                        profile.user, profile.host, profile.port
+                    )),
+                    persistent_name: profile.tmux_session.clone(),
+                    protected: profile.tmux_session.is_some(),
+                    connected_at: None,
+                    page: SessionPage::Terminal,
+                    infrastructure: None,
                     name: if profile.name.is_empty() {
                         profile.host.clone()
                     } else {
@@ -386,8 +815,10 @@ impl Workspace {
                     follow: true,
                     followed_directory: None,
                     file_generation: 0,
+                    files_needs_rebind: false,
                 });
-                self.active = Some(self.tabs.len() - 1);
+                self.transition = self.transition.wrapping_add(1);
+                self.sync_visibility(cx);
                 self.editor = None;
                 self.message.clear();
             }
@@ -401,9 +832,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<FilePane>> {
-        let index = self.tabs.iter().position(|tab| &tab.terminal == terminal)?;
-        self.tabs[index].files_visible = true;
-        if let Some(files) = &self.tabs[index].files {
+        let index = self
+            .sessions
+            .iter()
+            .position(|tab| &tab.terminal == terminal)?;
+        self.sessions[index].files_visible = true;
+        if let Some(files) = &self.sessions[index].files {
             return Some(files.clone());
         }
         let view = terminal.read(cx);
@@ -419,19 +853,26 @@ impl Workspace {
         let generation = view.connection_generation();
         let files =
             cx.new(|cx| FilePane::new(commands, fingerprint, directory.clone(), window, cx));
-        let terminal = terminal.downgrade();
-        cx.subscribe(&files, move |_, _, event, cx| {
+        cx.subscribe(&files, move |this, pane, event, cx| {
             let FilePaneEvent::InsertText(text) = event;
-            let _ = terminal.update(cx, |terminal, cx| {
-                if terminal.connection_generation() == generation {
-                    terminal.insert_text(text, cx);
-                }
-            });
+            // FilePane discards old worker updates; also require this pane's current live transport.
+            if let Some(tab) = this
+                .sessions
+                .iter()
+                .find(|s| s.files.as_ref() == Some(&pane))
+                && !tab.files_needs_rebind
+                && tab.terminal.read(cx).connection_generation() == tab.file_generation
+                && tab.terminal.read(cx).session_state()
+                    == opsssh_term_core::SessionState::Connected
+            {
+                tab.terminal
+                    .update(cx, |terminal, cx| terminal.insert_text(text, cx));
+            }
         })
         .detach();
-        self.tabs[index].files = Some(files.clone());
-        self.tabs[index].file_generation = generation;
-        self.tabs[index].followed_directory = Some(directory);
+        self.sessions[index].files = Some(files.clone());
+        self.sessions[index].file_generation = generation;
+        self.sessions[index].followed_directory = Some(directory);
         cx.notify();
         Some(files)
     }
@@ -523,5 +964,140 @@ impl Render for Workspace {
             });
         }
         self.render_workspace(window, cx)
+    }
+}
+
+#[cfg(all(test, feature = "capture"))]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext};
+
+    fn fixture(window: &mut Window, cx: &mut Context<Workspace>) -> Workspace {
+        let mut navigation = SessionTabs::default();
+        let sessions = (0..2)
+            .map(|_| {
+                let id = navigation.allocate();
+                // Invalid options fail before a worker can open a network connection.
+                let terminal = cx.new(|cx| {
+                    TerminalView::connect(
+                        opsssh_ssh_core::ConnectionOptions::new("", "", PathBuf::new()),
+                        window,
+                        cx,
+                    )
+                });
+                Tab {
+                    id,
+                    endpoint: Some("deploy@fixture.invalid:22".into()),
+                    persistent_name: None,
+                    protected: false,
+                    connected_at: None,
+                    page: SessionPage::Terminal,
+                    infrastructure: None,
+                    name: format!("Session {}", id.0),
+                    terminal,
+                    color: 0xbc3150,
+                    environment: String::new(),
+                    files: None,
+                    files_visible: false,
+                    follow: true,
+                    followed_directory: None,
+                    file_generation: 0,
+                    files_needs_rebind: false,
+                }
+            })
+            .collect();
+        Workspace {
+            home_focus: cx.focus_handle(),
+            search: cx.new(|cx| InputState::new(window, cx)),
+            store: Store::default(),
+            path: PathBuf::new(),
+            sessions,
+            navigation,
+            transition: 0,
+            pending_close: None,
+            quit_dialog: false,
+            uptime_timer: None,
+            editor: None,
+            settings_page: false,
+            help_page: false,
+            message: String::new(),
+            filter: "All servers".into(),
+            config: vec![],
+            launched: Instant::now(),
+            first_frame_recorded: false,
+            load_failed: true,
+        }
+    }
+
+    #[gpui::test]
+    fn hiding_and_reopening_retains_the_terminal_entity(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (workspace, cx) = cx.add_window_view(fixture);
+        VisualTestContext::update(cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                let id = this.sessions[0].id;
+                let terminal = this.sessions[0].terminal.clone();
+                let other = this.sessions[1].id;
+                this.finish_close(id, false, window, cx);
+                assert_eq!(this.sessions.len(), 2);
+                assert_eq!(this.navigation.active, Some(other));
+                assert!(!this.navigation.open.contains(&id));
+                this.activate_session(id, window, cx);
+                assert_eq!(
+                    this.sessions[this.session_index(id).unwrap()].terminal,
+                    terminal
+                );
+                assert_eq!(this.navigation.active, Some(id));
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn disconnect_and_stale_close_target_cannot_remove_another_session(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (workspace, cx) = cx.add_window_view(fixture);
+        VisualTestContext::update(cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                let first = this.sessions[0].id;
+                let second = this.sessions[1].id;
+                let terminal = this.sessions[1].terminal.clone();
+                this.finish_close(first, true, window, cx);
+                this.finish_close(first, true, window, cx);
+                assert_eq!(this.sessions.len(), 1);
+                assert_eq!(this.sessions[0].id, second);
+                assert_eq!(this.sessions[0].terminal, terminal);
+                assert_eq!(this.navigation.active, Some(second));
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn escape_cancels_close_without_hiding_or_disconnecting(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let mut workspace = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| fixture(window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        VisualTestContext::update(cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                let id = this.sessions[0].id;
+                this.request_close(id, window, cx);
+                assert_eq!(this.pending_close, Some(id));
+                assert_eq!(this.navigation.open.len(), 2);
+            })
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        VisualTestContext::update(cx, |_, cx| {
+            workspace.update(cx, |this, _| {
+                assert_eq!(this.pending_close, None);
+                assert_eq!(this.sessions.len(), 2);
+                assert_eq!(this.navigation.open.len(), 2);
+                assert_eq!(this.navigation.active, Some(this.sessions[1].id));
+            })
+        });
     }
 }

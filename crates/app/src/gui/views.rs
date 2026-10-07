@@ -1,7 +1,7 @@
 //! Workspace presentation. SSH/session ownership stays in the parent controller.
 use super::*;
 use crate::design;
-use gpui::{AnyElement, uniform_list};
+use gpui::{Animation, AnimationExt, AnyElement, ease_out_quint, uniform_list};
 use gpui_component::{
     ActiveTheme, Icon, IconName, Selectable, h_resizable,
     menu::{DropdownMenu, PopupMenuItem},
@@ -28,7 +28,7 @@ impl Workspace {
         design::apply(&self.store.settings.theme, window, cx);
         design::set_reduced_motion(self.store.settings.reduced_motion, cx);
         let font = self.store.settings.font_size as f32;
-        for tab in &self.tabs {
+        for tab in &self.sessions {
             tab.terminal.update(cx, |t, cx| t.set_font_size(font, cx));
         }
         cx.notify();
@@ -83,6 +83,109 @@ impl Workspace {
     fn sidebar(&self, narrow: bool, cx: &mut Context<Self>) -> gpui::Div {
         let p = design::palette(cx);
         let collapsed = self.store.settings.sidebar_collapsed || narrow;
+        if !self.settings_page
+            && !self.help_page
+            && let Some(id) = self.navigation.active
+            && let Some(index) = self.session_index(id)
+        {
+            let tab = &self.sessions[index];
+            let mut side = div()
+                .w(px(if collapsed { 64. } else { 220. }))
+                .h_full()
+                .flex_shrink_0()
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .bg(rgb(p.sidebar))
+                .border_r_1()
+                .border_color(rgb(p.border))
+                .child(
+                    Button::new("back-servers")
+                        .ghost()
+                        .icon(IconName::ArrowLeft)
+                        .tooltip(tr("back-servers"))
+                        .accessibility_label(tr("back-servers"))
+                        .when(!collapsed, |b| b.label(tr("back-servers")))
+                        .w_full()
+                        .on_click(cx.listener(|this, _, w, cx| this.home(&GoHome, w, cx))),
+                )
+                .when(!collapsed, |d| {
+                    d.child(
+                        div()
+                            .mt_4()
+                            .mb_2()
+                            .text_xs()
+                            .text_color(rgb(p.muted))
+                            .child(tr("server-workspace")),
+                    )
+                });
+            for (i, (page, key, icon)) in [
+                (
+                    SessionPage::Terminal,
+                    "nav-terminal",
+                    IconName::SquareTerminal,
+                ),
+                (SessionPage::Files, "nav-files", IconName::Folder),
+                (
+                    SessionPage::Infrastructure,
+                    "nav-infrastructure",
+                    IconName::LayoutDashboard,
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if tab.endpoint.is_none() && page != SessionPage::Terminal {
+                    continue;
+                }
+                side = side.child(
+                    Button::new(("session-nav", i))
+                        .ghost()
+                        .selected(tab.page == page)
+                        .icon(icon)
+                        .tooltip(tr(key))
+                        .accessibility_label(tr(key))
+                        .when(!collapsed, |b| b.label(tr(key)))
+                        .w_full()
+                        .on_click(
+                            cx.listener(move |this, _, w, cx| this.select_page(id, page, w, cx)),
+                        ),
+                );
+            }
+            return side
+                .child(div().flex_1())
+                .when(!collapsed, |d| {
+                    d.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(p.muted))
+                            .child(tr(if tab.protected {
+                                "tmux-protected"
+                            } else {
+                                "session-unprotected"
+                            })),
+                    )
+                })
+                .child(
+                    Button::new("collapse-session-nav")
+                        .ghost()
+                        .icon(if collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronLeft
+                        })
+                        .tooltip(tr("sidebar-toggle"))
+                        .accessibility_label(tr("sidebar-toggle"))
+                        .on_click(cx.listener(|this, _, w, cx| {
+                            this.change_settings(
+                                |s| s.sidebar_collapsed = !s.sidebar_collapsed,
+                                w,
+                                cx,
+                            )
+                        })),
+                );
+        }
         let mut sidebar = div()
             .w(px(if collapsed { 64. } else { 220. }))
             .flex_shrink_0()
@@ -140,7 +243,7 @@ impl Workspace {
         {
             let selected = !self.settings_page
                 && !self.help_page
-                && self.active.is_none()
+                && self.navigation.active.is_none()
                 && self.filter == filter;
             sidebar = sidebar.child(
                 Button::new(("nav", i))
@@ -182,7 +285,7 @@ impl Workspace {
                             self.filter == environment
                                 && !self.settings_page
                                 && !self.help_page
-                                && self.active.is_none(),
+                                && self.navigation.active.is_none(),
                         )
                         .label(environment.clone())
                         .w_full()
@@ -208,6 +311,8 @@ impl Workspace {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.settings_page = true;
                         this.help_page = false;
+                        this.transition = this.transition.wrapping_add(1);
+                        this.sync_visibility(cx);
                         cx.notify();
                     })),
             )
@@ -223,6 +328,8 @@ impl Workspace {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.help_page = true;
                         this.settings_page = false;
+                        this.transition = this.transition.wrapping_add(1);
+                        this.sync_visibility(cx);
                         cx.notify();
                     })),
             )
@@ -866,107 +973,310 @@ impl Workspace {
     }
     fn session(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let p = design::palette(cx);
-        let tab = &self.tabs[index];
+        let tab = &self.sessions[index];
+        let id = tab.id;
         let terminal = tab.terminal.clone();
         let files = tab.files.clone();
         let visible = tab.files_visible;
         let follow = tab.follow;
-        let is_ssh = terminal.read(cx).ssh_commands().is_some();
+        let status = terminal.read(cx).connection_status();
+        let state = terminal.read(cx).session_state();
+        let live = state == opsssh_term_core::SessionState::Connected;
+        let endpoint = tab.endpoint.clone();
+        let copy = endpoint.clone().unwrap_or_default();
+        let header = div()
+            .min_h(px(76.))
+            .flex_shrink_0()
+            .px_5()
+            .py_3()
+            .flex()
+            .items_center()
+            .gap_3()
+            .border_b_1()
+            .border_color(rgb(p.border))
+            .bg(rgb(p.sidebar))
+            .child(
+                div()
+                    .size(px(40.))
+                    .rounded_lg()
+                    .bg(rgb(p.ruby_tint))
+                    .text_color(rgb(p.ruby))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_lg()
+                    .child(">_"),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(tab.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(p.muted))
+                            .child(endpoint.unwrap_or_else(|| tr("local-session"))),
+                    ),
+            )
+            .when(tab.endpoint.is_some(), |d| {
+                d.child(
+                    Button::new("copy-endpoint")
+                        .ghost()
+                        .icon(IconName::Copy)
+                        .tooltip(tr("copy-endpoint"))
+                        .accessibility_label(tr("copy-endpoint"))
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone()))
+                        }),
+                )
+            })
+            .when(!tab.environment.is_empty(), |d| {
+                d.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(tab.color))
+                        .text_xs()
+                        .text_color(rgb(p.muted))
+                        .child(tab.environment.clone()),
+                )
+            })
+            .when(tab.endpoint.is_some(), |d| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(p.muted))
+                        .child(tr(if tab.protected {
+                            "tmux-protected"
+                        } else {
+                            "session-unprotected"
+                        })),
+                )
+            })
+            .when(tab.connected_at.is_some(), |d| {
+                d.child(div().text_xs().text_color(rgb(p.muted)).child(format!(
+                    "{}m",
+                    tab.connected_at.unwrap().elapsed().as_secs() / 60
+                )))
+            })
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .rounded_full()
+                    .bg(rgb(p.surface))
+                    .border_1()
+                    .border_color(rgb(p.border))
+                    .text_xs()
+                    .text_color(if live {
+                        cx.theme().success
+                    } else {
+                        cx.theme().warning
+                    })
+                    .child(status),
+            )
+            .when(state == opsssh_term_core::SessionState::Reconnecting, |d| {
+                d.child(
+                    Button::new("stop-recovery")
+                        .ghost()
+                        .label(tr("stop-reconnecting"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(i) = this.session_index(id) {
+                                this.sessions[i]
+                                    .terminal
+                                    .update(cx, |t, cx| t.disconnect(cx));
+                            }
+                            this.sync_visibility(cx);
+                            cx.notify();
+                        })),
+                )
+            });
+        let body = match tab.page {
+            SessionPage::Files => files
+                .clone()
+                .map(|f| div().size_full().child(f).into_any_element())
+                .unwrap_or_else(|| {
+                    div()
+                        .p_6()
+                        .child(tr("infra-connect-first"))
+                        .into_any_element()
+                }),
+            SessionPage::Infrastructure => tab
+                .infrastructure
+                .clone()
+                .map(|view| div().size_full().child(view).into_any_element())
+                .unwrap_or_else(|| {
+                    div()
+                        .p_6()
+                        .child(tr("infra-connect-first"))
+                        .into_any_element()
+                }),
+            SessionPage::Terminal => div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .min_h_0()
+                .p_4()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .child(tr("nav-terminal")),
+                        )
+                        .child(div().flex_1())
+                        .when(tab.endpoint.is_some(), |d| {
+                            d.child(
+                                Button::new("toggle-files")
+                                    .ghost()
+                                    .selected(visible)
+                                    .icon(IconName::Folder)
+                                    .label(tr("files"))
+                                    .on_click(cx.listener(move |this, _, w, cx| {
+                                        let Some(i) = this.session_index(id) else {
+                                            return;
+                                        };
+                                        if this.sessions[i].files_visible {
+                                            this.sessions[i].files_visible = false;
+                                        } else {
+                                            let t = this.sessions[i].terminal.clone();
+                                            this.ensure_files(&t, w, cx);
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(visible, |d| {
+                                d.child(
+                                    Button::new("follow-folder")
+                                        .ghost()
+                                        .selected(follow)
+                                        .label(tr("follow-folder"))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let Some(i) = this.session_index(id) else {
+                                                return;
+                                            };
+                                            let tab = &mut this.sessions[i];
+                                            tab.follow = !tab.follow;
+                                            if tab.follow
+                                                && let (Some(path), Some(files)) = (
+                                                    tab.terminal
+                                                        .read(cx)
+                                                        .current_directory()
+                                                        .map(str::to_owned),
+                                                    tab.files.clone(),
+                                                )
+                                            {
+                                                files.update(cx, |f, cx| {
+                                                    f.follow_directory(path.clone(), cx)
+                                                });
+                                                tab.followed_directory = Some(path);
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                            })
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .rounded_lg()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(rgb(p.border))
+                        .when(visible && files.is_some(), |d| {
+                            d.child(
+                                h_resizable(("session-split", id.0 as usize))
+                                    .child(
+                                        resizable_panel()
+                                            .size_range(px(200.)..px(10000.))
+                                            .child(div().size_full().child(terminal.clone())),
+                                    )
+                                    .child(
+                                        resizable_panel()
+                                            .size(px(360.))
+                                            .size_range(px(300.)..px(600.))
+                                            .child(files.clone().unwrap()),
+                                    ),
+                            )
+                        })
+                        .when(!visible || files.is_none(), |d| {
+                            d.child(div().size_full().child(terminal))
+                        }),
+                )
+                .into_any_element(),
+        };
         div()
             .size_full()
             .flex()
             .flex_col()
             .min_h_0()
-            .child(
-                div()
-                    .h(px(44.))
-                    .px_4()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(rgb(p.border))
-                    .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(rgb(tab.color)))
-                    .child(div().text_sm().child(tab.name.clone()))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(p.muted))
-                            .child(tab.environment.clone()),
-                    )
-                    .child(div().flex_1())
-                    .when(is_ssh, |d| {
-                        d.child(
-                            Button::new("toggle-files")
-                                .ghost()
-                                .selected(visible)
-                                .icon(IconName::Folder)
-                                .label(tr("files"))
-                                .on_click(cx.listener(move |this, _, w, cx| {
-                                    if this.tabs[index].files_visible {
-                                        this.tabs[index].files_visible = false;
-                                    } else {
-                                        let terminal = this.tabs[index].terminal.clone();
-                                        this.ensure_files(&terminal, w, cx);
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                        .when(visible, |d| {
-                            d.child(
-                                Button::new("follow-folder")
-                                    .ghost()
-                                    .selected(follow)
-                                    .label(tr("follow-folder"))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.tabs[index].follow = !this.tabs[index].follow;
-                                        if this.tabs[index].follow {
-                                            let directory = this.tabs[index]
-                                                .terminal
-                                                .read(cx)
-                                                .current_directory()
-                                                .map(str::to_owned);
-                                            if let (Some(directory), Some(files)) =
-                                                (directory, this.tabs[index].files.clone())
-                                            {
-                                                files.update(cx, |pane, cx| {
-                                                    pane.follow_directory(directory.clone(), cx)
-                                                });
-                                                this.tabs[index].followed_directory =
-                                                    Some(directory);
-                                            }
-                                        }
-                                        cx.notify();
-                                    })),
-                            )
-                        })
-                    }),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .when(visible && files.is_some(), |d| {
-                        d.child(
-                            h_resizable(("session-split", index))
-                                .child(
-                                    resizable_panel()
-                                        .size_range(px(200.)..px(10000.))
-                                        .child(div().size_full().child(terminal.clone())),
-                                )
-                                .child(
-                                    resizable_panel()
-                                        .size(px(360.))
-                                        .size_range(px(300.)..px(600.))
-                                        .child(files.clone().unwrap()),
-                                ),
-                        )
-                    })
-                    .when(!visible || files.is_none(), |d| {
-                        d.child(div().size_full().child(terminal))
-                    }),
-            )
+            .child(header)
+            .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
+    }
+    fn background_sessions(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let p = design::palette(cx);
+        let hidden = self
+            .sessions
+            .iter()
+            .filter(|s| !self.navigation.open.contains(&s.id))
+            .collect::<Vec<_>>();
+        div().when(!hidden.is_empty(), |d| {
+            d.p_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(p.border))
+                .bg(rgb(p.surface))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(p.muted))
+                        .child(tr("background-sessions")),
+                )
+                .child(
+                    div()
+                        .id("background-session-strip")
+                        .flex()
+                        .gap_2()
+                        .overflow_x_scroll()
+                        .children(hidden.into_iter().map(|s| {
+                            let id = s.id;
+                            Button::new(("reopen", id.0 as usize))
+                                .ghost()
+                                .icon(IconName::SquareTerminal)
+                                .label(format!(
+                                    "{} · {}",
+                                    s.name,
+                                    s.terminal.read(cx).connection_status()
+                                ))
+                                .tooltip(tr("reopen-session"))
+                                .on_click(cx.listener(move |this, _, w, cx| {
+                                    this.activate_session(id, w, cx)
+                                }))
+                        })),
+                )
+        })
     }
     pub(super) fn render_workspace(
         &mut self,
@@ -975,29 +1285,52 @@ impl Workspace {
     ) -> gpui::Stateful<gpui::Div> {
         let p = design::palette(cx);
         let narrow = window.viewport_size().width < px(1100.);
-        let home = self.active.is_none() && !self.settings_page && !self.help_page;
+        let home = self.navigation.active.is_none() && !self.settings_page && !self.help_page;
         let tabs = self
-            .tabs
+            .navigation
+            .open
             .iter()
-            .enumerate()
-            .map(|(index, tab)| {
-                Button::new(("tab", index))
-                    .ghost()
-                    .selected(self.active == Some(index) && !self.settings_page && !self.help_page)
-                    .label(tab.name.clone())
-                    .tooltip(format!(
-                        "{} · {}",
-                        tab.name,
-                        tab.terminal.read(cx).connection_status()
-                    ))
-                    .max_w(px(220.))
-                    .on_click(cx.listener(move |this, _, w, cx| {
-                        this.active = Some(index);
-                        this.settings_page = false;
-                        this.help_page = false;
-                        this.tabs[index].terminal.update(cx, |t, cx| t.focus(w, cx));
-                        cx.notify();
-                    }))
+            .filter_map(|id| self.session_index(*id))
+            .map(|index| {
+                let tab = &self.sessions[index];
+                let id = tab.id;
+                let selected =
+                    self.navigation.active == Some(id) && !self.settings_page && !self.help_page;
+                div()
+                    .id(("tab-shell", id.0 as usize))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .rounded_lg()
+                    .px_1()
+                    .bg(rgb(if selected { p.raised } else { p.sidebar }))
+                    .border_1()
+                    .border_color(rgb(if selected { p.border } else { p.sidebar }))
+                    .child(
+                        Button::new(("tab", id.0 as usize))
+                            .ghost()
+                            .selected(selected)
+                            .label(tab.name.clone())
+                            .tooltip(format!(
+                                "{} · {}",
+                                tab.name,
+                                tab.terminal.read(cx).connection_status()
+                            ))
+                            .max_w(px(200.))
+                            .on_click(
+                                cx.listener(move |this, _, w, cx| this.activate_session(id, w, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new(("close-tab", id.0 as usize))
+                            .ghost()
+                            .icon(IconName::Close)
+                            .tooltip(tr("close-tab"))
+                            .accessibility_label(format!("{} {}", tr("close-tab"), tab.name))
+                            .on_click(
+                                cx.listener(move |this, _, w, cx| this.request_close(id, w, cx)),
+                            ),
+                    )
             })
             .collect::<Vec<_>>();
         let content = if self.settings_page {
@@ -1021,7 +1354,7 @@ impl Workspace {
                 )
                 .child(self.shortcuts(cx))
                 .into_any_element()
-        } else if let Some(index) = self.active {
+        } else if let Some(index) = self.navigation.active.and_then(|id| self.session_index(id)) {
             self.session(index, cx)
         } else {
             self.servers(window, cx)
@@ -1079,21 +1412,6 @@ impl Workspace {
                             .on_click(cx.listener(|this, _, w, cx| {
                                 this.open_local(&OpenLocalTerminal, w, cx)
                             })),
-                    )
-                    .when(
-                        self.active.is_some() && !self.settings_page && !self.help_page,
-                        |d| {
-                            d.child(
-                                Button::new("close-tab")
-                                    .ghost()
-                                    .icon(IconName::Close)
-                                    .tooltip(tr("close-tab"))
-                                    .accessibility_label(tr("close-tab"))
-                                    .on_click(cx.listener(|this, _, w, cx| {
-                                        this.close_tab(&CloseTab, w, cx)
-                                    })),
-                            )
-                        },
                     ),
             )
             .child(
@@ -1101,7 +1419,20 @@ impl Workspace {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .child(self.sidebar(narrow, cx))
+                    .child(
+                        self.sidebar(narrow, cx).with_animation(
+                            ("sidebar-enter", self.transition as usize),
+                            Animation::new(std::time::Duration::from_millis(
+                                if self.store.settings.reduced_motion {
+                                    0
+                                } else {
+                                    160
+                                },
+                            ))
+                            .with_easing(ease_out_quint()),
+                            |d, t| d.opacity(0.6 + 0.4 * t),
+                        ),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -1133,7 +1464,21 @@ impl Workspace {
                                         ),
                                 )
                             })
-                            .child(div().flex_1().min_h_0().child(content)),
+                            .when(home, |d| d.child(self.background_sessions(cx)))
+                            .child(
+                                div().flex_1().min_h_0().child(content).with_animation(
+                                    ("page-enter", self.transition as usize),
+                                    Animation::new(std::time::Duration::from_millis(
+                                        if self.store.settings.reduced_motion {
+                                            0
+                                        } else {
+                                            140
+                                        },
+                                    ))
+                                    .with_easing(ease_out_quint()),
+                                    |d, t| d.opacity(0.65 + 0.35 * t),
+                                ),
+                            ),
                     ),
             )
     }

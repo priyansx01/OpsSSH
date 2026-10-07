@@ -5,6 +5,7 @@ use gpui_component::{
     ActiveTheme, Selectable,
     button::{Button, ButtonVariants},
     input::{Input, InputState},
+    switch::Switch,
 };
 use opsssh_store::{Auth, Profile};
 use std::collections::BTreeMap;
@@ -48,6 +49,7 @@ mod tests {
         VisualTestContext::update(cx, |_, cx| {
             form.update(cx, |form, cx| {
                 assert!(!form.details && !form.advanced);
+                assert!(form.protect_work);
                 assert_eq!(form.profile(cx), Some(expected));
             })
         });
@@ -107,6 +109,60 @@ mod tests {
             })
         });
     }
+
+    #[gpui::test]
+    fn tmux_protection_is_opt_in_and_session_name_is_validated(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (form, cx) = cx.add_window_view(|window, cx| {
+            ConnectionForm::new(
+                Profile {
+                    host: "server.example.test".into(),
+                    user: "deploy".into(),
+                    ..Profile::default()
+                },
+                vec![],
+                window,
+                cx,
+            )
+        });
+        VisualTestContext::update(cx, |window, cx| {
+            form.update(cx, |form, cx| {
+                assert!(!form.protect_work);
+                assert_eq!(form.profile(cx).unwrap().tmux_session, None);
+                form.protect_work = true;
+                assert_eq!(
+                    form.profile(cx).unwrap().tmux_session.as_deref(),
+                    Some("ops")
+                );
+                form.fields
+                    .tmux
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                assert!(form.profile(cx).is_none());
+                assert!(form.errors.contains_key("form-tmux-name"));
+                form.fields
+                    .tmux
+                    .update(cx, |input, cx| input.set_value("a".repeat(101), window, cx));
+                assert!(form.profile(cx).is_none());
+                form.fields
+                    .tmux
+                    .update(cx, |input, cx| input.set_value("work;unsafe", window, cx));
+                assert!(form.profile(cx).is_none());
+                assert!(form.errors.contains_key("form-tmux-name"));
+                assert!(!form.advanced);
+                form.protect_work = false;
+                assert_eq!(form.profile(cx).unwrap().tmux_session, None);
+                assert_eq!(form.fields.tmux.read(cx).value(), "work;unsafe");
+                form.protect_work = true;
+                form.fields
+                    .tmux
+                    .update(cx, |input, cx| input.set_value("release-42", window, cx));
+                assert_eq!(
+                    form.profile(cx).unwrap().tmux_session.as_deref(),
+                    Some("release-42")
+                );
+            })
+        });
+    }
 }
 struct Fields {
     name: Entity<InputState>,
@@ -143,7 +199,10 @@ impl Fields {
             certificate: input(p.certificate_file.clone(), "form-certificate"),
             jump: input(p.proxy_jump.clone(), "form-jump"),
             proxy: input(p.proxy_command.clone(), "form-proxy"),
-            tmux: input(p.tmux_session.clone().unwrap_or_default(), "form-tmux"),
+            tmux: input(
+                p.tmux_session.clone().unwrap_or_else(|| "ops".into()),
+                "form-tmux-name",
+            ),
             keepalive: input(p.keepalive_seconds.to_string(), "form-keepalive"),
             known_hosts: input(p.known_hosts.clone(), "form-known-hosts"),
             tags: input(p.tags.join(", "), "form-tags"),
@@ -161,6 +220,7 @@ pub struct ConnectionForm {
     routing: bool,
     security: bool,
     session: bool,
+    protect_work: bool,
     command: bool,
     errors: BTreeMap<&'static str, String>,
     message: String,
@@ -175,6 +235,7 @@ impl ConnectionForm {
     ) -> Self {
         let fields = Fields::new(&profile, window, cx);
         let quick = cx.new(|cx| InputState::new(window, cx).placeholder("ssh user@host"));
+        let protect_work = profile.tmux_session.is_some();
         Self {
             profile,
             fields,
@@ -185,6 +246,7 @@ impl ConnectionForm {
             routing: false,
             security: false,
             session: false,
+            protect_work,
             command: false,
             errors: BTreeMap::new(),
             message: String::new(),
@@ -235,8 +297,18 @@ impl ConnectionForm {
             p.proxy_review_required = true;
         }
         p.proxy_command = proxy;
-        let tmux = value(&self.fields.tmux);
-        p.tmux_session = (!tmux.is_empty()).then_some(tmux);
+        let tmux = value(&self.fields.tmux).trim().to_owned();
+        p.tmux_session = self.protect_work.then_some(tmux.clone());
+        if self.protect_work
+            && (tmux.is_empty()
+                || tmux.len() > 100
+                || !tmux
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        {
+            self.errors
+                .insert("form-tmux-name", tr("form-invalid-tmux"));
+        }
         match value(&self.fields.keepalive).parse() {
             Ok(seconds) => p.keepalive_seconds = seconds,
             _ => {
@@ -416,6 +488,37 @@ impl Render for ConnectionForm {
                         Auth::Key => "auth-key-help",
                     })),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        Switch::new("protect-work")
+                            .checked(self.protect_work)
+                            .label(tr("form-protect-work"))
+                            .on_click(cx.listener(|this, checked, _, cx| {
+                                this.protect_work = *checked;
+                                this.errors.remove("form-tmux-name");
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(tr("form-protect-work-help")),
+                    )
+                    .when(self.protect_work, |d| {
+                        d.child(self.row("form-tmux-name", &self.fields.tmux, cx))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(tr("form-tmux-name-help")),
+                            )
+                    }),
+            )
             .child(self.heading("form-details", self.details, cx))
             .when(self.details, |d| {
                 d.child(self.row("form-name", &self.fields.name, cx))
@@ -450,6 +553,9 @@ impl Render for ConnectionForm {
                                             .filter(|s| !s.is_empty())
                                             .map(str::to_owned)
                                             .collect();
+                                        profile.tmux_session = this
+                                            .protect_work
+                                            .then(|| this.fields.tmux.read(cx).value().to_string());
                                         this.fields = Fields::new(&profile, window, cx);
                                         this.profile = profile;
                                         this.warnings = parsed.warnings;
@@ -532,8 +638,7 @@ impl Render for ConnectionForm {
                     })
                     .child(self.heading("form-session", self.session, cx))
                     .when(self.session, |d| {
-                        d.child(self.row("form-tmux", &self.fields.tmux, cx))
-                            .child(self.row("form-keepalive", &self.fields.keepalive, cx))
+                        d.child(self.row("form-keepalive", &self.fields.keepalive, cx))
                     })
             })
             .child(

@@ -57,3 +57,48 @@ Rendered Windows screens were inspected at the current desktop scale (125%),
 including a 1024x768 logical window and a 500-profile fixture. Additional OS/DPI,
 screen-reader, live file-browser, and novice usability acceptance remain release
 checks; these results do not establish performance or cross-platform acceptance.
+
+
+## Connected VM workspaces
+
+Entering a VM replaces Home navigation with Terminal, File Manager, and
+Infrastructure. Back to servers restores Home. Each tab has a close button;
+live SSH sessions offer Stay connected, Disconnect, or Cancel. Hidden sessions
+remain in the registry and appear on Home, retaining the same terminal and
+transfer state. App exit reports active sessions and transfers. Plain SSH cannot
+promise work survives disconnection; optional named tmux workspaces can be
+reattached after network recovery or app restart. Missing tmux requires an
+explicit choice before connecting without protection.
+
+Files share one SFTP worker between the terminal drawer and full-page grid/list.
+Search and hidden-file filtering apply to the current folder. Name, size, and
+modified sorting keep folders first. Interrupted transfers retain failure detail
+and a Retry action after reconnection. Retry starts a new transfer rather than
+resuming byte offsets; partial remote files remain, and CreateNew prevents
+silently overwriting them. Choose another folder or remove the partial file.
+Download retries ask for a destination again.
+
+Infrastructure currently supports Linux only. It collects bounded read-only
+metrics on a separate SSH channel every five seconds while visible. Process CPU
+uses 100% per core; overall CPU uses 100% for all cores. Initial CPU readings need
+two samples. Missing readings display unavailable, and collection is capped at
+1,000 processes. Termination sends SIGTERM only after confirmation and checking
+the PID/start-time identity; permission failures never trigger sudo.
+
+Sidebar/page opacity transitions finish in 140?160 ms and do not animate PTY
+dimensions. Reduced motion disables these and component transitions.
+
+New capture fixtures (example data, no SSH) are snapshot-session-terminal,
+snapshot-session-files, snapshot-session-infra, snapshot-close, and
+snapshot-background. Add -light to inspect the light theme. These fixtures check
+layout; live tmux and infrastructure behavior still need disposable Linux-server
+acceptance in addition to loopback transport and parser tests.
+
+
+Server workspace verification on Windows: the workspace suite passed 106 tests covering session lifecycle, visible forms,
+metrics parsing, and real SSH transport regressions; strict Clippy, formatting, whitespace, and
+headless compilation passed. Rendered Terminal, Files grid/list, Infrastructure,
+connection form, and close-modal screens were inspected at 125% scaling with
+1280x820 and 1024x768 logical windows. File chrome was compacted after review to
+leave room for two grid rows or several list entries at the smaller size. Other
+OS/DPI and live Linux-server acceptance remain release checks.

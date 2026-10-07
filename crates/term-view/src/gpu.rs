@@ -63,6 +63,10 @@ struct ShapedRow {
 /// GPUI's display callback coalesces snapshots at the native frame rate.
 pub struct TerminalView {
     focus: FocusHandle,
+    connection_options: Option<ConnectionOptions>,
+    stopped: bool,
+    tmux_missing: bool,
+    notice_task: Option<Task<()>>,
     session: Option<Session>,
     snapshot: TerminalSnapshot,
     shapes: Vec<ShapedRow>,
@@ -113,6 +117,43 @@ impl TerminalView {
 
     pub fn ssh_commands(&self) -> Option<async_channel::Sender<SshCommand>> {
         self.session.as_ref().and_then(Session::ssh_commands)
+    }
+
+    /// Stop transport recovery without destroying the retained terminal buffer.
+    pub fn disconnect(&mut self, cx: &mut Context<Self>) {
+        if let Some(commands) = self.ssh_commands() {
+            let _ = commands.try_send(SshCommand::Disconnect);
+        }
+        self.notice_task = None;
+        self.session = None;
+        self.stopped = true;
+        self.prompt = None;
+        self.blink_task = None;
+        self.sync_task = None;
+        self.error = None;
+        self.connection_generation = self.connection_generation.wrapping_add(1);
+        cx.notify();
+    }
+    pub fn is_tmux_protected(&self) -> bool {
+        self.connection_options
+            .as_ref()
+            .is_some_and(|o| o.tmux.is_some())
+    }
+    fn connect_without_protection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.tmux_missing {
+            return;
+        }
+        let Some(mut options) = self.connection_options.clone() else {
+            return;
+        };
+        options.tmux = None;
+        let generation = self.connection_generation.wrapping_add(1);
+        let font_size = self.font_size;
+        let mut replacement = Self::start(Some(options), window, cx);
+        replacement.connection_generation = generation;
+        replacement.set_font_size(font_size, cx);
+        *self = replacement;
+        cx.notify();
     }
 
     pub fn current_directory(&self) -> Option<&str> {
@@ -190,13 +231,14 @@ impl TerminalView {
         focus.focus(window, cx);
         let options = LocalShellOptions::default();
         let dimensions = options.size;
+        let connection_options = remote.clone();
         let startup = cx.background_executor().spawn(async move {
             match remote {
                 Some(remote) => Session::remote(remote, dimensions),
                 None => Session::local(options),
             }
         });
-        cx.spawn_in(window, async move |this, cx| {
+        let notice_task = cx.spawn_in(window, async move |this, cx| {
             let result = startup.await;
             let notices = this
                 .update_in(cx, |view, window, cx| match result {
@@ -227,10 +269,13 @@ impl TerminalView {
                     }
                 }
             }
-        })
-        .detach();
+        });
         Self {
             focus,
+            connection_options,
+            stopped: false,
+            tmux_missing: false,
+            notice_task: Some(notice_task),
             session: None,
             snapshot: TerminalSnapshot::default(),
             shapes: Vec::new(),
@@ -299,6 +344,12 @@ impl TerminalView {
                 self.prompt = None;
             }
             SshEvent::Error(error) => self.error = Some(error),
+            SshEvent::Closed {
+                exit_status: Some(127),
+            } if self.is_tmux_protected() => {
+                self.tmux_missing = true;
+                self.error = Some(tr("term-tmux-missing"));
+            }
             SshEvent::HostKeyPrompt {
                 id,
                 host,
@@ -777,6 +828,9 @@ impl TerminalView {
     }
 
     fn state(&self) -> SessionState {
+        if self.stopped {
+            return SessionState::Disconnected;
+        }
         self.session
             .as_ref()
             .map(Session::state)
@@ -1382,6 +1436,24 @@ impl Render for TerminalView {
                             .child(status),
                     ),
             )
+            .when(self.tmux_missing, |d| {
+                d.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .bg(colors.surface)
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Button::new("connect-without-tmux")
+                                .label(tr("term-connect-unprotected"))
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.connect_without_protection(window, cx)
+                                })),
+                        )
+                        .child(div().text_sm().child(tr("term-tmux-install-help"))),
+                )
+            })
             .child(
                 div()
                     .flex_1()

@@ -100,6 +100,10 @@ impl client::Handler for HostHandler {
                                 .send(Err("SSH authentication is not complete".into()))
                                 .await;
                         }
+                        SshCommand::Exec { reply, .. } => {
+                            let _ =
+                                reply.try_send(Err("SSH authentication is not complete".into()));
+                        }
                         _ => {}
                     }
                 }
@@ -132,6 +136,99 @@ impl fmt::Debug for AuthenticatedConnection {
     }
 }
 impl AuthenticatedConnection {
+    async fn open_sftp_requested(
+        &self,
+        reply: &Sender<std::result::Result<SftpStream, String>>,
+    ) -> Result<SftpStream> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut channel = tokio::select! {
+            channel = tokio::time::timeout_at(deadline,self.handle.channel_open_session()) =>
+                channel.context("SFTP subsystem request timed out")??,
+            _ = reply.closed() => bail!("SFTP subsystem request cancelled"),
+        };
+        let opening = async {
+            channel.request_subsystem(true, "sftp").await?;
+            wait_success(&mut channel)
+                .await
+                .context("Server has no working SFTP subsystem")
+        };
+        let result = tokio::select! {
+            result = tokio::time::timeout_at(deadline,opening) => match result {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("SFTP subsystem request timed out")),
+            },
+            _ = reply.closed() => Err(anyhow::anyhow!("SFTP subsystem request cancelled")),
+        };
+        match result {
+            Ok(()) => Ok(channel.into_stream()),
+            Err(error) => {
+                let _ = tokio::time::timeout(Duration::from_millis(250), channel.close()).await;
+                Err(error)
+            }
+        }
+    }
+    /// Runs on a separate channel. Timeout/cancellation closes only this channel.
+    pub async fn exec_bounded(&self, request: ExecRequest) -> Result<ExecOutput> {
+        anyhow::ensure!(!request.timeout.is_zero(), "Exec timeout must be positive");
+        anyhow::ensure!(
+            request.timeout <= Duration::from_secs(60),
+            "Exec timeout cannot exceed 60 seconds"
+        );
+        anyhow::ensure!(
+            request.output_limit > 0 && request.output_limit <= 16 * 1024 * 1024,
+            "Exec output limit must be between 1 byte and 16 MiB"
+        );
+        anyhow::ensure!(
+            request.command.len() <= 64 * 1024,
+            "Exec command is too large"
+        );
+        anyhow::ensure!(!request.control.is_cancelled(), "Remote command cancelled");
+        let deadline = tokio::time::Instant::now() + request.timeout;
+        let mut channel = tokio::select! {
+            channel = tokio::time::timeout_at(deadline, self.handle.channel_open_session()) =>
+                channel.context("Remote command timed out")??,
+            _ = wait_exec_cancellation(&request.control) => bail!("Remote command cancelled"),
+        };
+        let result = async {
+            channel.exec(true, request.command).await?;
+            let mut output = ExecOutput::default();
+            while let Some(message) = channel.wait().await {
+                match message {
+                    ChannelMsg::Data { data } => {
+                        anyhow::ensure!(
+                            output.stdout.len() + output.stderr.len() + data.len()
+                                <= request.output_limit,
+                            "Remote command output exceeds its limit"
+                        );
+                        output.stdout.extend_from_slice(&data);
+                    }
+                    ChannelMsg::ExtendedData { data, .. } => {
+                        anyhow::ensure!(
+                            output.stdout.len() + output.stderr.len() + data.len()
+                                <= request.output_limit,
+                            "Remote command output exceeds its limit"
+                        );
+                        output.stderr.extend_from_slice(&data);
+                    }
+                    ChannelMsg::ExitStatus { exit_status } => {
+                        output.exit_status = Some(exit_status)
+                    }
+                    ChannelMsg::Failure => bail!("Remote command rejected"),
+                    _ => {}
+                }
+            }
+            Ok(output)
+        };
+        let outcome = tokio::select! {
+            result = tokio::time::timeout_at(deadline, result) => match result {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("Remote command timed out")),
+            },
+            _ = wait_exec_cancellation(&request.control) => Err(anyhow::anyhow!("Remote command cancelled")),
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(250), channel.close()).await;
+        outcome
+    }
     pub async fn open_sftp(&self) -> Result<SftpStream> {
         let mut channel = self.handle.channel_open_session().await?;
         channel.request_subsystem(true, "sftp").await?;
@@ -166,6 +263,11 @@ impl AuthenticatedConnection {
             }
         }
         Ok((bytes, status))
+    }
+}
+async fn wait_exec_cancellation(control: &ExecControl) {
+    while !control.is_cancelled() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -343,6 +445,9 @@ async fn ask(
                 let _ = reply
                     .send(Err("SSH authentication is not complete".into()))
                     .await;
+            }
+            SshCommand::Exec { reply, .. } => {
+                let _ = reply.try_send(Err("SSH authentication is not complete".into()));
             }
             _ => {}
         }
@@ -593,7 +698,8 @@ async fn run_once(
     memory: SharedMemory,
 ) -> Result<bool> {
     let tmux = options.tmux.clone();
-    let connection = connect_cached(options, events.clone(), commands.clone(), memory).await?;
+    let connection =
+        Arc::new(connect_cached(options, events.clone(), commands.clone(), memory).await?);
     let mut channel = connection.handle.channel_open_session().await?;
     channel
         .request_pty(
@@ -616,22 +722,46 @@ async fn run_once(
     events.send(SshEvent::Connected).await?;
     let mut status = None;
     let mut lost = false;
+    let mut executions = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
+         _=executions.join_next(),if !executions.is_empty()=>{},
          message=channel.wait()=>match message {
           Some(ChannelMsg::Data{data})|Some(ChannelMsg::ExtendedData{data,..})=>{events.send(SshEvent::Data(data.to_vec())).await?;},
           Some(ChannelMsg::ExitStatus{exit_status})=>status=Some(exit_status),
           Some(ChannelMsg::Failure)=>bail!("Server rejected the terminal or shell request"),
-          Some(ChannelMsg::Close)=>break,None=>{lost=status.is_none();break;},_=>{}
+          Some(ChannelMsg::Close)=>{lost=status.is_none();break;},None=>{lost=status.is_none();break;},_=>{}
          },
          command=commands.recv()=>match command {
           Ok(SshCommand::Write(data))=>if channel.data(data.as_slice()).await.is_err(){lost=true;break;},
           Ok(SshCommand::Resize(new_size))=>{*size=new_size;if channel.window_change(size.columns().into(),size.rows().into(),0,0).await.is_err(){lost=true;break;}},
-          Ok(SshCommand::OpenSftp{reply})=>{let result=connection.open_sftp().await.map_err(|e|e.to_string());let _=reply.send(result).await;},
+          Ok(SshCommand::OpenSftp{reply})=>{
+            if executions.len() >= 4 {
+                let _=reply.try_send(Err("Too many remote operations are running".into()));
+            } else {
+                let connection=connection.clone();
+                executions.spawn(async move {
+                    let result=connection.open_sftp_requested(&reply).await.map_err(|error|format!("{error:#}"));
+                    let _=reply.try_send(result);
+                });
+            }
+          },
+          Ok(SshCommand::Exec{request,reply})=>{
+            if executions.len() >= 4 {
+                let _=reply.try_send(Err("Too many remote operations are running".into()));
+            } else {
+                let connection=connection.clone();
+                executions.spawn(async move {
+                    let result=connection.exec_bounded(request).await.map_err(|error|format!("{error:#}"));
+                    let _=reply.try_send(result);
+                });
+            }
+          },
           Ok(SshCommand::Disconnect)|Err(_)=>{let _=channel.close().await;break;},_=>{}
          }
         }
     }
+    executions.abort_all();
     let _ = connection.disconnect().await;
     if !lost {
         events
@@ -652,23 +782,33 @@ pub(crate) async fn run(
     commands: Receiver<SshCommand>,
 ) -> Result<()> {
     let memory: SharedMemory = Arc::default();
+    let mut recovering = false;
+    let mut attempt = 0u32;
     loop {
-        let lost = run_once(
+        let result = run_once(
             options.clone(),
             &mut size,
             events.clone(),
             commands.clone(),
             memory.clone(),
         )
-        .await?;
+        .await;
+        let lost = match result {
+            Ok(lost) => {
+                attempt = 0;
+                lost
+            }
+            Err(error) if recovering && recoverable_network_error(&error) => true,
+            Err(error) => return Err(error),
+        };
         if !lost || options.tmux.is_none() {
             return Ok(());
         }
+        recovering = true;
         options.reconnect = true;
         for jump in &mut options.jumps {
             jump.reconnect = true;
         }
-        let mut attempt = 0u32;
         loop {
             attempt = attempt.saturating_add(1);
             let delay = Duration::from_secs((2u64.saturating_pow(attempt.min(6))).min(60));
@@ -684,6 +824,7 @@ pub(crate) async fn run(
                   Ok(SshCommand::Disconnect)|Err(_)=>return Ok(()),
                   Ok(SshCommand::Resize(new_size))=>size=new_size,
                   Ok(SshCommand::OpenSftp{reply})=>{let _=reply.send(Err("SSH connection is recovering".into())).await;},
+                  Ok(SshCommand::Exec{reply,..})=>{let _=reply.try_send(Err("SSH connection is recovering".into()));},
                   _=>{} // Never replay keys or stale authentication replies.
                  }
                 }
@@ -703,8 +844,39 @@ pub(crate) async fn run(
                 break;
             }
         }
-        // A handshake/auth error is surfaced once, never retried indefinitely.
+        // Transient recovery handshakes retry; auth, trust, and protocol errors stop.
     }
+}
+fn recoverable_network_error(error: &anyhow::Error) -> bool {
+    fn io_error(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::UnexpectedEof
+        )
+    }
+    error.chain().any(|source| {
+        if let Some(error) = source.downcast_ref::<std::io::Error>() {
+            return io_error(error);
+        }
+        source.is::<tokio::time::error::Elapsed>()
+            || source.downcast_ref::<russh::Error>().is_some_and(|error| {
+                matches!(
+                    error,
+                    russh::Error::HUP
+                        | russh::Error::Disconnect
+                        | russh::Error::ConnectionTimeout
+                        | russh::Error::KeepaliveTimeout
+                        | russh::Error::InactivityTimeout
+                        | russh::Error::Elapsed(_)
+                ) || matches!(error,russh::Error::IO(error) if io_error(error))
+            })
+    })
 }
 
 struct PromptGuard(Arc<AtomicBool>);
@@ -729,7 +901,7 @@ async fn network_timeout<T, E: Into<anyhow::Error>>(
     loop {
         tokio::select! {result=&mut future=>return result.map_err(Into::into),_=tokio::time::sleep(Duration::from_millis(100))=>{
          if prompt_active.load(Ordering::Acquire){deadline=tokio::time::Instant::now()+timeout;}
-         else if tokio::time::Instant::now()>=deadline{bail!("SSH server response timed out");}
+         else if tokio::time::Instant::now()>=deadline{return Err(std::io::Error::new(std::io::ErrorKind::TimedOut,"SSH server response timed out").into());}
         }}
     }
 }
