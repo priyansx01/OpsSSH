@@ -25,7 +25,8 @@ responses are never saved.
 Ctrl/Cmd+Enter opens a local shell. Ctrl/Cmd+K opens home/search, Ctrl/Cmd+N adds
 a server, and Ctrl/Cmd+W closes the active tab. Ctrl/Cmd+Shift+H returns home while
 retaining sessions. Ctrl+Shift+Q (Cmd+Q on macOS) quits. These workspace shortcuts
-apply outside the focused terminal. Inside a terminal, keys go to the shell or
+apply outside the Terminal page. Opening or returning to a terminal focuses it
+automatically. Inside a terminal, keys go to the shell or
 harness, including Ctrl+K, Ctrl+N, Ctrl+W, Shift+Tab, Escape, and Alt shortcuts.
 Use the workspace buttons to navigate, close a tab, or quit while using a harness.
 

@@ -49,6 +49,7 @@ struct Tab {
 }
 struct Workspace {
     home_focus: FocusHandle,
+    _terminal_focus: Vec<gpui::Subscription>,
     search: Entity<InputState>,
     store: Store,
     path: PathBuf,
@@ -77,8 +78,8 @@ pub fn capture(screen: &str, path: PathBuf) {
 }
 fn bind_workspace_keys(cx: &mut App) {
     // Workspace actions must never consume keys from a focused VM terminal.
-    const WORKSPACE: &str = "OpsSSH && !OpsSSHTerminal";
-    const HOME: &str = "OpsSSHHome && !OpsSSHTerminal";
+    const WORKSPACE: &str = "OpsSSH && !OpsSSHTerminal && !OpsSSHTerminalOpen";
+    const HOME: &str = "OpsSSHHome && !OpsSSHTerminal && !OpsSSHTerminalOpen";
     cx.bind_keys([
         KeyBinding::new("ctrl-enter", OpenLocalTerminal, Some(HOME)),
         KeyBinding::new("cmd-enter", OpenLocalTerminal, Some(HOME)),
@@ -112,12 +113,12 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
     let result=cx.open_window(WindowOptions{window_bounds:Some(WindowBounds::Windowed(bounds)),..WindowOptions::default()},move|window,cx|{
         window.set_window_title("OpsSSH");
         let workspace=cx.new(|cx: &mut Context<Workspace>|{
-            let home_focus=cx.focus_handle();let search=cx.new(|cx|InputState::new(window,cx).placeholder("Search name, host, user, environment or tags"));
+            let home_focus=cx.focus_handle();let terminal_focus=Workspace::terminal_focus_subscriptions(&home_focus,window,cx);let search=cx.new(|cx|InputState::new(window,cx).placeholder("Search name, host, user, environment or tags"));
             cx.subscribe_in(&search,window,|this,_,event,window,cx|{match event {InputEvent::PressEnter{..}=>{let query=this.search.read(cx).value();if let Some(p)=this.visible_profiles(&query).first().cloned(){this.connect(p,window,cx);}},InputEvent::Change=>cx.notify(),_=>{}}}).detach();
             let (path,mut message)=match opsssh_platform::app_data_dir(){Ok(dir)=>(dir.join("servers.toml"),String::new()),Err(error)=>(PathBuf::new(),format!("Cannot locate settings folder: {error}"))};
             let mut load_failed=false;
             let store=if path.as_os_str().is_empty(){load_failed=true;Store::default()}else{match Store::load(&path){Ok(store)=>store,Err(error)=>{message=format!("Cannot load servers. Fix the settings file before saving: {error}");load_failed=true;Store::default()}}};
-            let mut workspace=Workspace{home_focus,search,store,path,sessions:vec![],navigation:SessionTabs::default(),transition:0,pending_close:None,quit_dialog:false,uptime_timer:None,editor:None,settings_page:false,help_page:false,message,filter:"All servers".into(),config:vec![],launched,first_frame_recorded:false,load_failed};
+            let mut workspace=Workspace{home_focus,_terminal_focus:terminal_focus,search,store,path,sessions:vec![],navigation:SessionTabs::default(),transition:0,pending_close:None,quit_dialog:false,uptime_timer:None,editor:None,settings_page:false,help_page:false,message,filter:"All servers".into(),config:vec![],launched,first_frame_recorded:false,load_failed};
             crate::design::apply(&workspace.store.settings.theme,window,cx);
             crate::design::set_reduced_motion(workspace.store.settings.reduced_motion,cx);
             crate::design::observe_system(window).detach();
@@ -166,6 +167,46 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
 });
 }
 impl Workspace {
+    fn terminal_focus_subscriptions(
+        home: &FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::Subscription> {
+        vec![
+            cx.on_focus(home, window, |this, window, cx| {
+                this.restore_terminal_focus(window, cx)
+            }),
+            cx.on_focus_lost(window, |this, window, cx| {
+                this.restore_terminal_focus(window, cx)
+            }),
+        ]
+    }
+
+    fn terminal_visible(&self) -> bool {
+        !self.settings_page
+            && !self.help_page
+            && self
+                .navigation
+                .active
+                .and_then(|id| self.session_index(id))
+                .is_some_and(|index| self.sessions[index].page == SessionPage::Terminal)
+    }
+
+    fn restore_terminal_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.terminal_visible()
+            || self.editor.is_some()
+            || self.pending_close.is_some()
+            || self.quit_dialog
+        {
+            return;
+        }
+        if let Some(index) = self.navigation.active.and_then(|id| self.session_index(id)) {
+            self.sessions[index]
+                .terminal
+                .update(cx, |terminal, cx| terminal.focus(window, cx));
+        }
+    }
+
     fn reload_config(&mut self) {
         self.config.clear();
         if let Ok(home) = opsssh_platform::home_dir() {
@@ -998,6 +1039,8 @@ mod tests {
     use gpui::{Focusable, TestAppContext, VisualTestContext};
 
     fn fixture(window: &mut Window, cx: &mut Context<Workspace>) -> Workspace {
+        let home_focus = cx.focus_handle();
+        let terminal_focus = Workspace::terminal_focus_subscriptions(&home_focus, window, cx);
         let mut navigation = SessionTabs::default();
         let sessions = (0..2)
             .map(|_| {
@@ -1032,7 +1075,8 @@ mod tests {
             })
             .collect();
         Workspace {
-            home_focus: cx.focus_handle(),
+            home_focus,
+            _terminal_focus: terminal_focus,
             search: cx.new(|cx| InputState::new(window, cx)),
             store: Store::default(),
             path: PathBuf::new(),
@@ -1159,6 +1203,100 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[gpui::test]
+    fn terminal_page_reclaims_workspace_and_lost_focus_before_typing(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            bind_workspace_keys(cx);
+        });
+        let mut workspace = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| fixture(window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        for index in [0, 1, 0] {
+            VisualTestContext::update(cx, |window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.activate_session(this.sessions[index].id, window, cx);
+                });
+                let _ = window.draw(cx);
+            });
+            for empty in [false, true] {
+                VisualTestContext::update(cx, |window, cx| {
+                    if empty {
+                        window.blur(cx);
+                    } else {
+                        let handle = workspace.read(cx).home_focus.clone();
+                        handle.focus(window, cx);
+                    }
+                });
+                cx.run_until_parked();
+                VisualTestContext::update(cx, |window, cx| {
+                    let _ = window.draw(cx);
+                    assert_eq!(
+                        window.focused(cx),
+                        Some(
+                            workspace.read(cx).sessions[index]
+                                .terminal
+                                .read(cx)
+                                .focus_handle(cx)
+                        )
+                    );
+                });
+                cx.simulate_keystrokes("ctrl-w");
+                assert!(workspace.read_with(cx, |this, _| this.pending_close.is_none()));
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn visible_terminal_page_blocks_workspace_shortcuts_even_without_terminal_focus(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            bind_workspace_keys(cx);
+        });
+        let mut workspace = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| fixture(window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        let active = VisualTestContext::update(cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                let id = this.sessions[1].id;
+                this.activate_session(id, window, cx);
+                id
+            })
+        });
+        cx.run_until_parked();
+        VisualTestContext::update(cx, |window, cx| {
+            let _ = window.draw(cx);
+            // Deliberate keyboard focus on chrome must still not enable app shortcuts.
+            window.focus_next(cx);
+            assert_ne!(
+                window.focused(cx),
+                Some(
+                    workspace.read(cx).sessions[1]
+                        .terminal
+                        .read(cx)
+                        .focus_handle(cx)
+                )
+            );
+        });
+        cx.simulate_keystrokes("ctrl-k ctrl-n ctrl-w ctrl-shift-h ctrl-shift-q");
+        VisualTestContext::update(cx, |_, cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.navigation.active, Some(active));
+            assert!(this.editor.is_none() && this.pending_close.is_none() && !this.quit_dialog);
+            assert_eq!(this.sessions.len(), 2);
+        });
     }
 
     #[gpui::test]

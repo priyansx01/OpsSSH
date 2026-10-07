@@ -214,6 +214,17 @@ impl TerminalView {
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        if let Some(ConnectionPrompt::Authentication { fields, .. }) = &self.prompt
+            && let Some((_, input)) = fields.first()
+        {
+            if !fields
+                .iter()
+                .any(|(_, input)| input.read(cx).focus_handle(cx).is_focused(window))
+            {
+                input.update(cx, |input, cx| input.focus(window, cx));
+            }
+            return;
+        }
         self.focus.focus(window, cx);
     }
 
@@ -1864,6 +1875,50 @@ mod clipboard_tests {
         cx.simulate_mouse_move(end, Some(MouseButton::Left), modifiers);
         cx.simulate_mouse_up(end, MouseButton::Left, modifiers);
         draw(cx);
+    }
+
+    #[gpui::test]
+    fn returning_to_an_authenticating_terminal_focuses_the_credentials_field(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(fixture);
+        draw(cx);
+        let (password, otp) = cx.update(|window, cx| {
+            let password = cx.new(|cx| InputState::new(window, cx));
+            let otp = cx.new(|cx| InputState::new(window, cx));
+            view.update(cx, |view, cx| {
+                view.prompt = Some(ConnectionPrompt::Authentication {
+                    id: 1,
+                    name: "Sign in".into(),
+                    instructions: String::new(),
+                    fields: vec![
+                        ("Password".into(), password.clone()),
+                        ("Code".into(), otp.clone()),
+                    ],
+                    save: false,
+                    can_save: false,
+                });
+                view.focus(window, cx);
+                cx.notify();
+            });
+            (password, otp)
+        });
+        draw(cx);
+        cx.simulate_input("password");
+        cx.update(|window, cx| {
+            assert_eq!(password.read(cx).value().to_string(), "password");
+            otp.update(cx, |input, cx| input.focus(window, cx));
+            view.update(cx, |view, cx| view.focus(window, cx));
+            assert_eq!(window.focused(cx), Some(otp.read(cx).focus_handle(cx)));
+        });
+        draw(cx);
+        cx.simulate_input("123456");
+        assert_eq!(
+            otp.read_with(cx, |input, _| input.value().to_string()),
+            "123456"
+        );
+        assert!(view.read_with(cx, |view, _| view.sent_input.is_empty()));
     }
 
     #[gpui::test]

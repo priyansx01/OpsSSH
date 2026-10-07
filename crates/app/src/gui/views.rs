@@ -1292,6 +1292,10 @@ impl Workspace {
         let p = design::palette(cx);
         let narrow = window.viewport_size().width < px(1100.);
         let home = self.navigation.active.is_none() && !self.settings_page && !self.help_page;
+        let terminal_open = self.terminal_visible();
+        if terminal_open && (window.focused(cx).is_none() || self.home_focus.is_focused(window)) {
+            self.restore_terminal_focus(window, cx);
+        }
         let tabs = self
             .navigation
             .open
@@ -1367,7 +1371,13 @@ impl Workspace {
         };
         div()
             .id("opsssh-workspace")
-            .key_context(if home { "OpsSSH OpsSSHHome" } else { "OpsSSH" })
+            .key_context(if terminal_open {
+                "OpsSSH OpsSSHTerminalOpen"
+            } else if home {
+                "OpsSSH OpsSSHHome"
+            } else {
+                "OpsSSH"
+            })
             .track_focus(&self.home_focus)
             .size_full()
             .flex()
