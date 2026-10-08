@@ -76,7 +76,6 @@ struct Workspace {
     message: String,
     filter: String,
     hovered_card: Option<usize>,
-    config: Vec<(Profile, Vec<String>)>,
     launched: Instant,
     first_frame_recorded: bool,
     load_failed: bool,
@@ -136,28 +135,18 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
             let (path,mut message)=match opsssh_platform::app_data_dir(){Ok(dir)=>(dir.join("servers.toml"),String::new()),Err(error)=>(PathBuf::new(),format!("Cannot locate settings folder: {error}"))};
             let mut load_failed=false;
             let store=if path.as_os_str().is_empty(){load_failed=true;Store::default()}else{match Store::load(&path){Ok(store)=>store,Err(error)=>{message=format!("Cannot load servers. Fix the settings file before saving: {error}");load_failed=true;Store::default()}}};
-            let mut workspace=Workspace{home_focus,capture:None,upload_dialog:None,_terminal_focus:terminal_focus,search,store,path,sessions:vec![],navigation:SessionTabs::default(),transition:0,pending_close:None,quit_dialog:false,uptime_timer:None,editor:None,settings_page:false,help_page:false,message,filter:"All servers".into(),hovered_card:None,config:vec![],launched,first_frame_recorded:false,load_failed,environment_filter:String::new(),terminal_focus_released:false,panel_drag:None};
+            let mut workspace=Workspace{home_focus,capture:None,upload_dialog:None,_terminal_focus:terminal_focus,search,store,path,sessions:vec![],navigation:SessionTabs::default(),transition:0,pending_close:None,quit_dialog:false,uptime_timer:None,editor:None,settings_page:false,help_page:false,message,filter:"All servers".into(),hovered_card:None,launched,first_frame_recorded:false,load_failed,environment_filter:String::new(),terminal_focus_released:false,panel_drag:None};
             crate::design::apply(&workspace.store.settings.theme,window,cx);
             crate::design::set_reduced_motion(workspace.store.settings.reduced_motion,cx);
             crate::design::observe_system(window).detach();
-            workspace.reload_config();
             if open_terminal{workspace.open_local(&OpenLocalTerminal,window,cx);}else{workspace.home_focus.focus(window,cx);}
             #[cfg(feature="capture")]
             if let Some((screen,path))=capture_path{
                 // In-memory fixtures only; snapshot processes cannot save user data.
-                workspace.load_failed=true;workspace.message.clear();workspace.config.clear();workspace.store=Store::default();
+                workspace.load_failed=true;workspace.message.clear();workspace.store=Store::default();
                 if screen.contains("servers") || screen.contains("list") || screen.contains("many") {
                     let count=if screen.contains("many"){500}else{6};
                     for i in 0..count {let _=workspace.store.upsert(Profile{name:if i==5 {"Research / a deliberately long server name to verify truncation".into()}else{format!("{} {:02}",["Atlas gateway","Build runner","Payments API","Staging database","Personal lab"][i%5],i+1)},host:format!("host-{}.example.test",i+1),user:"deploy".into(),environment:["Production","Staging","Development"][i%3].into(),auth:[opsssh_store::Auth::Agent,opsssh_store::Auth::Password,opsssh_store::Auth::Key][i%3].clone(),favorite:i%2==0,..Profile::default()});}
-                }
-                if screen.contains("config") {
-                    workspace.filter="From SSH config".into();
-                    for (name, host) in [("github-ismart", "github.com"), ("github.com", "github.com"), ("gitlab.com", "gitlab.com")] {
-                        workspace.config.push((Profile { name:name.into(), ssh_alias:name.into(), host:host.into(), user:"git".into(), environment:"Development".into(), identity_file:"~/.ssh/id_ed25519".into(), auth:opsssh_store::Auth::Key, ..Profile::default() }, vec![]));
-                    }
-                    let id=workspace.navigation.allocate();
-                    workspace.sessions.push(Tab { id, name:"github-ismart".into(), endpoint:Some("git@github.com:22".into()), profile_id:None, upload_directory:None, keyboard_capture:false, persistent_name:None, protected:false, connected_at:Some(Instant::now()), page:SessionPage::Terminal, infrastructure:None, ssh_management:None, terminal:cx.new(|cx| TerminalView::preview_connected_local(window,cx)), color:environment_color("Development"), environment:"Development".into(), files:None, files_visible:false, files_width:0., workspace_key:None, follow:true, followed_directory:None, file_generation:0, files_needs_rebind:false });
-                    workspace.navigation.active=None;
                 }
                 if screen.contains("hover") {workspace.hovered_card=Some(0);}
                 if screen.contains("list") {workspace.store.settings.server_view="list".into();}
@@ -424,31 +413,6 @@ impl Workspace {
         }
     }
 
-    fn reload_config(&mut self) {
-        self.config.clear();
-        if let Ok(home) = opsssh_platform::home_dir() {
-            let path = home.join(".ssh/config");
-            if path.exists() {
-                match opsssh_ssh_config::ParsedConfig::read(&path, &home) {
-                    Ok(config) => {
-                        self.config = config
-                            .aliases()
-                            .iter()
-                            .map(|alias| {
-                                let mut resolved = config.resolve(alias);
-                                if resolved.profile.user.is_empty() {
-                                    resolved.profile.user =
-                                        opsssh_platform::default_username().unwrap_or_default();
-                                }
-                                (resolved.profile, resolved.warnings)
-                            })
-                            .collect();
-                    }
-                    Err(error) => self.message = format!("Could not read SSH config: {error}"),
-                }
-            }
-        }
-    }
     fn persist(&mut self) -> bool {
         if self.load_failed {
             self.message =
@@ -508,7 +472,6 @@ impl Workspace {
         self.transition = self.transition.wrapping_add(1);
         self.sync_visibility(cx);
         self.editor = None;
-        self.reload_config();
         self.search.update(cx, |state, cx| state.focus(window, cx));
         cx.notify();
     }
@@ -867,21 +830,12 @@ impl Workspace {
         });
     }
     fn edit(&mut self, profile: Profile, window: &mut Window, cx: &mut Context<Self>) {
-        let warnings = if profile.id == 0 {
-            self.config
-                .iter()
-                .find(|(p, _)| p.name == profile.name)
-                .map(|(_, w)| w.clone())
-                .unwrap_or_default()
-        } else {
-            vec![]
-        };
         let title = tr(if profile.id == 0 {
             "form-title"
         } else {
             "form-edit-title"
         });
-        let form = cx.new(|cx| ConnectionForm::new(profile, warnings, window, cx));
+        let form = cx.new(|cx| ConnectionForm::new(profile, vec![], window, cx));
         cx.subscribe_in(&form, window, |this, form, event, window, cx| {
             match event {
                 FormEvent::Cancel => {
@@ -963,17 +917,6 @@ impl Workspace {
         cx.notify();
     }
     fn connect(&mut self, profile: Profile, window: &mut Window, cx: &mut Context<Self>) {
-        if profile.id == 0
-            && let Some((_, warnings)) = self.config.iter().find(|(p, _)| p.name == profile.name)
-            && !warnings.is_empty()
-        {
-            self.message = format!(
-                "Review unsupported config options using Customize: {}",
-                warnings.join("; ")
-            );
-            cx.notify();
-            return;
-        }
         let endpoint = format!("{}@{}:{}", profile.user, profile.host, profile.port);
         if profile.tmux_session.is_some()
             && let Some(id) = self
@@ -1447,11 +1390,7 @@ impl Workspace {
         Some(files)
     }
     fn visible_profiles(&self, query: &str) -> Vec<Profile> {
-        let profiles: Vec<Profile> = if self.filter == "From SSH config" {
-            self.config.iter().map(|(p, _)| p.clone()).collect()
-        } else {
-            self.store.servers.clone()
-        };
+        let profiles = self.store.servers.clone();
         let mut profiles: Vec<_> = profiles
             .into_iter()
             .filter(|p| {
@@ -1459,7 +1398,7 @@ impl Workspace {
                     && (self.environment_filter.is_empty()
                         || p.environment == self.environment_filter)
                     && match self.filter.as_str() {
-                        "All servers" | "From SSH config" => true,
+                        "All servers" => true,
                         "Favourites" => p.favorite,
                         environment => p.environment == environment,
                     }
@@ -1816,7 +1755,6 @@ mod tests {
             message: String::new(),
             filter: "All servers".into(),
             hovered_card: None,
-            config: vec![],
             launched: Instant::now(),
             first_frame_recorded: false,
             load_failed: true,

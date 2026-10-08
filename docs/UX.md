@@ -23,8 +23,8 @@ neutral tones, with subtle borders instead of a bright outline on card hover.
 The initial page focuses workspace navigation; Ctrl/Cmd+K still focuses search.
 Disconnect requires confirmation and retains the tab and
 terminal history; multiple sessions get a session chooser. Reconnect is explicit.
-SSH-config aliases are read-only: Customize creates a saved profile, and aliases
-support Duplicate and Copy SSH command but cannot be removed from this UI.
+The sidebar lists saved servers and favorites. SSH config aliases are not listed
+or automatically imported; Quick Connect remains available in the connection dialog.
 There are no synthetic reachability indicators in the application.
 
 Connection setup shows Quick Connect first: pasting an SSH command fills the fields
@@ -268,8 +268,7 @@ changes crossfade briefly. Menus and dialogs use the component motion system.
 Reduced motion disables spatial transitions. Terminal input and search have no
 entrance animation.
 
-Redesign review fixtures include `snapshot-config`, `snapshot-help`, and their
-`-light` variants in addition to the screens above. GitHub example aliases and
-their preview status exist only in memory in the capture process; they never
-write to SSH config or connect to those hosts. Windows debug binaries reserve
-8 MiB of main-thread virtual stack for native GPUI composition.
+Redesign review fixtures include `snapshot-servers`, `snapshot-help`, and their
+`-light` variants in addition to the screens above. Fixtures exist only in memory
+in the capture process; they never write profiles or connect to example hosts.
+Windows debug binaries reserve 8 MiB of main-thread virtual stack for native GPUI composition.

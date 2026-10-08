@@ -321,11 +321,6 @@ impl Workspace {
                 "nav-favorites",
                 gpui_kit_assets::IconName::Star,
             ),
-            (
-                "From SSH config",
-                "nav-config",
-                gpui_kit_assets::IconName::KeyRound,
-            ),
         ]
         .into_iter()
         .enumerate()
@@ -362,7 +357,6 @@ impl Workspace {
                 .store
                 .servers
                 .iter()
-                .chain(self.config.iter().map(|(profile, _)| profile))
                 .map(|p| p.environment.clone())
                 .filter(|s| !s.is_empty())
                 .collect::<std::collections::BTreeSet<_>>();
@@ -837,14 +831,12 @@ impl Workspace {
         let title = match self.filter.as_str() {
             "All servers" => tr("nav-servers"),
             "Favourites" => tr("nav-favorites"),
-            "From SSH config" => tr("nav-config"),
             other => other.into(),
         };
         let environments = self
             .store
             .servers
             .iter()
-            .chain(self.config.iter().map(|(p, _)| p))
             .map(|p| p.environment.clone())
             .filter(|e| !e.is_empty())
             .collect::<std::collections::BTreeSet<_>>();
@@ -1072,15 +1064,6 @@ impl Workspace {
                                     .label(tr("new-server"))
                                     .on_click(cx.listener(|this, _, w, cx| {
                                         this.new_server(&NewServer, w, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("empty-config")
-                                    .label(tr("import-config"))
-                                    .on_click(cx.listener(|this, _, w, cx| {
-                                        this.home(&GoHome, w, cx);
-                                        this.filter = "From SSH config".into();
-                                        cx.notify();
                                     })),
                             )
                             .child(
