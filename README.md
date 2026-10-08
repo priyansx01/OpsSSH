@@ -31,10 +31,12 @@ harness, including Ctrl+K, Ctrl+N, Ctrl+W, Shift+Tab, Escape, and Alt shortcuts.
 Use the workspace buttons to navigate, close a tab, or quit while using a harness.
 
 Select text by dragging, then right-click for Copy, Paste, or Select all beside
-the pointer. Alt+drag selects a rectangle. Ctrl/Cmd+C copies a selection;
-Ctrl/Cmd+Shift+C copies without interrupting the shell. Ctrl/Cmd+V, Ctrl/Cmd+Shift+V,
-or Shift+Insert pastes. A simple focus click leaves Ctrl+C available to interrupt
-the shell. Shift bypasses application
+the pointer. Alt+drag selects a rectangle. Keyboard shortcuts, including
+Ctrl/Cmd+C/V, Ctrl/Cmd+Shift+C/V, and Shift+Insert, go directly to the terminal
+application. Ctrl+C reaches the remote process even when text is selected.
+Use right-click Copy/Paste for the local clipboard. Windows owns physical
+Alt+Tab; use right-click Send Alt+Tab to VM to send that combination explicitly.
+Shift bypasses application
 mouse reporting for local selection/scrollback. Input is blocked while disconnected
 and is never queued for later replay. Multiline paste without bracketed-paste mode
 requires review. Ctrl/Cmd-click opens HTTP/HTTPS terminal hyperlinks.

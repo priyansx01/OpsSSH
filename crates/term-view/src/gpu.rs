@@ -1,5 +1,4 @@
 use opsssh_i18n::text as tr;
-use std::collections::HashSet;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -86,7 +85,6 @@ pub struct TerminalView {
     connection_generation: u64,
     at_prompt: bool,
     paste_preview: Option<String>,
-    clipboard_keys: HashSet<String>,
     #[cfg(all(test, feature = "test-support"))]
     sent_input: Vec<Vec<u8>>,
     error: Option<String>,
@@ -269,7 +267,6 @@ impl TerminalView {
                 this.focus_changed(true, window, cx);
             }),
             cx.on_blur(&focus, window, |this, window, cx| {
-                this.clipboard_keys.clear();
                 this.focus_changed(false, window, cx);
             }),
             cx.observe_window_activation(window, |this, window, cx| this.refresh_blink(window, cx)),
@@ -339,7 +336,6 @@ impl TerminalView {
             connection_generation: 0,
             at_prompt: false,
             paste_preview: None,
-            clipboard_keys: HashSet::new(),
             #[cfg(all(test, feature = "test-support"))]
             sent_input: Vec::new(),
             error: None,
@@ -1004,32 +1000,6 @@ impl TerminalView {
             return;
         }
         let key = &event.keystroke;
-        let clipboard_primary = !key.modifiers.alt
-            && if opsssh_platform::info().primary_modifier == "Cmd" {
-                key.modifiers.platform && !key.modifiers.control
-            } else {
-                key.modifiers.control && !key.modifiers.platform
-            };
-        if clipboard_primary && key.key == "c" && (self.selection.is_some() || key.modifiers.shift)
-        {
-            self.clipboard_keys.insert(key.key.clone());
-            self.copy(cx);
-            cx.stop_propagation();
-            return;
-        }
-        let shift_insert = key.modifiers.shift
-            && !key.modifiers.control
-            && !key.modifiers.alt
-            && !key.modifiers.platform
-            && key.key == "insert";
-        if (clipboard_primary && key.key == "v") || shift_insert {
-            self.clipboard_keys.insert(key.key.clone());
-            if let Some(item) = cx.read_from_clipboard() {
-                self.paste_item(item, cx);
-            }
-            cx.stop_propagation();
-            return;
-        }
         let Some(session) = &self.session else {
             return;
         };
@@ -1068,11 +1038,6 @@ impl TerminalView {
     }
 
     fn key_up(&mut self, event: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        // A clipboard gesture consumes both halves, even if modifiers were released first.
-        if self.clipboard_keys.remove(&event.keystroke.key) {
-            cx.stop_propagation();
-            return;
-        }
         if self.prompt.is_some() || self.paste_preview.is_some() {
             return;
         }
@@ -1088,6 +1053,33 @@ impl TerminalView {
         {
             self.send(bytes, cx);
         }
+    }
+
+    fn send_alt_tab(&mut self, cx: &mut Context<Self>) {
+        if self.prompt.is_some() || self.paste_preview.is_some() || !self.state().accepts_input() {
+            return;
+        }
+        let Some(session) = &self.session else {
+            return;
+        };
+        let modes = session.modes();
+        let modifiers = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+        let state = session.state();
+        let Ok(mut bytes) = encode_key(state, modes, Key::Tab, modifiers, KeyEventKind::Press)
+        else {
+            return;
+        };
+        let release = encode_key(state, modes, Key::Tab, modifiers, KeyEventKind::Release)
+            .unwrap_or_default();
+        session.scroll_to_bottom();
+        self.selection = None;
+        self.anchor = None;
+        bytes.extend(release);
+        self.send(bytes, cx);
+        cx.notify();
     }
 
     fn position(&self, position: Point<Pixels>) -> Position {
@@ -1586,6 +1578,10 @@ impl Render for TerminalView {
                         let copy_view = menu_view.clone();
                         let paste_view = menu_view.clone();
                         let select_view = menu_view.clone();
+                        let send_view = menu_view.clone();
+                        let send_enabled = terminal.state().accepts_input()
+                            && terminal.prompt.is_none()
+                            && terminal.paste_preview.is_none();
                         menu.item(
                             PopupMenuItem::new(tr("term-copy"))
                                 .disabled(!copy_enabled)
@@ -1610,15 +1606,24 @@ impl Render for TerminalView {
                                 }),
                         )
                         .separator()
+                        .item(PopupMenuItem::new(tr("term-select-all")).on_click(
+                            move |_, window, cx| {
+                                let _ = select_view.update(cx, |view, cx| {
+                                    view.select_all(cx);
+                                    view.focus.focus(window, cx);
+                                });
+                            },
+                        ))
+                        .separator()
                         .item(
-                            PopupMenuItem::new(tr("term-select-all")).on_click(
-                                move |_, window, cx| {
-                                    let _ = select_view.update(cx, |view, cx| {
-                                        view.select_all(cx);
+                            PopupMenuItem::new(tr("term-send-alt-tab"))
+                                .disabled(!send_enabled)
+                                .on_click(move |_, window, cx| {
+                                    let _ = send_view.update(cx, |view, cx| {
+                                        view.send_alt_tab(cx);
                                         view.focus.focus(window, cx);
                                     });
-                                },
-                            ),
+                                }),
                         )
                     }),
             )
@@ -1839,15 +1844,6 @@ mod clipboard_tests {
         });
     }
 
-    fn shortcut(cx: &mut VisualTestContext, keys: &str) {
-        let primary = if opsssh_platform::info().primary_modifier == "Cmd" {
-            "cmd"
-        } else {
-            "ctrl"
-        };
-        cx.simulate_keystrokes(&keys.replace("primary", primary));
-    }
-
     fn cell(
         view: &Entity<TerminalView>,
         cx: &VisualTestContext,
@@ -1946,6 +1942,11 @@ mod clipboard_tests {
             ("ctrl-shift-h", b"\x08".as_slice()),
             ("ctrl-shift-q", b"\x11".as_slice()),
             ("shift-tab", b"\x1b[Z".as_slice()),
+            ("alt-tab", b"\x1b\t".as_slice()),
+            ("ctrl-v", b"\x16".as_slice()),
+            ("ctrl-shift-c", b"\x03".as_slice()),
+            ("ctrl-shift-v", b"\x16".as_slice()),
+            ("shift-insert", b"\x1b[2;2~".as_slice()),
             ("alt-p", b"\x1bp".as_slice()),
             ("alt-enter", b"\x1b\r".as_slice()),
             ("ctrl-alt-v", b"\x1b\x16".as_slice()),
@@ -1983,7 +1984,9 @@ mod clipboard_tests {
     }
 
     #[gpui::test]
-    fn clipboard_gestures_do_not_leak_key_release_events_into_a_harness(cx: &mut TestAppContext) {
+    fn all_terminal_shortcuts_forward_press_and_release_without_clipboard_actions(
+        cx: &mut TestAppContext,
+    ) {
         cx.update(gpui_component::init);
         let session = Session::local(LocalShellOptions::default()).unwrap();
         let (view, cx) = cx.add_window_view(fixture);
@@ -2000,31 +2003,110 @@ mod clipboard_tests {
                     .unwrap()
                     .ingest(b"\x1b[>11u")
                     .unwrap();
-            })
+            });
+            cx.write_to_clipboard(ClipboardItem::new_string("clipboard unchanged".into()));
         });
         draw(cx);
-        for keys in ["primary-shift-c", "primary-shift-v", "shift-insert"] {
-            cx.update(|_, cx| view.update(cx, |view, _| view.sent_input.clear()));
-            shortcut(cx, keys);
-            cx.update(|window, cx| {
-                view.update(cx, |view, cx| {
-                    // Releasing Ctrl/Shift before the letter must still consume its release.
-                    view.key_up(
-                        &KeyUpEvent {
-                            keystroke: gpui::Keystroke::parse(keys.split('-').next_back().unwrap())
-                                .unwrap(),
-                        },
-                        window,
-                        cx,
-                    );
-                    assert!(
-                        view.sent_input.concat().is_empty(),
-                        "{keys} leaked an unmatched key event"
-                    );
+        for (keys, press, release) in [
+            ("ctrl-c", "\x1b[99;5:1u", "\x1b[99;5:3u"),
+            ("ctrl-v", "\x1b[118;5:1u", "\x1b[118;5:3u"),
+            ("ctrl-shift-c", "\x1b[99;6:1u", "\x1b[99;6:3u"),
+            ("ctrl-shift-v", "\x1b[118;6:1u", "\x1b[118;6:3u"),
+            ("cmd-c", "\x1b[99;9:1u", "\x1b[99;9:3u"),
+            ("cmd-v", "\x1b[118;9:1u", "\x1b[118;9:3u"),
+            ("shift-insert", "\x1b[2;2:1~", "\x1b[2;2:3~"),
+            ("alt-tab", "\x1b[9;3:1u", "\x1b[9;3:3u"),
+        ] {
+            cx.update(|_, cx| {
+                view.update(cx, |view, _| {
+                    view.sent_input.clear();
+                    view.selection = Some(Selection::Linear {
+                        start: Position { row: 0, column: 0 },
+                        end: Position { row: 0, column: 4 },
+                    });
                 })
+            });
+            cx.simulate_keystrokes(keys);
+            cx.simulate_event(KeyUpEvent {
+                keystroke: gpui::Keystroke::parse(keys).unwrap(),
+            });
+            cx.update(|_, cx| {
+                let terminal = view.read(cx);
+                assert_eq!(
+                    terminal.sent_input.concat(),
+                    [press.as_bytes(), release.as_bytes()].concat(),
+                    "{keys} was intercepted"
+                );
+                assert!(terminal.paste_preview.is_none());
+                assert_eq!(
+                    cx.read_from_clipboard()
+                        .and_then(|item| item.text())
+                        .as_deref(),
+                    Some("clipboard unchanged")
+                );
             });
         }
         cx.update(|_, cx| view.update(cx, |view, cx| view.disconnect(cx)));
+    }
+
+    #[gpui::test]
+    fn context_menu_sends_os_reserved_alt_tab_in_legacy_and_kitty_modes(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let session = Session::local(LocalShellOptions::default()).unwrap();
+        let (view, cx) = cx.add_window_view(fixture);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.stopped = false;
+                view.session = Some(session);
+            })
+        });
+        draw(cx);
+        for (mode, expected) in [
+            (b"\x1b[<u".as_slice(), b"\x1b\t".as_slice()),
+            (
+                b"\x1b[>11u".as_slice(),
+                b"\x1b[9;3:1u\x1b[9;3:3u".as_slice(),
+            ),
+        ] {
+            cx.update(|_, cx| {
+                view.update(cx, |view, _| {
+                    view.session
+                        .as_ref()
+                        .unwrap()
+                        .backend()
+                        .lock()
+                        .unwrap()
+                        .ingest(mode)
+                        .unwrap();
+                    view.sent_input.clear();
+                })
+            });
+            let pointer = cell(&view, cx, 0, 2);
+            cx.simulate_mouse_down(pointer, MouseButton::Right, Default::default());
+            draw(cx);
+            cx.simulate_click(pointer + point(px(24.), px(118.)), Default::default());
+            draw(cx);
+            cx.update(|window, cx| {
+                assert_eq!(view.read(cx).sent_input.concat(), expected);
+                assert_eq!(window.focused(cx), Some(view.read(cx).focus.clone()));
+            });
+        }
+        cx.update(|_, cx| view.update(cx, |view, cx| view.disconnect(cx)));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.sent_input.clear();
+                view.send_alt_tab(cx);
+                assert!(view.sent_input.is_empty(), "disconnected key was queued");
+            })
+        });
+    }
+
+    fn copy_from_menu(view: &Entity<TerminalView>, cx: &mut VisualTestContext) {
+        let pointer = cell(view, cx, 1, 8);
+        cx.simulate_mouse_down(pointer, MouseButton::Right, Default::default());
+        draw(cx);
+        cx.simulate_click(pointer + point(px(24.), px(17.)), Default::default());
+        draw(cx);
     }
 
     #[gpui::test]
@@ -2058,7 +2140,7 @@ mod clipboard_tests {
         let (view, cx) = cx.add_window_view(fixture);
         draw(cx);
         drag(&view, cx, (1, 4), (0, 0), Default::default());
-        shortcut(cx, "primary-c");
+        copy_from_menu(&view, cx);
         cx.update(|_, cx| {
             assert_eq!(
                 cx.read_from_clipboard()
@@ -2077,7 +2159,7 @@ mod clipboard_tests {
                 ..Default::default()
             },
         );
-        shortcut(cx, "primary-shift-c");
+        copy_from_menu(&view, cx);
         cx.update(|_, cx| {
             assert_eq!(
                 cx.read_from_clipboard()
@@ -2099,7 +2181,6 @@ mod clipboard_tests {
         cx.update(|_, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string("keep clipboard".into()))
         });
-        shortcut(cx, "primary-shift-c");
         drag(&view, cx, (0, 0), (0, 4), Default::default());
         let selection = view.read_with(cx, |view, _| view.selection);
         cx.simulate_mouse_down(pointer, MouseButton::Right, Default::default());
@@ -2119,7 +2200,7 @@ mod clipboard_tests {
     }
 
     #[gpui::test]
-    fn menu_paste_and_keyboard_shortcuts_share_multiline_confirmation(cx: &mut TestAppContext) {
+    fn menu_paste_preserves_multiline_review_and_sends_single_line_to_pty(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
         let session = Session::local(LocalShellOptions::default()).unwrap();
         let (view, cx) = cx.add_window_view(fixture);
@@ -2144,22 +2225,6 @@ mod clipboard_tests {
             );
             assert_eq!(window.focused(cx), Some(view.read(cx).focus.clone()));
         });
-        for keys in ["primary-v", "primary-shift-v", "shift-insert"] {
-            cx.update(|window, cx| {
-                view.update(cx, |view, cx| {
-                    view.paste_preview = None;
-                    view.focus.focus(window, cx);
-                    cx.notify();
-                });
-            });
-            draw(cx);
-            shortcut(cx, keys);
-            assert_eq!(
-                view.read_with(cx, |view, _| view.paste_preview.clone())
-                    .as_deref(),
-                Some("first\nsecond")
-            );
-        }
         // A single-line paste should go straight to the PTY, once, without review.
         let command = if opsssh_platform::info().os == "windows" {
             "Write-Output ('OPSSSH_' + 'PASTE_OK')"

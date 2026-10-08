@@ -115,7 +115,7 @@ settings-font-help = Text size applies to open sessions and new terminals.
 font-decrease = Decrease terminal text size
 font-increase = Increase terminal text size
 settings-shortcuts = Keyboard shortcuts
-settings-terminal-shortcuts = Opening a terminal focuses it automatically. Workspace shortcuts are paused on the Terminal page. Use the buttons to navigate or close tabs. Copy and paste remain available.
+settings-terminal-shortcuts = Terminal keys go directly to your shell or terminal app. Workspace and clipboard shortcuts are paused on the Terminal page. Use the buttons to navigate and the right-click menu to copy, paste, or send Alt+Tab to the VM.
 settings-data = Connection profiles
 settings-data-help = Import or export connection profiles without passwords or private key contents.
 help-description = Start with New connection, enter a host and username, and choose how to sign in. Passwords are requested securely when connecting. Review the server fingerprint before trusting a new host. Open Files from an authenticated session to browse and transfer remote files.
@@ -184,6 +184,7 @@ term-paste-text = Paste text
 term-copy = Copy
 term-paste = Paste
 term-select-all = Select all
+term-send-alt-tab = Send Alt+Tab to VM
 term-dismiss = Dismiss
 
 term-sign-in-title = Sign in to your server

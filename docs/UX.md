@@ -105,20 +105,20 @@ OS/DPI and live Linux-server acceptance remain release checks.
 
 ## Terminal clipboard
 
-Drag to select text, then right-click for the GPUI Kit Copy, Paste, and Select all
+Drag to select text, then right-click for the GPUI Kit Copy, Paste, Select all, and Send Alt+Tab to VM
 menu beside the pointer. Selection remains visible while the menu is open;
 Copy, Paste, Select all, and Escape restore terminal focus. A focus click does
 not select a character, leaving Ctrl+C available to interrupt the shell.
 Alt+drag selects a rectangle; Shift+drag bypasses a terminal application's
-mouse reporting. Copy also supports Ctrl/Cmd+C and Ctrl/Cmd+Shift+C. Paste
-supports Ctrl/Cmd+V, Ctrl/Cmd+Shift+V, and Shift+Insert. Single-line text pastes
-immediately. Multiline text still requires review when bracketed paste is off,
-and disconnected sessions reject input.
+mouse reporting. Clipboard actions use the right-click menu. All keyboard
+shortcuts, including Ctrl/Cmd+C/V, Ctrl/Cmd+Shift+C/V, and Shift+Insert, go to
+the terminal application. Ctrl+C is sent even when text is selected. Single-line
+menu paste is immediate; multiline text requires review when bracketed paste is
+off, and disconnected sessions reject input.
 
-Four GPUI regressions cover actual mouse clicks on Copy and Paste, forward,
-reverse and rectangular selection, focus clicks, Escape, clipboard shortcuts,
-multiline review, and a real local PTY paste followed by Enter. The workspace
-suite passed 110 tests and strict Clippy passed. The native Windows right-click
+Clipboard GUI regressions cover mouse clicks on Copy and Paste, forward, reverse
+and rectangular selection, focus clicks, Escape, multiline review, and a real
+local PTY paste followed by Enter. The native Windows right-click
 menu was rendered and inspected at 125% scaling. Reproduce that review with
 `snapshot-session-clipboard` using the development `capture` feature.
 
@@ -135,9 +135,16 @@ retain their own input handling.
 Ctrl+K, Ctrl+N, Ctrl+W, Ctrl+J, Ctrl+R, Ctrl+T, Ctrl+O, Shift+Tab, Escape, and
 Alt combinations therefore reach the shell or harness. Workspace buttons remain
 available, and the usual workspace bindings still work outside the Terminal page.
-Explicit clipboard shortcuts remain local. Extra Alt/Super/Control modifiers
-are not mistaken for clipboard gestures, and consumed clipboard key releases
-are not sent to a harness.
+The terminal has no local keyboard clipboard handlers. Modified key presses
+and negotiated key releases reach the harness without rewriting them as local
+copy/paste actions. Local clipboard operations remain available through the
+right-click menu.
+
+Windows intercepts physical Alt+Tab before the app receives it. Right-click
+Send Alt+Tab to VM sends the terminal key encoding directly, using ESC+Tab in
+legacy mode and the negotiated Kitty encoding otherwise. Press and any required
+release are sent together; disconnected/authenticating/review states block it.
+This does not claim to capture Windows system shortcuts.
 
 Shift+Enter remains distinct from Enter when the application negotiates the
 Kitty keyboard protocol. Legacy Enter behavior remains compatible with ordinary
@@ -145,9 +152,10 @@ shells. A tmux server can filter extended keys before a harness receives them;
 see the [harness terminal configuration](https://code.claude.com/docs/en/terminal-config#configure-tmux)
 for configuring that layer. OpsSSH does not modify the VM's tmux configuration.
 
-The workspace suite passed 117 tests; strict Clippy and the normal GUI build
+The workspace suite passed 118 tests; strict Clippy and the normal GUI build
 passed. GUI tests exercise the actual workspace bindings, verify that Home shortcuts
 still work, inspect the encoded transport bytes for harness shortcuts and
-negotiated Shift+Enter, reject unmatched clipboard release events, restore
+negotiated Shift+Enter, forward former clipboard shortcuts and their releases,
+exercise the Send Alt+Tab menu in legacy and Kitty modes, restore
 workspace/empty focus, and protect authentication inputs. Live
 harness and tmux acceptance on a disposable VM remains a release check.
