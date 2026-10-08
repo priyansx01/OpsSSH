@@ -109,6 +109,7 @@ impl ParsedConfig {
     }
     pub fn resolve(&self, alias: &str) -> QuickConnect {
         let mut result = QuickConnect {
+            options: HashSet::new(),
             profile: Profile {
                 host: alias.into(),
                 name: alias.into(),
@@ -172,10 +173,13 @@ fn host_matches(patterns: &[String], host: &str) -> bool {
 
 #[derive(Debug, Clone)]
 pub struct QuickConnect {
+    /// Options explicitly supplied, so forms can retain unrelated draft values.
+    pub options: HashSet<String>,
     pub profile: Profile,
     pub warnings: Vec<String>,
 }
 fn apply(result: &mut QuickConnect, key: &str, value: &str) {
+    result.options.insert(key.into());
     let p = &mut result.profile;
     match key {
         "hostname" => p.host = value.into(),
@@ -254,17 +258,12 @@ pub fn parse_command(command: &str) -> Result<QuickConnect, String> {
         iter.next();
     }
     let mut result = QuickConnect {
+        options: HashSet::new(),
         profile: Profile::default(),
         warnings: vec![],
     };
     let mut destination = false;
     while let Some(word) = iter.next() {
-        if destination {
-            result
-                .warnings
-                .push("Remote commands are unsupported; a shell will be opened".into());
-            break;
-        }
         if word == "--" {
             continue;
         }
@@ -306,6 +305,12 @@ pub fn parse_command(command: &str) -> Result<QuickConnect, String> {
                 apply(&mut result, key, &value);
             }
             continue;
+        }
+        if destination {
+            result
+                .warnings
+                .push("Remote commands are unsupported; a shell will be opened".into());
+            break;
         }
         let (user, address) = word
             .rsplit_once('@')
@@ -353,6 +358,20 @@ mod tests {
         assert_eq!(p.identity_file, "my key");
         assert_eq!(p.proxy_jump, "admin@bastion");
     }
+    #[test]
+    fn command_options_after_destination_and_remote_commands() {
+        let parsed = parse_command("ssh -i ~/.ssh/mykey.pem user@192.168.1.1 -p 2222").unwrap();
+        assert_eq!(parsed.profile.port, 2222);
+        assert_eq!(parsed.profile.user, "user");
+        assert_eq!(parsed.profile.host, "192.168.1.1");
+        assert_eq!(parsed.profile.identity_file, "~/.ssh/mykey.pem");
+        assert!(parsed.options.contains("identityfile") && parsed.options.contains("port"));
+        assert!(parsed.warnings.is_empty());
+        let remote = parse_command("ssh user@host echo -p 9999").unwrap();
+        assert_eq!(remote.profile.port, 22);
+        assert_eq!(remote.warnings.len(), 1);
+    }
+
     #[test]
     fn unsupported_and_malformed_commands_never_silently_execute() {
         assert!(parse_command("ssh -é host").is_err());

@@ -2,9 +2,10 @@
 use crate::localization::text as tr;
 use gpui::{App, Context, Entity, EventEmitter, Render, Window, div, prelude::*, px};
 use gpui_component::{
-    ActiveTheme, Selectable,
+    ActiveTheme, Icon, Selectable,
     button::{Button, ButtonVariants},
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
+    menu::{DropdownMenu, PopupMenuItem},
     switch::Switch,
 };
 use opsssh_store::{Auth, Profile};
@@ -108,6 +109,73 @@ mod tests {
                 assert!(form.profile(cx).is_none());
                 assert!(!form.message.is_empty());
             })
+        });
+    }
+
+    #[gpui::test]
+    fn quick_command_fills_fields_without_losing_edit_metadata(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let original = Profile {
+            id: 42,
+            name: "My server".into(),
+            environment: "dev".into(),
+            host: "old.example.test".into(),
+            user: "old-user".into(),
+            favorite: true,
+            strict_host_key: true,
+            keepalive_seconds: 75,
+            tags: vec!["backend".into()],
+            tmux_session: Some("work".into()),
+            terminal_upload_directory: Some("/opt/uploads".into()),
+            ..Profile::default()
+        };
+        let (form, cx) =
+            cx.add_window_view(|window, cx| ConnectionForm::new(original, vec![], window, cx));
+        VisualTestContext::update(cx, |window, cx| {
+            form.update(cx, |form, cx| {
+                form.quick.update(cx, |input, cx| {
+                    input.set_value(
+                        "ssh -i 'my key.pem' deploy@new.example.test -p 2222",
+                        window,
+                        cx,
+                    )
+                });
+                form.apply_quick(window, cx, true);
+                let profile = form.profile(cx).unwrap();
+                assert_eq!(
+                    (profile.host.as_str(), profile.user.as_str(), profile.port),
+                    ("new.example.test", "deploy", 2222)
+                );
+                assert_eq!(profile.identity_file, "my key.pem");
+                assert_eq!(profile.auth, Auth::Key);
+                assert_eq!(profile.id, 42);
+                assert_eq!(profile.name, "My server");
+                assert_eq!(profile.environment, "dev");
+                assert_eq!(profile.tags, vec!["backend"]);
+                assert!(profile.favorite && profile.strict_host_key);
+                assert_eq!(profile.keepalive_seconds, 75);
+                assert_eq!(profile.tmux_session.as_deref(), Some("work"));
+                assert_eq!(
+                    profile.terminal_upload_directory.as_deref(),
+                    Some("/opt/uploads")
+                );
+                form.fields
+                    .environment
+                    .update(cx, |input, cx| input.set_value("Production", window, cx));
+                assert_eq!(form.profile(cx).unwrap().environment, "Production");
+                form.quick.update(cx, |input, cx| {
+                    input.set_value("ssh -i 'unclosed", window, cx)
+                });
+                form.apply_quick(window, cx, true);
+                assert!(!form.quick_error.is_empty());
+                assert_eq!(form.fields.host.read(cx).value(), "new.example.test");
+                assert_eq!(form.fields.environment.read(cx).value(), "Production");
+                form.quick
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                form.apply_quick(window, cx, true);
+                assert!(form.quick_error.is_empty());
+                assert_eq!(form.profile(cx).unwrap().port, 2222);
+            });
         });
     }
 
@@ -227,7 +295,10 @@ pub struct ConnectionForm {
     security: bool,
     session: bool,
     protect_work: bool,
-    command: bool,
+    quick_generation: u64,
+    quick_error: String,
+    quick_applied: String,
+    custom_environment: bool,
     errors: BTreeMap<&'static str, String>,
     message: String,
 }
@@ -240,7 +311,35 @@ impl ConnectionForm {
         cx: &mut Context<Self>,
     ) -> Self {
         let fields = Fields::new(&profile, window, cx);
+        cx.subscribe(&fields.environment, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        })
+        .detach();
         let quick = cx.new(|cx| InputState::new(window, cx).placeholder("ssh user@host"));
+        cx.subscribe_in(&quick, window, |this, _, event, window, cx| match event {
+            InputEvent::Change => {
+                this.quick_generation += 1;
+                let generation = this.quick_generation;
+                this.quick_error.clear();
+                let timer = cx
+                    .background_executor()
+                    .timer(std::time::Duration::from_millis(450));
+                cx.spawn_in(window, async move |this, cx| {
+                    timer.await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        if this.quick_generation == generation {
+                            this.apply_quick(window, cx, false);
+                        }
+                    });
+                })
+                .detach();
+            }
+            InputEvent::PressEnter { .. } => this.apply_quick(window, cx, true),
+            _ => {}
+        })
+        .detach();
         let protect_work = profile.tmux_session.is_some();
         Self {
             profile,
@@ -253,10 +352,58 @@ impl ConnectionForm {
             security: false,
             session: false,
             protect_work,
-            command: false,
+            quick_generation: 0,
+            quick_error: String::new(),
+            quick_applied: String::new(),
+            custom_environment: false,
             errors: BTreeMap::new(),
             message: String::new(),
         }
+    }
+    #[cfg(feature = "capture")]
+    pub fn preview_quick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.quick.update(cx, |input, cx| {
+            input.set_value(
+                "ssh -i ~/.ssh/mykey.pem user@192.168.1.1 -p 2222",
+                window,
+                cx,
+            );
+            cx.emit(InputEvent::Change);
+        });
+    }
+    pub fn footer(form: &Entity<Self>, cx: &App) -> gpui::Div {
+        let connect = form.downgrade();
+        let save = form.downgrade();
+        let cancel = form.downgrade();
+        div()
+            .pt_3()
+            .mt_2()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .flex()
+            .gap_2()
+            .child(
+                crate::design::PrimaryAction::new("save-connect")
+                    .label(tr("save-connect"))
+                    .on_click(move |_, window, cx| {
+                        let _ = connect.update(cx, |form, cx| form.submit(true, window, cx));
+                    }),
+            )
+            .child(
+                Button::new("save")
+                    .label(tr("save-server"))
+                    .on_click(move |_, window, cx| {
+                        let _ = save.update(cx, |form, cx| form.submit(false, window, cx));
+                    }),
+            )
+            .child(
+                Button::new("cancel")
+                    .ghost()
+                    .label(tr("cancel"))
+                    .on_click(move |_, _, cx| {
+                        let _ = cancel.update(cx, |_, cx| cx.emit(FormEvent::Cancel));
+                    }),
+            )
     }
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.fields.host.update(cx, |s, cx| s.focus(window, cx));
@@ -346,11 +493,173 @@ impl ConnectionForm {
         }
         (self.errors.is_empty() && self.message.is_empty()).then_some(p)
     }
-    fn submit(&mut self, connect: bool, cx: &mut Context<Self>) {
+    fn submit(&mut self, connect: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_quick(window, cx, false);
+        if !self.quick_error.is_empty() {
+            return;
+        }
         if let Some(p) = self.profile(cx) {
             cx.emit(FormEvent::Save(Box::new(p), connect));
         }
         cx.notify();
+    }
+    fn apply_quick(&mut self, window: &mut Window, cx: &mut Context<Self>, force: bool) {
+        self.quick_generation += 1;
+        let command = self.quick.read(cx).value().trim().to_owned();
+        if command.is_empty() {
+            self.quick_error.clear();
+            self.quick_applied.clear();
+            cx.notify();
+            return;
+        }
+        if !force && command == self.quick_applied {
+            return;
+        }
+        let parsed = match opsssh_ssh_config::parse_command(&command) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.quick_error = error;
+                cx.notify();
+                return;
+            }
+        };
+        let p = parsed.profile;
+        self.fields
+            .host
+            .update(cx, |input, cx| input.set_value(p.host, window, cx));
+        self.fields.port.update(cx, |input, cx| {
+            input.set_value(p.port.to_string(), window, cx)
+        });
+        if !p.user.is_empty() {
+            self.fields
+                .user
+                .update(cx, |input, cx| input.set_value(p.user, window, cx));
+        }
+        for (option, field, value) in [
+            ("identityfile", &self.fields.key, p.identity_file),
+            (
+                "certificatefile",
+                &self.fields.certificate,
+                p.certificate_file,
+            ),
+            ("proxyjump", &self.fields.jump, p.proxy_jump),
+            ("proxycommand", &self.fields.proxy, p.proxy_command),
+            (
+                "serveraliveinterval",
+                &self.fields.keepalive,
+                p.keepalive_seconds.to_string(),
+            ),
+            (
+                "userknownhostsfile",
+                &self.fields.known_hosts,
+                p.known_hosts,
+            ),
+            ("identityagent", &self.fields.agent, p.identity_agent),
+        ] {
+            if parsed.options.contains(option) {
+                field.update(cx, |input, cx| input.set_value(value, window, cx));
+            }
+        }
+        if parsed.options.contains("identityfile") {
+            self.profile.auth = Auth::Key;
+        }
+        if parsed.options.contains("proxycommand") {
+            self.profile.proxy_review_required = true;
+        }
+        if parsed.options.contains("identitiesonly") {
+            self.profile.identities_only = p.identities_only;
+        }
+        if parsed.options.contains("stricthostkeychecking") {
+            self.profile.strict_host_key = p.strict_host_key;
+        }
+        if parsed.options.contains("forwardagent") {
+            self.profile.forward_agent = p.forward_agent;
+        }
+        self.warnings = parsed.warnings;
+        self.quick_applied = command;
+        self.quick_error.clear();
+        self.message.clear();
+        self.errors.clear();
+        cx.notify();
+    }
+    fn environment(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let current = self.fields.environment.read(cx).value().to_string();
+        let weak = cx.entity().downgrade();
+        let selected = current.clone();
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w_full()
+            .child(div().text_sm().child(tr("form-environment")))
+            .child(
+                Button::new("environment-select")
+                    .w_full()
+                    .icon(gpui_kit_assets::IconName::Box)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(if current.is_empty() {
+                                tr("form-select-environment")
+                            } else {
+                                current
+                            }),
+                    )
+                    .child(Icon::new(gpui_kit_assets::IconName::ChevronDown))
+                    .accessibility_label(tr("form-environment"))
+                    .dropdown_menu(move |mut menu, window, _| {
+                        menu = menu.min_w(px(580.).min(window.viewport_size().width - px(112.)));
+                        let mut values = vec![
+                            String::new(),
+                            "Production".into(),
+                            "Staging".into(),
+                            "Development".into(),
+                        ];
+                        if !values.contains(&selected) {
+                            values.push(selected.clone());
+                        }
+                        for value in values {
+                            let weak = weak.clone();
+                            let checked = value == selected;
+                            menu = menu.item(
+                                PopupMenuItem::new(if value.is_empty() {
+                                    tr("form-no-environment")
+                                } else {
+                                    value.clone()
+                                })
+                                .checked(checked)
+                                .on_click(move |_, window, cx| {
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.fields.environment.update(cx, |input, cx| {
+                                            input.set_value(value.clone(), window, cx)
+                                        });
+                                        this.custom_environment = false;
+                                        cx.notify();
+                                    });
+                                }),
+                            );
+                        }
+                        let weak = weak.clone();
+                        menu.item(PopupMenuItem::new(tr("form-custom-environment")).on_click(
+                            move |_, window, cx| {
+                                let _ = weak.update(cx, |this, cx| {
+                                    this.custom_environment = true;
+                                    this.fields
+                                        .environment
+                                        .update(cx, |input, cx| input.focus(window, cx));
+                                    cx.notify();
+                                });
+                            },
+                        ))
+                    }),
+            )
+            .when(self.custom_environment, |d| {
+                d.child(
+                    Input::new(&self.fields.environment).aria_label(tr("form-custom-environment")),
+                )
+            })
     }
     fn row(&self, key: &'static str, field: &Entity<InputState>, cx: &App) -> gpui::Div {
         div()
@@ -394,7 +703,7 @@ impl ConnectionForm {
                     "form-routing" => this.routing = !this.routing,
                     "form-security" => this.security = !this.security,
                     "form-session" => this.session = !this.session,
-                    _ => this.command = !this.command,
+                    _ => {}
                 }
                 cx.notify();
             }))
@@ -438,6 +747,43 @@ impl Render for ConnectionForm {
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(tr("form-intro")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(div().text_sm().child(tr("form-quick-connect")))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().flex_1().min_w_0().child(
+                                Input::new(&self.quick).aria_label(tr("form-quick-connect")),
+                            ))
+                            .child(
+                                Button::new("parse-command")
+                                    .label(tr("form-fill-command"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.apply_quick(window, cx, true)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(tr("form-quick-help")),
+                    )
+                    .when(!self.quick_error.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().danger)
+                                .child(self.quick_error.clone()),
+                        )
+                    }),
             )
             .when(!self.message.is_empty(), |d| {
                 d.child(
@@ -511,6 +857,7 @@ impl Render for ConnectionForm {
                         Auth::Key => "auth-key-help",
                     })),
             )
+            .child(self.environment(cx))
             .child(
                 div()
                     .flex()
@@ -545,51 +892,7 @@ impl Render for ConnectionForm {
             .child(self.heading("form-details", self.details, cx))
             .when(self.details, |d| {
                 d.child(self.row("form-name", &self.fields.name, cx))
-                    .child(self.row("form-environment", &self.fields.environment, cx))
                     .child(self.row("form-tags", &self.fields.tags, cx))
-            })
-            .child(self.heading("form-command", self.command, cx))
-            .when(self.command, |d| {
-                d.child(Input::new(&self.quick).aria_label(tr("form-command")))
-                    .child(
-                        Button::new("parse-command")
-                            .label(tr("form-fill-command"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let command = this.quick.read(cx).value();
-                                match opsssh_ssh_config::parse_command(&command) {
-                                    Ok(parsed) => {
-                                        let mut profile = parsed.profile;
-                                        profile.id = this.profile.id;
-                                        profile.favorite = this.profile.favorite;
-                                        profile.name =
-                                            this.fields.name.read(cx).value().to_string();
-                                        profile.environment =
-                                            this.fields.environment.read(cx).value().to_string();
-                                        profile.tags = this
-                                            .fields
-                                            .tags
-                                            .read(cx)
-                                            .value()
-                                            .split(',')
-                                            .map(str::trim)
-                                            .filter(|s| !s.is_empty())
-                                            .map(str::to_owned)
-                                            .collect();
-                                        profile.tmux_session = this
-                                            .protect_work
-                                            .then(|| this.fields.tmux.read(cx).value().to_string());
-                                        this.fields = Fields::new(&profile, window, cx);
-                                        this.profile = profile;
-                                        this.warnings = parsed.warnings;
-                                        this.message.clear();
-                                        this.errors.clear();
-                                        this.details = true;
-                                    }
-                                    Err(error) => this.message = error,
-                                }
-                                cx.notify();
-                            })),
-                    )
             })
             .when(!self.warnings.is_empty(), |d| {
                 d.child(
@@ -668,30 +971,6 @@ impl Render for ConnectionForm {
                             ))
                     })
             })
-            .child(
-                div()
-                    .pt_3()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .flex()
-                    .gap_2()
-                    .child(
-                        crate::design::PrimaryAction::new("save-connect")
-                            .label(tr("save-connect"))
-                            .on_click(cx.listener(|this, _, _, cx| this.submit(true, cx))),
-                    )
-                    .child(
-                        Button::new("save")
-                            .label(tr("save-server"))
-                            .on_click(cx.listener(|this, _, _, cx| this.submit(false, cx))),
-                    )
-                    .child(
-                        Button::new("cancel")
-                            .ghost()
-                            .label(tr("cancel"))
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(FormEvent::Cancel))),
-                    ),
-            )
             .max_w(px(620.))
     }
 }

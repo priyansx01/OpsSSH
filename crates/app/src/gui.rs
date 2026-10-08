@@ -196,7 +196,13 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
                 }
                 if screen.contains("settings") {workspace.settings_page=true;}
                 if screen.contains("help") {workspace.help_page=true;}
-                if screen.contains("connection") {let this=cx.entity().downgrade();window.on_next_frame(move|window,cx|{let _=this.update(cx,|this,cx|this.new_server(&NewServer,window,cx));});}
+                if screen.contains("connection") {
+                    let this=cx.entity().downgrade();let editing=screen.contains("edit-connection");let quick=screen.contains("quick");
+                    window.on_next_frame(move|window,cx|{let _=this.update(cx,|this,cx|{
+                        if editing {this.edit(Profile{id:42,name:"ERP development VM".into(),host:"10.30.7.25".into(),user:"backend".into(),port:8288,environment:"dev".into(),auth:opsssh_store::Auth::Password,..Profile::default()},window,cx);}else{this.new_server(&NewServer,window,cx);}
+                        if quick && let Some(form)=&this.editor {form.update(cx,|form,cx|form.preview_quick(window,cx));}
+                    });});
+                }
                 if screen.contains("key") {let this=cx.entity().downgrade();window.on_next_frame(move|window,cx|{let _=this.update(cx,|this,cx|this.edit(Profile{host:"host.example.test".into(),user:"deploy".into(),auth:opsssh_store::Auth::Key,..Profile::default()},window,cx));});}
                 let timer=cx.background_executor().timer(std::time::Duration::from_secs(2));cx.spawn_in(window,async move|this,cx|{timer.await;let _=this.update_in(cx,|_,window,cx|{match window.render_to_image().and_then(|image|image.save(&path).map_err(Into::into)){Ok(())=>eprintln!("Saved rendered frame to {}",path.display()),Err(error)=>eprintln!("Frame export failed: {error}")};cx.quit();});}).detach();}
             #[cfg(not(feature="capture"))]let _=capture_path;
@@ -936,13 +942,14 @@ impl Workspace {
         .detach();
         let child = form.clone();
         let workspace = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, window, _cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let workspace = workspace.clone();
             dialog
                 .title(title.clone())
                 .width(px(660.).min(window.viewport_size().width - px(48.)))
                 .overlay_closable(false)
                 .child(child.clone())
+                .footer(ConnectionForm::footer(&child, cx))
                 .on_close(move |_, _, cx| {
                     let _ = workspace.update(cx, |this, cx| {
                         this.editor = None;

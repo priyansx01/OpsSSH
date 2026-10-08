@@ -404,3 +404,9 @@ card-collection = CONNECTIONS
 card-shown = shown
 workspace-subtitle = Connection workspace
 search-connections = Search connections
+
+form-quick-connect = Quick connect via SSH command (optional)
+form-quick-help = Paste an SSH command to fill host, username, port, and key. Review the details, then Save & connect.
+form-select-environment = Select environment
+form-no-environment = No environment
+form-custom-environment = Custom environment...

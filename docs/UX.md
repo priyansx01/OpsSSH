@@ -27,7 +27,15 @@ SSH-config aliases are read-only: Customize creates a saved profile, and aliases
 support Duplicate and Copy SSH command but cannot be removed from this UI.
 There are no synthetic reachability indicators in the application.
 
-Connection setup starts with host and port side by side, username, and authentication. Details and
+Connection setup shows Quick Connect first: pasting an SSH command fills the fields
+after a short pause; Apply command or Enter fills immediately. Parsing never starts
+a connection. Invalid commands retain the previous field values, and applying a
+command preserves metadata and any advanced options absent from that command.
+Host and port stay side by side, followed by username and authentication. Both
+new and edit dialogs show an environment dropdown with Production, Staging,
+Development, no environment, and custom values; existing labels such as dev survive edits.
+Save and Cancel stay visible in the dialog footer while the form body scrolls.
+Details and
 advanced routing/security/session settings are collapsed. Existing advanced
 values survive editing while collapsed. Passwords and encrypted-key passphrases
 are requested during authentication. Unsupported SSH options require explicit
