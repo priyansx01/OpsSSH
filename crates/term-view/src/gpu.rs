@@ -105,6 +105,14 @@ impl std::fmt::Debug for TerminalView {
 }
 
 impl TerminalView {
+    /// Keep the toolkit's root focus/clipboard bindings off terminal key events.
+    /// Register after toolkit initialization, once per application.
+    pub fn bind_keys(cx: &mut App) {
+        cx.bind_keys(
+            ["tab", "shift-tab", "ctrl-c", "cmd-c"]
+                .map(|key| gpui::KeyBinding::new(key, gpui::NoAction {}, Some("OpsSSHTerminal"))),
+        );
+    }
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self::start(None, window, cx)
     }
@@ -1425,7 +1433,13 @@ impl Render for TerminalView {
         let _ = &self.subscriptions;
         div()
             .id("terminal")
-            .key_context("OpsSSHTerminal")
+            .key_context(if self.prompt.is_some() {
+                "OpsSSHAuthentication"
+            } else if self.paste_preview.is_some() {
+                "OpsSSHPasteReview"
+            } else {
+                "OpsSSHTerminal"
+            })
             .relative()
             .size_full()
             .flex()
@@ -1869,6 +1883,63 @@ mod clipboard_tests {
     use opsssh_term_core::{Cell, TerminalBackend};
 
     #[gpui::test]
+    fn root_focus_bindings_cannot_consume_terminal_tab_keys(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            TerminalView::bind_keys(cx);
+        });
+        let session = Session::local(LocalShellOptions::default()).unwrap();
+        let mut view = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let terminal = cx.new(|cx| {
+                let mut view = fixture(window, cx);
+                view.stopped = false;
+                view.session = Some(session);
+                view.focus.focus(window, cx);
+                view
+            });
+            view = Some(terminal.clone());
+            gpui_component::Root::new(terminal, window, cx)
+        });
+        let view = view.unwrap();
+        draw(cx);
+        for (keys, expected) in [
+            ("shift-tab", b"\x1b[Z".as_slice()),
+            ("tab", b"\t".as_slice()),
+            ("left", b"\x1b[D".as_slice()),
+            ("ctrl-c", b"\x03".as_slice()),
+        ] {
+            cx.update(|_, cx| view.update(cx, |view, _| view.sent_input.clear()));
+            cx.simulate_keystrokes(keys);
+            assert_eq!(
+                view.read_with(cx, |view, _| view.sent_input.concat()),
+                expected,
+                "{keys}"
+            );
+            cx.update(|window, cx| assert!(view.read(cx).focus.is_focused(window)));
+        }
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.session
+                    .as_ref()
+                    .unwrap()
+                    .backend()
+                    .lock()
+                    .unwrap()
+                    .ingest(b"\x1b[>1u")
+                    .unwrap();
+                view.sent_input.clear();
+            })
+        });
+        cx.simulate_keystrokes("shift-tab");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sent_input.concat()),
+            b"\x1b[9;2u"
+        );
+        cx.update(|_, cx| view.update(cx, |view, cx| view.disconnect(cx)));
+    }
+
+    #[gpui::test]
     fn native_captured_keys_use_the_encoder_and_reject_stale_generations(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
         let session = Session::local(LocalShellOptions::default()).unwrap();
@@ -1987,8 +2058,17 @@ mod clipboard_tests {
     fn returning_to_an_authenticating_terminal_focuses_the_credentials_field(
         cx: &mut TestAppContext,
     ) {
-        cx.update(gpui_component::init);
-        let (view, cx) = cx.add_window_view(fixture);
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            TerminalView::bind_keys(cx);
+        });
+        let mut view = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let terminal = cx.new(|cx| fixture(window, cx));
+            view = Some(terminal.clone());
+            gpui_component::Root::new(terminal, window, cx)
+        });
+        let view = view.unwrap();
         draw(cx);
         let (password, otp) = cx.update(|window, cx| {
             let password = cx.new(|cx| InputState::new(window, cx));
@@ -2012,6 +2092,12 @@ mod clipboard_tests {
         });
         draw(cx);
         cx.simulate_input("password");
+        cx.simulate_keystrokes("tab");
+        cx.update(|window, cx| assert_eq!(window.focused(cx), Some(otp.read(cx).focus_handle(cx))));
+        cx.simulate_keystrokes("shift-tab");
+        cx.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(password.read(cx).focus_handle(cx)))
+        });
         cx.update(|window, cx| {
             assert_eq!(password.read(cx).value().to_string(), "password");
             otp.update(cx, |input, cx| input.focus(window, cx));

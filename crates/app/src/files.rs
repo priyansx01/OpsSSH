@@ -20,6 +20,7 @@ pub enum FilePaneEvent {
     FocusTerminal,
     DestinationValidated(u64, String),
     DestinationFailed(u64, String),
+    ChooseUploadDestination,
 }
 #[derive(Clone)]
 enum Job {
@@ -1004,6 +1005,22 @@ impl FilePane {
                             })),
                     )
                 })
+                .when(
+                    !active
+                        && matches!(task.retry.as_ref(), Some(Job::Upload { insert: true, .. })),
+                    |d| {
+                        d.child(
+                            Button::new(("drop-destination", id))
+                                .small()
+                                .ghost()
+                                .label(tr("upload-change-folder"))
+                                .disabled(!self.available)
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    cx.emit(FilePaneEvent::ChooseUploadDestination);
+                                })),
+                        )
+                    },
+                )
                 .when_some(paths.clone(), |d, text| {
                     d.child(
                         Button::new(("drop-copy", id))
@@ -2281,8 +2298,7 @@ async fn execute(
 ) -> opsssh_sftp::Result<()> {
     match job {
         Job::ValidateDestination { request, path } => {
-            let path = client.canonicalize(&path).await?;
-            client.list(&path).await?;
+            let path = client.validate_upload_directory(&path).await?;
             updates
                 .send(Update::DestinationValidated(request, path))
                 .await?;

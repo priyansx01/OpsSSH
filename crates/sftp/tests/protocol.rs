@@ -10,6 +10,7 @@ use std::{
 struct MemoryServer {
     files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     directories: Arc<Mutex<HashMap<String, u32>>>,
+    denied_writes: Vec<String>,
     listed: bool,
 }
 fn ok(id: u32) -> Status {
@@ -40,6 +41,15 @@ impl Handler for MemoryServer {
         flags: OpenFlags,
         _: FileAttributes,
     ) -> Result<Handle, StatusCode> {
+        if flags.contains(OpenFlags::WRITE)
+            && self.denied_writes.iter().any(|path| {
+                filename
+                    .rsplit_once('/')
+                    .is_some_and(|(parent, _)| parent == path)
+            })
+        {
+            return Err(StatusCode::PermissionDenied);
+        }
         let mut files = self.files.lock().unwrap();
         if files.contains_key(&filename) && flags.contains(OpenFlags::EXCLUDE) {
             return Err(StatusCode::Failure);
@@ -57,6 +67,14 @@ impl Handler for MemoryServer {
         })
     }
     async fn close(&mut self, id: u32, _: String) -> Result<Status, StatusCode> {
+        Ok(ok(id))
+    }
+    async fn remove(&mut self, id: u32, filename: String) -> Result<Status, StatusCode> {
+        self.files
+            .lock()
+            .unwrap()
+            .remove(&filename)
+            .ok_or(StatusCode::NoSuchFile)?;
         Ok(ok(id))
     }
     async fn read(
@@ -166,6 +184,41 @@ impl Handler for MemoryServer {
                 .collect(),
         })
     }
+}
+
+#[tokio::test]
+async fn upload_destination_checks_write_access_and_removes_its_probe() {
+    let (client_io, server_io) = tokio::io::duplex(65536);
+    let server = MemoryServer {
+        denied_writes: vec!["/home".into()],
+        ..Default::default()
+    };
+    let files = server.files.clone();
+    russh_sftp::server::run(server_io, server).await;
+    let client = SftpClient::connect(client_io, "SHA256:fixture".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .validate_upload_directory("/home/backend")
+            .await
+            .unwrap(),
+        "/home/backend"
+    );
+    assert!(
+        files.lock().unwrap().is_empty(),
+        "successful probe left a file behind"
+    );
+    let error = client
+        .validate_upload_directory("/home")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("/home") && error.contains("SSH login"),
+        "{error}"
+    );
+    assert!(files.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -120,6 +120,8 @@ impl Workspace {
             let browse_input = input.clone();
             let up_pane = pane.clone();
             let up_input = input.clone();
+            let home_pane = pane.clone();
+            let home_input = input.clone();
             dialog
                 .title(tr("upload-destination-title"))
                 .width(px(520.).min(window.viewport_size().width - px(48.)))
@@ -171,6 +173,20 @@ impl Workspace {
                                             });
                                             up_pane.update(cx, |pane, cx| {
                                                 pane.follow_directory(parent.clone(), cx)
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("upload-ssh-home")
+                                        .ghost()
+                                        .label(tr("upload-ssh-home"))
+                                        .disabled(checking)
+                                        .on_click(move |_, window, cx| {
+                                            home_input.update(cx, |input, cx| {
+                                                input.set_value(".", window, cx)
+                                            });
+                                            home_pane.update(cx, |pane, cx| {
+                                                pane.follow_directory(".".into(), cx)
                                             });
                                         }),
                                 ),

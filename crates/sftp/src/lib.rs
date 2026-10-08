@@ -107,6 +107,28 @@ impl SftpClient {
     pub async fn canonicalize(&self, path: &str) -> Result<String> {
         Ok(self.session.canonicalize(path).await?)
     }
+    /// Validate the login user's actual write access, including ACLs and read-only mounts.
+    /// The exclusive, empty probe is removed before the destination is accepted.
+    pub async fn validate_upload_directory(&self, path: &str) -> Result<String> {
+        let path = self.canonicalize(path).await?;
+        self.list(&path).await?;
+        let probe = opsssh_drop::join_remote(
+            &path,
+            &format!(".opsssh-write-check-{}", uuid::Uuid::new_v4()),
+        )?;
+        let file = self.session.open_with_flags_and_attributes(
+            &probe,
+            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE,
+            FileAttributes { permissions: Some(0o600), ..FileAttributes::empty() },
+        ).await.map_err(|error| format!(
+            "Cannot upload to {path}: {error}. Choose a folder writable by your SSH login. Sudo in the terminal does not change SFTP permissions."
+        ))?;
+        let close = file.close().await;
+        let cleanup = self.session.remove_file(&probe).await;
+        cleanup.map_err(|error| format!("Could not remove upload write check {probe}: {error}"))?;
+        close?;
+        Ok(path)
+    }
     /// SFTP v3 listing is collected off the UI thread; the UI must virtualize rows.
     pub async fn list(&self, path: &str) -> Result<Vec<Entry>> {
         let mut entries = Vec::new();

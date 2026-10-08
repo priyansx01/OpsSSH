@@ -135,8 +135,12 @@ retain their own input handling.
 Ctrl+K, Ctrl+N, Ctrl+W, Ctrl+J, Ctrl+R, Ctrl+T, Ctrl+O, Shift+Tab, Escape, and
 Alt combinations therefore reach the shell or harness. Workspace buttons remain
 available, and the usual workspace bindings still work outside the Terminal page.
-The terminal has no local keyboard clipboard handlers. Modified key presses
-and negotiated key releases reach the harness without rewriting them as local
+The terminal has no local keyboard clipboard handlers. Tab/Shift+Tab and terminal
+clipboard chords bypass GPUI Kit's root focus and clipboard bindings. These
+overrides apply to terminal input only; authentication fields and paste reviews
+retain normal focus traversal. A root-mounted regression checks terminal bytes
+and focus, including the legacy backtab and negotiated Kitty Shift+Tab.
+Modified key presses and negotiated key releases reach the harness without rewriting them as local
 copy/paste actions. Local clipboard operations remain available through the
 right-click menu.
 
@@ -170,7 +174,11 @@ harness and tmux acceptance on a disposable VM remains a release check.
 
 Terminal drops initialize SFTP without opening Files. A compact folder picker
 validates existing remote directories and remembers the canonical destination in
-the server profile. Endpoint changes clear that preference; an old live session
+the server profile after an exclusive empty write probe is closed and removed.
+The SSH home button resolves `.` through SFTP; it does not assume `/home/user`.
+Failed terminal uploads offer Change folder before retry. SFTP retains the SSH
+login's privileges regardless of sudo inside the interactive shell.
+Endpoint changes clear the saved preference; an old live session
 is detached from the edited profile rather than saving paths for the wrong host.
 The destination can be edited in advanced connection session settings or from
 the terminal toolbar. Unchecked Remember applies to the current drop only.

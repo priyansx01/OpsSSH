@@ -47,8 +47,11 @@ requires review. Ctrl/Cmd-click opens HTTP/HTTPS terminal hyperlinks.
 
 Dropping a file keeps the terminal open. Choose a remote upload folder once and
 remember it for that server; future drops use that folder automatically. Change it
-with Upload destination or the connection's advanced session settings. A circular
-progress tray shows preparation, upload, cancellation, and failure. Successful
+with Upload destination or the connection's advanced session settings. The
+folder picker checks write access before remembering a destination. Use SSH home
+selects the login user's home, avoiding unwritable parents such as `/home`.
+SFTP uses the SSH login's permissions even if the shell is running under sudo.
+A circular progress tray shows preparation, upload, cancellation, and failure. Successful
 uploads insert quoted remote paths without pressing Enter. If you move away from
 the original terminal, use Insert path or Copy path from its transfer feedback.
 Files and folders never overwrite existing remote names automatically.

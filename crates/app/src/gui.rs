@@ -84,6 +84,7 @@ pub fn capture(screen: &str, path: PathBuf) {
     run_internal(screen == "snapshot-local", Some((screen.into(), path)));
 }
 fn bind_workspace_keys(cx: &mut App) {
+    TerminalView::bind_keys(cx);
     // Workspace actions must never consume keys from a focused VM terminal.
     const WORKSPACE: &str = "OpsSSH && !OpsSSHTerminal && !OpsSSHTerminalOpen";
     const HOME: &str = "OpsSSHHome && !OpsSSHTerminal && !OpsSSHTerminalOpen";
@@ -1051,6 +1052,20 @@ impl Workspace {
         cx.observe(&files, |_, _, cx| cx.notify()).detach();
         cx.subscribe_in(&files, window, move |this, pane, event, window, cx| {
             let (id, text) = match event {
+                FilePaneEvent::ChooseUploadDestination => {
+                    if let Some(id) = this
+                        .sessions
+                        .iter()
+                        .find(|tab| {
+                            tab.files.as_ref() == Some(pane)
+                                && this.navigation.active == Some(tab.id)
+                        })
+                        .map(|tab| tab.id)
+                    {
+                        this.choose_upload_destination(id, vec![], window, cx);
+                    }
+                    return;
+                }
                 FilePaneEvent::InsertText(id, text) => (id, text),
                 FilePaneEvent::FocusTerminal => {
                     if this.sessions.iter().any(|tab| {
@@ -1242,6 +1257,11 @@ mod tests {
                 dialog.checking = true;
                 let pane = dialog.pane.clone();
                 let request = dialog.request;
+                this.destination_failed(&pane, request, "Permission denied".into(), cx);
+                assert!(this.upload_dialog.as_ref().is_some_and(|d| !d.checking));
+                assert!(this.sessions[index].upload_directory.is_none());
+                assert_eq!(pane.read(cx).active_transfers(), 0);
+                this.upload_dialog.as_mut().unwrap().checking = true;
                 this.destination_validated(&pane, request + 1, "/wrong".into(), window, cx);
                 assert!(this.upload_dialog.is_some());
                 this.destination_validated(&pane, request, "/srv/uploads".into(), window, cx);
