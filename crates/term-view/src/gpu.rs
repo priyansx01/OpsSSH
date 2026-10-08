@@ -82,6 +82,7 @@ pub struct TerminalView {
     prompt: Option<ConnectionPrompt>,
     current_directory: Option<String>,
     verified_host_key: Option<String>,
+    authentication: Option<opsssh_ssh_core::AuthenticationInfo>,
     connection_generation: u64,
     at_prompt: bool,
     paste_preview: Option<String>,
@@ -153,6 +154,7 @@ impl TerminalView {
         self.blink_task = None;
         self.sync_task = None;
         self.error = None;
+        self.authentication = None;
         self.connection_generation = self.connection_generation.wrapping_add(1);
         cx.notify();
     }
@@ -186,7 +188,12 @@ impl TerminalView {
         self.verified_host_key.as_deref()
     }
 
-    /// Changes when an SSH transport begins reconnecting, invalidating SFTP work.
+    /// Successful target authentication, cleared when the transport is disconnected.
+    pub fn authentication(&self) -> Option<&opsssh_ssh_core::AuthenticationInfo> {
+        self.authentication.as_ref()
+    }
+
+    /// Changes when an SSH transport begins reconnecting, invalidating remote work.
     pub fn connection_generation(&self) -> u64 {
         self.connection_generation
     }
@@ -416,6 +423,7 @@ impl TerminalView {
             prompt: None,
             current_directory: None,
             verified_host_key: None,
+            authentication: None,
             connection_generation: 0,
             at_prompt: false,
             paste_preview: None,
@@ -449,6 +457,7 @@ impl TerminalView {
 
     fn ssh_event(&mut self, event: SshEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
+            SshEvent::Authenticated(info) => self.authentication = Some(info),
             SshEvent::Connected => {
                 self.error = None;
                 self.prompt = None;
@@ -463,6 +472,7 @@ impl TerminalView {
                 self.verified_host_key = Some(fingerprint)
             }
             SshEvent::Reconnecting { attempt, delay } => {
+                self.authentication = None;
                 self.connection_generation = self.connection_generation.wrapping_add(1);
                 self.error = Some(format!(
                     "Connection lost. Reconnecting (attempt {attempt}) in {} seconds",

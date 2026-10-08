@@ -25,6 +25,8 @@ opsssh-ssh-core = { path = "../ssh-core", version = "=0.1.0" }
 shlex = "=2.0.1"
 opsssh-i18n = { path = "../i18n", version = "=0.1.0" }
 opsssh-sftp = { path = "../sftp", version = "=0.1.0" }
+opsssh-ssh-management = { path = "../ssh-management", version = "=0.1.0" }
+serde_json = "=1.0.151"
 opsssh-drop = { path = "../drop", version = "=0.1.0" }
 async-channel = "=2.5.0"
 tokio = { version = "=1.53.2", features = ["rt", "time", "net"] }

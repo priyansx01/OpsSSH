@@ -105,6 +105,9 @@ can contain local paths and shell output; review them before sharing.
   certificates, strict known-host verification, jump chains and reviewed proxies.
 - SFTP listing/transfers, cancellation, exclusive creation, explicit overwrite and
   identity-checked resume; drop quoting, private staging and PNG encoding.
+- Per-session Linux SSH key management: search, import, inspect, copy/export,
+  comment edits and confirmed removal; explicit privileged user creation with repair.
+  See [SSH Management](docs/SSH_MANAGEMENT.md) for requirements and scope.
 - Tmux reconnect with bounded backoff and disconnected input rejection.
 - Real PTY, SSH loopback and SFTP protocol tests, three-platform CI, compatibility
   fixtures and unsigned package tooling.

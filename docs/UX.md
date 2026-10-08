@@ -61,8 +61,8 @@ checks; these results do not establish performance or cross-platform acceptance.
 
 ## Connected VM workspaces
 
-Entering a VM replaces Home navigation with Terminal, File Manager, and
-Infrastructure. Back to servers restores Home. Each tab has a close button;
+Entering a VM replaces Home navigation with Terminal, File Manager, SSH Management,
+and Infrastructure. Back to servers restores Home. Each tab has a close button;
 live SSH sessions offer Stay connected, Disconnect, or Cancel. Hidden sessions
 remain in the registry and appear on Home, retaining the same terminal and
 transfer state. App exit reports active sessions and transfers. Plain SSH cannot

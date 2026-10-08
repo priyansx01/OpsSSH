@@ -183,6 +183,13 @@ impl AuthenticatedConnection {
             "Exec command is too large"
         );
         anyhow::ensure!(!request.control.is_cancelled(), "Remote command cancelled");
+        anyhow::ensure!(
+            request
+                .stdin
+                .as_ref()
+                .is_none_or(|input| input.expose().len() <= 2 * 1024 * 1024),
+            "Exec stdin exceeds its limit"
+        );
         let deadline = tokio::time::Instant::now() + request.timeout;
         let mut channel = tokio::select! {
             channel = tokio::time::timeout_at(deadline, self.handle.channel_open_session()) =>
@@ -191,6 +198,10 @@ impl AuthenticatedConnection {
         };
         let result = async {
             channel.exec(true, request.command).await?;
+            if let Some(input) = &request.stdin {
+                channel.data(input.expose().as_bytes()).await?;
+                channel.eof().await?;
+            }
             let mut output = ExecOutput::default();
             while let Some(message) = channel.wait().await {
                 match message {
@@ -322,6 +333,7 @@ async fn connect_cached(
     let mut proxy_child = None;
     let mut chain = options.jumps.clone();
     chain.push(options);
+    let mut authentication = None;
     for (index, option) in chain.into_iter().enumerate() {
         let stream: Box<dyn Transport> = if let Some(previous) = hops.last() {
             anyhow::ensure!(
@@ -383,23 +395,30 @@ async fn connect_cached(
         )
         .await
         .with_context(|| format!("SSH handshake failed at hop {}", index + 1))?;
-        network_timeout(
-            authenticate(
-                &mut handle,
-                &option,
-                &events,
-                &commands,
-                &prompt_active,
-                &memory,
-            ),
-            option.connect_timeout,
-            prompt_active.clone(),
-        )
-        .await
-        .with_context(|| format!("SSH authentication failed at hop {}", index + 1))?;
+        authentication = Some(
+            network_timeout(
+                authenticate(
+                    &mut handle,
+                    &option,
+                    &events,
+                    &commands,
+                    &prompt_active,
+                    &memory,
+                ),
+                option.connect_timeout,
+                prompt_active.clone(),
+            )
+            .await
+            .with_context(|| format!("SSH authentication failed at hop {}", index + 1))?,
+        );
         hops.push(handle);
     }
     let handle = hops.pop().context("Empty SSH connection chain")?;
+    events
+        .send(SshEvent::Authenticated(
+            authentication.context("Missing authentication result")?,
+        ))
+        .await?;
     Ok(AuthenticatedConnection {
         handle,
         hops,
@@ -460,11 +479,29 @@ async fn authenticate(
     commands: &Receiver<SshCommand>,
     prompt_active: &Arc<AtomicBool>,
     memory: &SharedMemory,
-) -> Result<()> {
+) -> Result<crate::AuthenticationInfo> {
+    let info = |method, fingerprint| crate::AuthenticationInfo {
+        username: options.username.clone(),
+        method,
+        fingerprint,
+    };
     if handle.authenticate_none(&options.username).await?.success() {
-        return Ok(());
+        return Ok(info(crate::AuthenticationMethod::None, None));
     }
     for method in &options.auth {
+        let mut fingerprint = None;
+        let kind = match method {
+            AuthMethod::Password(_) | AuthMethod::PasswordPrompt => {
+                crate::AuthenticationMethod::Password
+            }
+            AuthMethod::PrivateKey {
+                certificate: Some(_),
+                ..
+            } => crate::AuthenticationMethod::Certificate,
+            AuthMethod::PrivateKey { .. } => crate::AuthenticationMethod::PublicKey,
+            AuthMethod::Agent { .. } => crate::AuthenticationMethod::Agent,
+            AuthMethod::KeyboardInteractive => crate::AuthenticationMethod::KeyboardInteractive,
+        };
         let success = match method {
             AuthMethod::Password(secret) => handle
                 .authenticate_password(&options.username, secret.expose())
@@ -490,7 +527,7 @@ async fn authenticate(
                         .await?
                         .success()
                 {
-                    return Ok(());
+                    return Ok(info(kind, None));
                 }
                 memory
                     .lock()
@@ -580,6 +617,7 @@ async fn authenticate(
                     !key.algorithm().is_rsa(),
                     "RSA private keys are disabled pending a dependency security fix; select Ed25519 or ECDSA"
                 );
+                fingerprint = Some(key.public_key().fingerprint(HashAlg::Sha256).to_string());
                 if let Some(path) = certificate {
                     handle
                         .authenticate_openssh_cert(
@@ -613,6 +651,10 @@ async fn authenticate(
                         .filter(|identity| !identity.public_key().algorithm().is_rsa())
                         .take(6)
                     {
+                        let candidate = identity
+                            .public_key()
+                            .fingerprint(HashAlg::Sha256)
+                            .to_string();
                         let result = match identity {
                             AgentIdentity::PublicKey { key, .. } => {
                                 handle
@@ -636,6 +678,7 @@ async fn authenticate(
                             }
                         };
                         if result.success() {
+                            fingerprint = Some(candidate);
                             success = true;
                             break;
                         }
@@ -685,7 +728,7 @@ async fn authenticate(
             }
         };
         if success {
-            return Ok(());
+            return Ok(info(kind, fingerprint));
         }
     }
     bail!("Authentication rejected; credentials are not retried automatically")

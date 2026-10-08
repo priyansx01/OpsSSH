@@ -64,11 +64,12 @@ The charcoal/ruby redesign and its validation limits are described in [UX.md](UX
 
 ## Server workspace phase
 
-Implemented Terminal / File Manager / Linux Infrastructure navigation, stable
+Implemented Terminal / File Manager / SSH Management / Linux Infrastructure navigation, stable
 session identities, per-tab close choices, background-session reopening, optional
 tmux protection and visible recovery, full-page SFTP grid/list views, interrupted
 transfer retry, and independent bounded metrics/process-operation channels.
 See [SESSION_RECOVERY.md](SESSION_RECOVERY.md) for persistence behavior. Remote
 process termination uses confirmed SIGTERM with identity revalidation and no
-sudo. Deployments, AI assistance, PM2, backups, logs, alerts, cron and Docker
+sudo. [SSH Management](SSH_MANAGEMENT.md) provides connected-account authorized
+keys and explicit root/sudo user creation on Linux with Python 3. Deployments, AI assistance, PM2, backups, logs, alerts, cron and Docker
 remain later phases.

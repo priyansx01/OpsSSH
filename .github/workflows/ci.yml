@@ -25,6 +25,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libfreetype6-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxcb1-dev libssl-dev
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace --all-features --locked
+      - name: Linux SSH management helper
+        if: runner.os == 'Linux'
+        run: sudo env PYTHONDONTWRITEBYTECODE=1 python3 crates/ssh-management/tests/test_helper.py -v
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo build --workspace --release --locked
       - name: Record support-code microbenchmark

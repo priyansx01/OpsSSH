@@ -5,6 +5,7 @@ mod terminal_uploads;
 mod views;
 use crate::infrastructure::InfrastructureView;
 use crate::localization::text as tr;
+use crate::ssh_management::SshManagementView;
 use gpui::{
     App, Bounds, Context, Entity, FocusHandle, KeyBinding, Render, Window, WindowBounds,
     WindowOptions, actions, div, prelude::*, px, rgb, size,
@@ -27,6 +28,7 @@ enum SessionPage {
     Terminal,
     Files,
     Infrastructure,
+    SshManagement,
 }
 
 struct Tab {
@@ -40,6 +42,7 @@ struct Tab {
     connected_at: Option<Instant>,
     page: SessionPage,
     infrastructure: Option<Entity<InfrastructureView>>,
+    ssh_management: Option<Entity<SshManagementView>>,
     name: String,
     terminal: Entity<TerminalView>,
     color: u32,
@@ -160,6 +163,12 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
                         let terminal=tab.terminal.clone();
                         let timer=cx.background_executor().timer(std::time::Duration::from_millis(900));
                         cx.spawn_in(window,async move|_,cx|{timer.await;let _=terminal.update_in(cx,|view,window,cx|view.preview_clipboard_menu(window,cx));}).detach();
+                    }
+                    if screen.contains("ssh-management") {
+                        tab.page=SessionPage::SshManagement;
+                        let management=cx.new(|cx|SshManagementView::preview(window,cx,&screen));
+                        tab.ssh_management=Some(management.clone());
+                        if screen.contains("add") || screen.contains("create") { let create=screen.contains("create"); window.on_next_frame(move|window,cx|{management.update(cx,|view,cx|view.preview_dialog(create,window,cx));}); }
                     }
                     if screen.contains("infra") {tab.page=SessionPage::Infrastructure;tab.infrastructure=Some(cx.new(|cx|InfrastructureView::preview(window,cx)));}
                     if screen.contains("background") {workspace.navigation.hide(tab.id);}
@@ -443,6 +452,7 @@ impl Workspace {
             connected_at: Some(Instant::now()),
             page: SessionPage::Terminal,
             infrastructure: None,
+            ssh_management: None,
             name: "Local".into(),
             terminal: cx.new(|cx| {
                 let mut terminal = TerminalView::new(window, cx);
@@ -511,6 +521,13 @@ impl Workspace {
             }));
         }
         for session in &self.sessions {
+            if let Some(management) = &session.ssh_management {
+                let visible = self.navigation.active == Some(session.id)
+                    && !self.settings_page
+                    && !self.help_page
+                    && session.page == SessionPage::SshManagement;
+                management.update(cx, |view, cx| view.set_visible(visible, cx));
+            }
             if let Some(infra) = &session.infrastructure {
                 let visible = self.navigation.active == Some(session.id)
                     && !self.settings_page
@@ -574,6 +591,22 @@ impl Workspace {
             let generation = terminal.connection_generation();
             self.sessions[index].infrastructure =
                 Some(cx.new(|cx| InfrastructureView::new(commands, generation, window, cx)));
+        }
+        if page == SessionPage::SshManagement && self.sessions[index].ssh_management.is_none() {
+            let terminal = self.sessions[index].terminal.read(cx);
+            if terminal.session_state() != opsssh_term_core::SessionState::Connected {
+                self.message = tr("sshmgmt-connect-first");
+                cx.notify();
+                return;
+            }
+            let Some(commands) = terminal.ssh_commands() else {
+                return;
+            };
+            let generation = terminal.connection_generation();
+            let authentication = terminal.authentication().cloned();
+            self.sessions[index].ssh_management = Some(cx.new(|cx| {
+                SshManagementView::new(commands, generation, authentication, window, cx)
+            }));
         }
         self.sessions[index].page = page;
         self.activate_session(id, window, cx);
@@ -995,6 +1028,22 @@ impl Workspace {
                         {
                             tab.infrastructure = None;
                         }
+                        if tab
+                            .ssh_management
+                            .as_ref()
+                            .is_some_and(|view| view.read(cx).generation() != generation)
+                        {
+                            if let Some(view) = &tab.ssh_management {
+                                view.update(cx, |view, cx| view.suspend(cx));
+                            }
+                            tab.ssh_management = None;
+                        }
+                        if terminal.read(cx).session_state()
+                            != opsssh_term_core::SessionState::Connected
+                            && let Some(view) = &tab.ssh_management
+                        {
+                            view.update(cx, |view, cx| view.suspend(cx));
+                        }
                         if tab.files.is_some() && tab.file_generation != generation {
                             if let Some(files) = &tab.files {
                                 files.update(cx, |pane, cx| pane.suspend(cx));
@@ -1042,7 +1091,9 @@ impl Workspace {
                                     && this.navigation.active == Some(s.id)
                                     && ((s.page == SessionPage::Infrastructure
                                         && s.infrastructure.is_none())
-                                        || (s.page == SessionPage::Files && s.files.is_none()))
+                                        || (s.page == SessionPage::Files && s.files.is_none())
+                                        || (s.page == SessionPage::SshManagement
+                                            && s.ssh_management.is_none()))
                             })
                             .map(|s| (s.id, s.page))
                     {
@@ -1067,6 +1118,7 @@ impl Workspace {
                     connected_at: None,
                     page: SessionPage::Terminal,
                     infrastructure: None,
+                    ssh_management: None,
                     name: if profile.name.is_empty() {
                         profile.host.clone()
                     } else {
@@ -1433,6 +1485,7 @@ mod tests {
                     connected_at: None,
                     page: SessionPage::Terminal,
                     infrastructure: None,
+                    ssh_management: None,
                     name: format!("Session {}", id.0),
                     terminal,
                     color: 0xbc3150,

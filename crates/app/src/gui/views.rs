@@ -126,13 +126,22 @@ impl Workspace {
                 (
                     SessionPage::Terminal,
                     "nav-terminal",
-                    IconName::SquareTerminal,
+                    gpui_kit_assets::IconName::SquareTerminal,
                 ),
-                (SessionPage::Files, "nav-files", IconName::Folder),
+                (
+                    SessionPage::Files,
+                    "nav-files",
+                    gpui_kit_assets::IconName::Folder,
+                ),
+                (
+                    SessionPage::SshManagement,
+                    "sshmgmt-title",
+                    gpui_kit_assets::IconName::Shield,
+                ),
                 (
                     SessionPage::Infrastructure,
                     "nav-infrastructure",
-                    IconName::LayoutDashboard,
+                    gpui_kit_assets::IconName::LayoutDashboard,
                 ),
             ]
             .into_iter()
@@ -1148,6 +1157,16 @@ impl Workspace {
                     div()
                         .p_6()
                         .child(tr("infra-connect-first"))
+                        .into_any_element()
+                }),
+            SessionPage::SshManagement => tab
+                .ssh_management
+                .clone()
+                .map(|view| div().size_full().child(view).into_any_element())
+                .unwrap_or_else(|| {
+                    div()
+                        .p_6()
+                        .child(tr("sshmgmt-connect-first"))
                         .into_any_element()
                 }),
             SessionPage::Terminal => div()

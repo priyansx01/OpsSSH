@@ -5366,9 +5366,11 @@ dependencies = [
  "opsssh-sftp",
  "opsssh-ssh-config",
  "opsssh-ssh-core",
+ "opsssh-ssh-management",
  "opsssh-store",
  "opsssh-term-core",
  "opsssh-term-view",
+ "serde_json",
  "shlex 2.0.1",
  "tempfile",
  "tokio",
@@ -5452,6 +5454,17 @@ dependencies = [
  "tempfile",
  "tokio",
  "zeroize",
+]
+
+[[package]]
+name = "opsssh-ssh-management"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "opsssh-ssh-core",
+ "russh",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

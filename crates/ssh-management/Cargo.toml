@@ -1,0 +1,15 @@
+[package]
+name = "opsssh-ssh-management"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+[dependencies]
+opsssh-ssh-core = { path = "../ssh-core", version = "=0.1.0" }
+russh = { version = "=0.64.1", default-features = false, features = ["ring"] }
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+base64 = "=0.22.1"
+[lints]
+workspace = true

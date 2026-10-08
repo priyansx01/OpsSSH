@@ -135,6 +135,7 @@ pub struct AuthenticationField {
 }
 #[derive(Debug)]
 pub enum SshEvent {
+    Authenticated(AuthenticationInfo),
     Data(Vec<u8>),
     Connected,
     Closed {
@@ -174,9 +175,26 @@ impl ExecControl {
         self.0.load(std::sync::atomic::Ordering::Acquire)
     }
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticationInfo {
+    pub username: String,
+    pub method: AuthenticationMethod,
+    pub fingerprint: Option<String>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticationMethod {
+    None,
+    Password,
+    PublicKey,
+    Certificate,
+    Agent,
+    KeyboardInteractive,
+}
 /// Explicit remote shell command. Debug output never includes the command text.
 pub struct ExecRequest {
     pub command: String,
+    /// UTF-8 payload sent only on this independent channel and wiped after use.
+    pub stdin: Option<SecretString>,
     pub timeout: Duration,
     pub output_limit: usize,
     pub control: ExecControl,
@@ -185,6 +203,7 @@ impl ExecRequest {
     pub fn new(command: impl Into<String>) -> Self {
         Self {
             command: command.into(),
+            stdin: None,
             timeout: Duration::from_secs(5),
             output_limit: 2 * 1024 * 1024,
             control: ExecControl::default(),

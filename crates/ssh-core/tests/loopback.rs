@@ -15,6 +15,7 @@ struct Echo {
     sizes: Arc<Mutex<Vec<(u32, u32)>>>,
     key: PublicKey,
     forwarded: std::collections::HashSet<ChannelId>,
+    stdin_channels: std::collections::HashSet<ChannelId>,
 }
 impl server::Handler for Echo {
     type Error = russh::Error;
@@ -149,10 +150,26 @@ impl server::Handler for Echo {
                 session.close(channel)?;
                 return Ok(());
             }
+            b"stdin-exec-fixture" => {
+                self.stdin_channels.insert(channel);
+                return Ok(());
+            }
             b"slow-exec-fixture" => return Ok(()),
             _ => {}
         }
         session.data(channel, b"fixture-ready".to_vec())?;
+        Ok(())
+    }
+    async fn channel_eof(
+        &mut self,
+        channel: ChannelId,
+        session: &mut server::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        if self.stdin_channels.remove(&channel) {
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+        }
         Ok(())
     }
     async fn data(
@@ -201,6 +218,7 @@ impl Fixture {
             sizes: sizes.clone(),
             key: user_key.public_key().clone(),
             forwarded: Default::default(),
+            stdin_channels: Default::default(),
         };
         let fail_handshakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let failed = fail_handshakes.clone();
@@ -253,8 +271,9 @@ async fn next(events: &async_channel::Receiver<SshEvent>) -> SshEvent {
         .expect("SSH event timeout")
         .expect("SSH event channel closed")
 }
-async fn trust_and_connect(session: &SshSession) {
+async fn trust_and_connect(session: &SshSession) -> AuthenticationInfo {
     let events = session.events();
+    let mut authentication = None;
     loop {
         match next(&events).await {
             SshEvent::HostKeyPrompt { id, .. } => session
@@ -266,11 +285,13 @@ async fn trust_and_connect(session: &SshSession) {
                 })
                 .await
                 .unwrap(),
+            SshEvent::Authenticated(info) => authentication = Some(info),
             SshEvent::Connected => break,
             SshEvent::Error(error) => panic!("{error}"),
             _ => {}
         }
     }
+    authentication.expect("Successful target authentication metadata")
 }
 async fn start_exec(
     session: &SshSession,
@@ -610,7 +631,18 @@ async fn private_key_authentication() {
         certificate: None,
     }];
     let session = SshSession::spawn(options, TerminalSize::new(80, 24).unwrap()).unwrap();
-    trust_and_connect(&session).await;
+    let info = trust_and_connect(&session).await;
+    assert_eq!(info.method, AuthenticationMethod::PublicKey);
+    assert_eq!(
+        info.fingerprint,
+        Some(
+            fixture
+                .user_key
+                .public_key()
+                .fingerprint(russh::keys::HashAlg::Sha256)
+                .to_string()
+        )
+    );
 }
 #[tokio::test]
 async fn keyboard_interactive_otp() {
@@ -690,6 +722,7 @@ async fn two_jump_hosts_verify_every_hop() {
     options.jumps = vec![first.options(path.clone()), second.options(path.clone())];
     let session = SshSession::spawn(options, TerminalSize::new(80, 24).unwrap()).unwrap();
     let mut verified = 0;
+    let mut authenticated = 0;
     loop {
         match next(&session.events()).await {
             SshEvent::HostKeyPrompt { id, .. } => session
@@ -702,12 +735,17 @@ async fn two_jump_hosts_verify_every_hop() {
                 .await
                 .unwrap(),
             SshEvent::VerifiedHost { .. } => verified += 1,
+            SshEvent::Authenticated(info) => {
+                authenticated += 1;
+                assert_eq!(info.method, AuthenticationMethod::Password);
+            }
             SshEvent::Connected => break,
             SshEvent::Error(error) => panic!("{error}"),
             _ => {}
         }
     }
     assert_eq!(verified, 3);
+    assert_eq!(authenticated, 1);
     session
         .commands()
         .send(SshCommand::Write(b"jump-marker".to_vec()))
@@ -832,6 +870,76 @@ async fn strict_host_policy_never_prompts_for_unknown_key() {
                 assert!(error.contains("strict verification"));
                 break;
             }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn exec_stdin_eof_and_authentication_are_isolated_from_terminal() {
+    let fixture = Fixture::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let session = SshSession::spawn(
+        fixture.options(dir.path().join("known_hosts")),
+        TerminalSize::new(80, 24).unwrap(),
+    )
+    .unwrap();
+    let mut authentication = None;
+    loop {
+        match next(&session.events()).await {
+            SshEvent::HostKeyPrompt { id, .. } => session
+                .commands()
+                .send(SshCommand::TrustHost {
+                    id,
+                    trust: true,
+                    persist: false,
+                })
+                .await
+                .unwrap(),
+            SshEvent::Authenticated(info) => authentication = Some(info),
+            SshEvent::Connected => break,
+            SshEvent::Error(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        authentication,
+        Some(AuthenticationInfo {
+            username: "fixture".into(),
+            method: AuthenticationMethod::Password,
+            fingerprint: None
+        })
+    );
+    let input = "private-input-marker".repeat(4096);
+    let mut request = ExecRequest::new("stdin-exec-fixture");
+    request.stdin = Some(SecretString::new(input.clone()));
+    let result = exec_reply(start_exec(&session, request).await)
+        .await
+        .unwrap();
+    assert_eq!(result.stdout, input.as_bytes());
+    assert_eq!(result.exit_status, Some(0));
+    let mut oversized = ExecRequest::new("stdin-exec-fixture");
+    oversized.stdin = Some(SecretString::new("x".repeat(2 * 1024 * 1024 + 1)));
+    assert!(
+        exec_reply(start_exec(&session, oversized).await)
+            .await
+            .unwrap_err()
+            .contains("stdin exceeds")
+    );
+    session
+        .commands()
+        .send(SshCommand::Write(b"terminal-after-stdin".to_vec()))
+        .await
+        .unwrap();
+    loop {
+        match next(&session.events()).await {
+            SshEvent::Data(data) if data == b"terminal-after-stdin" => break,
+            SshEvent::Data(data) => assert!(
+                !data
+                    .windows(20)
+                    .any(|value| value == b"private-input-marker")
+            ),
+            SshEvent::Error(error) => panic!("{error}"),
             _ => {}
         }
     }

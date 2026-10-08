@@ -14,6 +14,8 @@ mod gui;
 mod infrastructure;
 #[cfg(feature = "gui")]
 mod localization;
+#[cfg(feature = "gui")]
+mod ssh_management;
 
 use std::hint::black_box;
 use std::process::ExitCode;
