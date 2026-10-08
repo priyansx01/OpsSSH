@@ -1,19 +1,30 @@
 //! Workspace presentation. SSH/session ownership stays in the parent controller.
 use super::*;
 use crate::design;
-use gpui::{
-    Animation, AnimationExt, AnyElement, SpringAnimation, SpringConfig, relative, uniform_list,
-};
+use gpui::{Animation, AnimationExt, AnyElement, SpringAnimation, SpringConfig, uniform_list};
 use gpui_component::{
-    ActiveTheme, Icon, IconName, Selectable, h_resizable,
+    ActiveTheme, Disableable, Icon, IconName, Selectable, TitleBar,
     menu::{DropdownMenu, PopupMenuItem},
-    resizable_panel,
     switch::Switch,
 };
 use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+fn sidebar_label(key: &'static str, reduced: bool) -> AnyElement {
+    let label = div().flex_1().min_w_0().truncate().child(tr(key));
+    if reduced {
+        return label.into_any_element();
+    }
+    label
+        .with_animation(
+            gpui::SharedString::from(format!("sidebar-label-{key}")),
+            Animation::new(std::time::Duration::from_millis(300)),
+            |d, t| d.opacity(((t - 0.15) / 0.85).clamp(0., 1.)),
+        )
+        .into_any_element()
+}
 
 impl Workspace {
     fn change_settings(
@@ -92,7 +103,7 @@ impl Workspace {
         {
             let tab = &self.sessions[index];
             let mut side = div()
-                .w(px(if collapsed { 64. } else { 220. }))
+                .w(px(if collapsed { 68. } else { 228. }))
                 .h_full()
                 .flex_shrink_0()
                 .p_3()
@@ -108,8 +119,15 @@ impl Workspace {
                         .icon(IconName::ArrowLeft)
                         .tooltip(tr("back-servers"))
                         .accessibility_label(tr("back-servers"))
-                        .when(!collapsed, |b| b.label(tr("back-servers")))
+                        .when(!collapsed, |b| {
+                            b.child(sidebar_label(
+                                "back-servers",
+                                self.store.settings.reduced_motion,
+                            ))
+                        })
                         .w_full()
+                        .justify_start()
+                        .when(collapsed, |b| b.justify_center())
                         .on_click(cx.listener(|this, _, w, cx| this.home(&GoHome, w, cx))),
                 )
                 .when(!collapsed, |d| {
@@ -157,8 +175,12 @@ impl Workspace {
                         .icon(icon)
                         .tooltip(tr(key))
                         .accessibility_label(tr(key))
-                        .when(!collapsed, |b| b.label(tr(key)))
+                        .when(!collapsed, |b| {
+                            b.child(sidebar_label(key, self.store.settings.reduced_motion))
+                        })
                         .w_full()
+                        .justify_start()
+                        .when(collapsed, |b| b.justify_center())
                         .on_click(
                             cx.listener(move |this, _, w, cx| this.select_page(id, page, w, cx)),
                         ),
@@ -198,7 +220,7 @@ impl Workspace {
                 );
         }
         let mut sidebar = div()
-            .w(px(if collapsed { 64. } else { 220. }))
+            .w(px(if collapsed { 68. } else { 228. }))
             .flex_shrink_0()
             .h_full()
             .p_3()
@@ -263,11 +285,16 @@ impl Workspace {
                     .icon(icon)
                     .tooltip(tr(key))
                     .accessibility_label(tr(key))
-                    .when(!collapsed, |b| b.label(tr(key)))
+                    .when(!collapsed, |b| {
+                        b.child(sidebar_label(key, self.store.settings.reduced_motion))
+                    })
                     .w_full()
+                    .justify_start()
+                    .when(collapsed, |b| b.justify_center())
                     .on_click(cx.listener(move |this, _, w, cx| {
                         this.home(&GoHome, w, cx);
                         this.filter = filter.into();
+                        this.environment_filter.clear();
                         cx.notify();
                     })),
             );
@@ -277,6 +304,7 @@ impl Workspace {
                 .store
                 .servers
                 .iter()
+                .chain(self.config.iter().map(|(profile, _)| profile))
                 .map(|p| p.environment.clone())
                 .filter(|s| !s.is_empty())
                 .collect::<std::collections::BTreeSet<_>>();
@@ -298,11 +326,15 @@ impl Workspace {
                                 && !self.help_page
                                 && self.navigation.active.is_none(),
                         )
-                        .label(environment.clone())
+                        .accessibility_label(environment.clone())
+                        .child(div().flex_1().min_w_0().child(environment.clone()))
                         .w_full()
+                        .justify_start()
+                        .when(collapsed, |b| b.justify_center())
                         .on_click(cx.listener(move |this, _, w, cx| {
                             this.home(&GoHome, w, cx);
                             this.filter = environment.clone();
+                            this.environment_filter.clear();
                             cx.notify();
                         })),
                 );
@@ -317,8 +349,15 @@ impl Workspace {
                     .icon(IconName::Settings)
                     .tooltip(tr("settings"))
                     .accessibility_label(tr("settings"))
-                    .when(!collapsed, |b| b.label(tr("settings")))
+                    .when(!collapsed, |b| {
+                        b.child(sidebar_label(
+                            "settings",
+                            self.store.settings.reduced_motion,
+                        ))
+                    })
                     .w_full()
+                    .justify_start()
+                    .when(collapsed, |b| b.justify_center())
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.settings_page = true;
                         this.help_page = false;
@@ -334,8 +373,12 @@ impl Workspace {
                     .icon(IconName::Info)
                     .tooltip(tr("help"))
                     .accessibility_label(tr("help"))
-                    .when(!collapsed, |b| b.label(tr("help")))
+                    .when(!collapsed, |b| {
+                        b.child(sidebar_label("help", self.store.settings.reduced_motion))
+                    })
                     .w_full()
+                    .justify_start()
+                    .when(collapsed, |b| b.justify_center())
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.help_page = true;
                         this.settings_page = false;
@@ -354,8 +397,15 @@ impl Workspace {
                     })
                     .tooltip(tr("sidebar-toggle"))
                     .accessibility_label(tr("sidebar-toggle"))
-                    .when(!collapsed, |b| b.label(tr("sidebar-collapse")))
+                    .when(!collapsed, |b| {
+                        b.child(sidebar_label(
+                            "sidebar-collapse",
+                            self.store.settings.reduced_motion,
+                        ))
+                    })
                     .w_full()
+                    .justify_start()
+                    .when(collapsed, |b| b.justify_center())
                     .on_click(cx.listener(|this, _, w, cx| {
                         this.change_settings(|s| s.sidebar_collapsed = !s.sidebar_collapsed, w, cx)
                     })),
@@ -369,6 +419,25 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = design::palette(cx);
+        let active = self.profile_sessions(&profile, cx);
+        let status = active
+            .iter()
+            .filter_map(|id| self.session_index(*id))
+            .map(|i| self.sessions[i].terminal.read(cx).session_state())
+            .find(|state| *state == opsssh_term_core::SessionState::Connected)
+            .or_else(|| {
+                active
+                    .first()
+                    .and_then(|id| self.session_index(*id))
+                    .map(|i| self.sessions[i].terminal.read(cx).session_state())
+            });
+        let status_text = active
+            .iter()
+            .filter_map(|id| self.session_index(*id))
+            .find(|i| Some(self.sessions[*i].terminal.read(cx).session_state()) == status)
+            .map(|i| self.sessions[i].terminal.read(cx).connection_status())
+            .unwrap_or_else(|| tr("connection-disconnected"));
+        let connected = !active.is_empty();
         let config = profile.id == 0;
         let connect = profile.clone();
         let favorite = profile.clone();
@@ -394,9 +463,16 @@ impl Workspace {
                         let _ = weak.update(cx, |this, cx| this.edit(profile.clone(), w, cx));
                     }),
                 );
-                if config {
-                    return menu;
-                }
+                let copied = edit.clone();
+                let menu = menu.item(PopupMenuItem::new(tr("copy-ssh-command")).on_click(
+                    move |_, window, cx| match crate::connections::ssh_command(&copied) {
+                        Ok(command) => {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(command));
+                            window.push_notification(tr("ssh-command-copied"), cx);
+                        }
+                        Err(error) => window.push_notification(error, cx),
+                    },
+                ));
                 let weak = workspace.clone();
                 let profile = duplicate.clone();
                 let menu = menu.item(PopupMenuItem::new(tr("duplicate-server")).on_click(
@@ -409,6 +485,9 @@ impl Workspace {
                         });
                     },
                 ));
+                if config {
+                    return menu;
+                }
                 let weak = workspace.clone();
                 let profile = delete.clone();
                 menu.separator()
@@ -425,14 +504,35 @@ impl Workspace {
             opsssh_store::Auth::Key => "auth-key",
         });
         let timestamp = self.store.settings.last_connected.get(&profile.id).copied();
-        let last = last_connected(timestamp);
+        let last = if config {
+            tr("config-alias")
+        } else {
+            last_connected(timestamp)
+        };
+        let key_path = if profile.identity_file.is_empty() {
+            auth.clone()
+        } else {
+            profile.identity_file.clone()
+        };
+        let key_tooltip = key_path.clone();
+        let address_tooltip = format!("{}@{}:{}", profile.user, profile.host, profile.port);
+        let name_tooltip = profile.name.clone();
         let metadata = div()
             .truncate()
             .flex()
             .gap_2()
             .text_xs()
             .text_color(rgb(p.muted))
-            .child(auth)
+            .child(
+                div()
+                    .truncate()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .id(("key-path", index))
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(key_tooltip.clone()).build(window, cx)
+                    })
+                    .child(key_path),
+            )
             .when(!profile.proxy_jump.is_empty(), |d| {
                 d.child(format!("{} {}", tr("via-label"), profile.proxy_jump))
             })
@@ -444,18 +544,23 @@ impl Workspace {
             .min_w_0()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_1()
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap_1()
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .id(("profile-name", index))
+                            .tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(name_tooltip.clone())
+                                    .build(window, cx)
+                            })
                             .child(profile.name.clone()),
                     )
                     .when(!profile.environment.is_empty(), |d| {
@@ -479,21 +584,57 @@ impl Workspace {
                     .text_color(rgb(p.muted))
                     .truncate()
                     .font_family(cx.theme().mono_font_family.clone())
+                    .id(("profile-address", index))
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(address_tooltip.clone())
+                            .build(window, cx)
+                    })
                     .child(format!(
                         "{}@{}:{}",
                         profile.user, profile.host, profile.port
                     )),
             )
-            .child(metadata);
+            .child(metadata)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_xs()
+                    .text_color(
+                        if status == Some(opsssh_term_core::SessionState::Connected) {
+                            cx.theme().success
+                        } else {
+                            rgb(p.muted).into()
+                        },
+                    )
+                    .child(
+                        if status == Some(opsssh_term_core::SessionState::Connected) {
+                            "\u{25cf}"
+                        } else {
+                            "\u{25cb}"
+                        },
+                    )
+                    .child(status_text),
+            );
         let mut card = div()
             .id(("server-card", index))
-            .h(px(if list { 120. } else { 208. }))
+            .h(px(if list { 124. } else { 228. }))
             .overflow_hidden()
             .p_4()
-            .rounded(px(12.))
+            .rounded(px(7.))
             .bg(rgb(p.surface))
             .border_1()
             .border_color(rgb(p.border))
+            .hover(|d| {
+                d.border_color(rgb(p.muted)).shadow(vec![gpui::BoxShadow {
+                    color: gpui::rgba(0x00000014).into(),
+                    offset: gpui::point(px(0.), px(2.)),
+                    blur_radius: px(5.),
+                    spread_radius: px(0.),
+                    inset: false,
+                }])
+            })
             .flex()
             .gap_3()
             .when(!list, |d| d.flex_col())
@@ -506,12 +647,20 @@ impl Workspace {
                 .gap_2()
                 .when(!list, |d| d.pt_3().border_t_1().border_color(rgb(p.border)))
                 .child(
-                    Button::new(("connect", index))
-                        .primary()
-                        .label(tr("connect-server"))
-                        .on_click(
-                            cx.listener(move |this, _, w, cx| this.connect(connect.clone(), w, cx)),
-                        ),
+                    crate::design::PrimaryAction::new(("connect", index))
+                        .w(px(112.))
+                        .label(tr(if connected {
+                            "disconnect"
+                        } else {
+                            "connect-server"
+                        }))
+                        .on_click(cx.listener(move |this, _, w, cx| {
+                            if connected {
+                                this.disconnect_profile(&connect, w, cx);
+                            } else {
+                                this.connect(connect.clone(), w, cx);
+                            }
+                        })),
                 )
                 .child(div().flex_1())
                 .when(!config, |d| {
@@ -555,18 +704,14 @@ impl Workspace {
         }))
         .with_spring(
             ("server-motion", index),
-            SpringAnimation::new(SpringConfig::new(650., 32., 1.))
+            SpringAnimation::new(SpringConfig::new(180., 27., 1.))
                 .to(if self.hovered_card == Some(index) {
-                    -3.
+                    -2.
                 } else {
                     0.
                 })
-                .from(18.),
-            |d, offset| {
-                d.opacity(((18. - offset) / 18.).clamp(0., 1.))
-                    .relative()
-                    .top(px(offset))
-            },
+                .from(0.),
+            |d, offset| d.relative().top(px(offset)),
         )
         .into_any_element()
     }
@@ -577,15 +722,15 @@ impl Workspace {
         let list = self.store.settings.server_view != "cards";
         let sidebar_width =
             if self.store.settings.sidebar_collapsed || window.viewport_size().width < px(1100.) {
-                64.
+                68.
             } else {
-                220.
+                228.
             };
         let available = f32::from(window.viewport_size().width) - sidebar_width - 64.;
         let columns = if list {
             1
         } else {
-            ((available + 16.) / 316.).floor().clamp(1., 4.) as usize
+            ((available + 16.) / 316.).floor().clamp(1., 3.) as usize
         };
         let width = (available - 16. * (columns - 1) as f32) / columns as f32;
         let rows = profiles.len().div_ceil(columns);
@@ -599,19 +744,24 @@ impl Workspace {
             .store
             .servers
             .iter()
+            .chain(self.config.iter().map(|(p, _)| p))
             .map(|p| p.environment.clone())
             .filter(|e| !e.is_empty())
             .collect::<std::collections::BTreeSet<_>>();
         let workspace = cx.entity().downgrade();
         let environment_menu = Button::new("environment-filter")
-            .label(tr("filter-environments"))
+            .label(if self.environment_filter.is_empty() {
+                tr("all-environments")
+            } else {
+                self.environment_filter.clone()
+            })
             .dropdown_menu(move |menu, _, _| {
                 let weak = workspace.clone();
                 let mut menu = menu.item(PopupMenuItem::new(tr("all-environments")).on_click(
                     move |_, window, cx| {
                         let _ = weak.update(cx, |this, cx| {
                             this.home(&GoHome, window, cx);
-                            this.filter = "All servers".into();
+                            this.environment_filter.clear();
                             cx.notify();
                         });
                     },
@@ -623,7 +773,7 @@ impl Workspace {
                         move |_, window, cx| {
                             let _ = weak.update(cx, |this, cx| {
                                 this.home(&GoHome, window, cx);
-                                this.filter = value.clone();
+                                this.environment_filter = value.clone();
                                 cx.notify();
                             });
                         },
@@ -650,19 +800,38 @@ impl Workspace {
                             .gap_1()
                             .child(
                                 div()
+                                    .text_xs()
+                                    .text_color(rgb(p.muted))
+                                    .child(tr("workspace-breadcrumb")),
+                            )
+                            .child(
+                                div()
                                     .text_2xl()
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .child(title),
                             )
                             .child(div().text_sm().text_color(rgb(p.muted)).child(format!(
-                                "{} {}",
-                                profiles.len(),
-                                tr("servers-count")
-                            ))),
+                                    "{} {} \u{b7} {} {}",
+                                    profiles.len(),
+                                    tr("servers-count"),
+                                    profiles
+                                        .iter()
+                                        .filter(|profile| self
+                                            .profile_sessions(profile, cx)
+                                            .iter()
+                                            .any(|id| self.session_index(*id).is_some_and(
+                                                |i| self.sessions[i]
+                                                    .terminal
+                                                    .read(cx)
+                                                    .session_state()
+                                                    == opsssh_term_core::SessionState::Connected
+                                            )))
+                                        .count(),
+                                    tr("active-connections")
+                                ))),
                     )
                     .child(
-                        Button::new("new-server")
-                            .primary()
+                        crate::design::PrimaryAction::new("new-server")
                             .icon(IconName::Plus)
                             .label(tr("new-server"))
                             .on_click(
@@ -675,34 +844,55 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .flex_wrap()
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Input::new(&self.search).aria_label(tr("search-servers"))),
+                        div().flex_1().min_w(px(220.)).child(
+                            Input::new(&self.search)
+                                .cleanable(true)
+                                .aria_label(tr("search-servers")),
+                        ),
                     )
                     .child(environment_menu)
                     .child(
-                        Button::new("view-cards")
-                            .ghost()
-                            .selected(!list)
-                            .icon(IconName::LayoutDashboard)
-                            .tooltip(tr("view-cards"))
-                            .accessibility_label(tr("view-cards"))
-                            .on_click(cx.listener(|this, _, w, cx| {
-                                this.change_settings(|s| s.server_view = "cards".into(), w, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("view-list")
-                            .ghost()
-                            .selected(list)
-                            .icon(gpui_kit_assets::IconName::List)
-                            .tooltip(tr("view-list"))
-                            .accessibility_label(tr("view-list"))
-                            .on_click(cx.listener(|this, _, w, cx| {
-                                this.change_settings(|s| s.server_view = "list".into(), w, cx)
-                            })),
+                        div()
+                            .flex()
+                            .gap_1()
+                            .p_1()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(rgb(p.border))
+                            .child(
+                                Button::new("view-cards")
+                                    .ghost()
+                                    .selected(!list)
+                                    .toggled(!list)
+                                    .icon(IconName::LayoutDashboard)
+                                    .tooltip(tr("view-cards"))
+                                    .accessibility_label(tr("view-cards"))
+                                    .on_click(cx.listener(|this, _, w, cx| {
+                                        this.change_settings(
+                                            |s| s.server_view = "cards".into(),
+                                            w,
+                                            cx,
+                                        )
+                                    })),
+                            )
+                            .child(
+                                Button::new("view-list")
+                                    .ghost()
+                                    .selected(list)
+                                    .toggled(list)
+                                    .icon(gpui_kit_assets::IconName::List)
+                                    .tooltip(tr("view-list"))
+                                    .accessibility_label(tr("view-list"))
+                                    .on_click(cx.listener(|this, _, w, cx| {
+                                        this.change_settings(
+                                            |s| s.server_view = "list".into(),
+                                            w,
+                                            cx,
+                                        )
+                                    })),
+                            ),
                     )
                     .child(
                         Button::new("sort")
@@ -753,8 +943,7 @@ impl Workspace {
                         })))
                         .when(first, |d| {
                             d.child(
-                                Button::new("empty-new")
-                                    .primary()
+                                crate::design::PrimaryAction::new("empty-new")
                                     .label(tr("new-server"))
                                     .on_click(cx.listener(|this, _, w, cx| {
                                         this.new_server(&NewServer, w, cx)
@@ -789,7 +978,7 @@ impl Workspace {
                         range
                             .map(|row| {
                                 div()
-                                    .h(px(if list { 136. } else { 224. }))
+                                    .h(px(if list { 144. } else { 244. }))
                                     .pb_4()
                                     .flex()
                                     .gap_4()
@@ -836,10 +1025,8 @@ impl Workspace {
             .child(
                 div()
                     .max_w(px(680.))
-                    .p_5()
-                    .rounded_lg()
-                    .bg(rgb(p.surface))
-                    .border_1()
+                    .py_4()
+                    .border_b_1()
                     .border_color(rgb(p.border))
                     .flex()
                     .flex_col()
@@ -881,10 +1068,8 @@ impl Workspace {
             .child(
                 div()
                     .max_w(px(680.))
-                    .p_5()
-                    .rounded_lg()
-                    .bg(rgb(p.surface))
-                    .border_1()
+                    .py_4()
+                    .border_b_1()
                     .border_color(rgb(p.border))
                     .flex()
                     .flex_col()
@@ -934,9 +1119,9 @@ impl Workspace {
             .child(
                 div()
                     .max_w(px(680.))
-                    .p_5()
-                    .rounded_lg()
-                    .bg(rgb(p.surface))
+                    .py_4()
+                    .border_b_1()
+                    .border_color(rgb(p.border))
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -974,10 +1159,8 @@ impl Workspace {
         };
         div()
             .max_w(px(680.))
-            .p_5()
-            .rounded_lg()
-            .bg(rgb(p.surface))
-            .border_1()
+            .py_4()
+            .border_b_1()
             .border_color(rgb(p.border))
             .flex()
             .flex_col()
@@ -1008,7 +1191,7 @@ impl Workspace {
                 }),
             )
     }
-    fn session(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn session(&self, index: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = design::palette(cx);
         let tab = &self.sessions[index];
         let id = tab.id;
@@ -1035,9 +1218,9 @@ impl Workspace {
             .child(
                 div()
                     .size(px(40.))
-                    .rounded_lg()
-                    .bg(rgb(p.ruby_tint))
-                    .text_color(rgb(p.ruby))
+                    .rounded(px(7.))
+                    .bg(design::action_gradient(false))
+                    .text_color(rgb(0xffffff))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1061,6 +1244,8 @@ impl Workspace {
                         div()
                             .text_xs()
                             .text_color(rgb(p.muted))
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .truncate()
                             .child(endpoint.unwrap_or_else(|| tr("local-session"))),
                     ),
             )
@@ -1071,8 +1256,9 @@ impl Workspace {
                         .icon(IconName::Copy)
                         .tooltip(tr("copy-endpoint"))
                         .accessibility_label(tr("copy-endpoint"))
-                        .on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone()))
+                        .on_click(move |_, window, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone()));
+                            window.push_notification(tr("address-copied"), cx);
                         }),
                 )
             })
@@ -1111,7 +1297,7 @@ impl Workspace {
                 div()
                     .px_3()
                     .py_2()
-                    .rounded_full()
+                    .rounded(px(6.))
                     .bg(rgb(p.surface))
                     .border_1()
                     .border_color(rgb(p.border))
@@ -1121,7 +1307,36 @@ impl Workspace {
                     } else {
                         cx.theme().warning
                     })
-                    .child(status),
+                    .child(format!(
+                        "{} {}",
+                        if live { "\u{25cf}" } else { "\u{25cb}" },
+                        status
+                    )),
+            )
+            .when(
+                matches!(
+                    state,
+                    opsssh_term_core::SessionState::Disconnected
+                        | opsssh_term_core::SessionState::Closed
+                ) && tab.endpoint.is_some(),
+                |d| {
+                    d.child(
+                        crate::design::PrimaryAction::new("reconnect-server")
+                            .label(tr("reconnect-server"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if let Some(i) = this.session_index(id) {
+                                    this.sessions[i]
+                                        .terminal
+                                        .update(cx, |t, cx| t.reconnect(window, cx));
+                                    this.sessions[i].files_needs_rebind = true;
+                                    this.terminal_focus_released = false;
+                                    this.sync_visibility(cx);
+                                    this.update_keyboard_capture(window, cx);
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                },
             )
             .when(state == opsssh_term_core::SessionState::Reconnecting, |d| {
                 d.child(
@@ -1209,7 +1424,8 @@ impl Workspace {
                                             .tooltip(tr("keyboard-capture-help"))
                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                 if let Some(index) = this.session_index(id) {
-                                                    this.sessions[index].keyboard_capture =
+                                                    this.terminal_focus_released = false;
+                                    this.sessions[index].keyboard_capture =
                                                         !this.sessions[index].keyboard_capture;
                                                     this.sessions[index]
                                                         .terminal
@@ -1244,12 +1460,14 @@ impl Workspace {
                                     .selected(visible)
                                     .icon(IconName::Folder)
                                     .label(tr("files"))
+                                    .tooltip(tr("files"))
+                                    .accessibility_label(tr("files"))
                                     .on_click(cx.listener(move |this, _, w, cx| {
                                         let Some(i) = this.session_index(id) else {
                                             return;
                                         };
                                         if this.sessions[i].files_visible {
-                                            this.sessions[i].files_visible = false;
+                                            this.close_files(id,w,cx);
                                         } else {
                                             let t = this.sessions[i].terminal.clone();
                                             this.ensure_files(&t, w, cx);
@@ -1298,28 +1516,24 @@ impl Workspace {
                     div()
                         .flex_1()
                         .min_h_0()
-                        .rounded_lg()
+                        .rounded(px(7.))
                         .overflow_hidden()
                         .border_1()
                         .border_color(rgb(p.border))
-                        .when(visible && files.is_some(), |d| {
-                            d.child(
-                                h_resizable(("session-split", id.0 as usize))
-                                    .child(
-                                        resizable_panel()
-                                            .size_range(px(200.)..px(10000.))
-                                            .child(div().size_full().child(terminal.clone())),
-                                    )
-                                    .child(
-                                        resizable_panel()
-                                            .size(px(360.))
-                                            .size_range(px(300.)..px(600.))
-                                            .child(files.clone().unwrap()),
-                                    ),
-                            )
-                        })
-                        .when(!visible || files.is_none(), |d| {
-                            d.child(div().size_full().child(terminal))
+                        .flex()
+                        .child(div().flex_1().min_w(px(480.)).min_h_0().child(terminal))
+                        .when_some(files.clone(),|d,files| {
+                            let available=f32::from(window.viewport_size().width)-if self.store.settings.sidebar_collapsed || window.viewport_size().width<px(1100.){68.}else{228.}-32.;
+                            let dragging=self.panel_drag.is_some();
+                            let desired=if tab.files_width>0. {tab.files_width}else{available/3.};
+                            let width=desired.clamp(280.,(available-480.).max(280.));
+                            d.child(div().id(("files-panel",id.0 as usize)).flex_shrink_0().min_h_0().overflow_hidden().flex()
+                                .with_spring(("files-panel-width",id.0 as usize),SpringAnimation::new(SpringConfig::new(250.,32.,1.)).to(if visible{width}else{0.}).from(if visible && tab.files_width>0. {width} else {0.}),move|d,value|d.w(px(if dragging && visible {width} else {value.max(0.)})))
+                                .child(Button::new(("files-divider",id.0 as usize)).ghost().w(px(6.)).h_full().px_0().disabled(!visible).cursor(gpui::CursorStyle::ResizeLeftRight).tooltip(tr("resize-remote-files")).accessibility_label(tr("resize-remote-files"))
+                                    .on_mouse_down(gpui::MouseButton::Left,cx.listener(move|this,event:&gpui::MouseDownEvent,_,cx|{this.panel_drag=Some((id,f32::from(event.position.x),width));cx.stop_propagation();}))
+                                    .on_key_down(cx.listener(move|this,event:&gpui::KeyDownEvent,window,cx|{let delta=match event.keystroke.key.as_str(){"left"=>16.,"right"=>-16.,_=>return};if let Some(i)=this.session_index(id){this.sessions[i].files_width=(width+delta).clamp(280.,(available-480.).max(280.));this.remember_files(id,cx);cx.notify();}window.prevent_default();cx.stop_propagation();}))
+                                    .child(div().w(px(1.)).h_full().bg(rgb(p.border))))
+                                .child(div().flex_1().min_w_0().h_full().when(visible,|d|d.child(files))))
                         }),
                 )
                 .into_any_element(),
@@ -1342,7 +1556,7 @@ impl Workspace {
             .collect::<Vec<_>>();
         div().when(!hidden.is_empty(), |d| {
             d.p_3()
-                .rounded_lg()
+                .rounded(px(7.))
                 .border_1()
                 .border_color(rgb(p.border))
                 .bg(rgb(p.surface))
@@ -1388,7 +1602,10 @@ impl Workspace {
         let narrow = window.viewport_size().width < px(1100.);
         let home = self.navigation.active.is_none() && !self.settings_page && !self.help_page;
         let terminal_open = self.terminal_visible();
-        if terminal_open && (window.focused(cx).is_none() || self.home_focus.is_focused(window)) {
+        if terminal_open
+            && !self.terminal_focus_released
+            && (window.focused(cx).is_none() || self.home_focus.is_focused(window))
+        {
             self.restore_terminal_focus(window, cx);
         }
         self.flush_uploaded_paths(window, cx);
@@ -1419,11 +1636,13 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .rounded_lg()
+                    .h_full()
+                    .min_w(px(180.))
+                    .max_w(px(260.))
                     .px_1()
-                    .bg(rgb(if selected { p.raised } else { p.sidebar }))
-                    .border_1()
-                    .border_color(rgb(if selected { p.border } else { p.sidebar }))
+                    .bg(rgb(if selected { p.surface } else { p.sidebar }))
+                    .border_r_1()
+                    .border_color(rgb(p.border))
                     .relative()
                     .when(selected, |d| {
                         d.child(
@@ -1433,20 +1652,37 @@ impl Workspace {
                                 .left_0()
                                 .h(px(2.))
                                 .bg(rgb(p.ruby))
-                                .with_spring(
-                                    ("tab-indicator", id.0 as usize),
-                                    SpringAnimation::new(SpringConfig::new(700., 36., 1.))
-                                        .to(1.)
-                                        .from(0.),
-                                    |d, t| d.w(relative(t.clamp(0., 1.))),
-                                ),
+                                .w_full(),
                         )
                     })
                     .child(
                         Button::new(("tab", id.0 as usize))
                             .ghost()
-                            .selected(selected)
-                            .label(tab.name.clone())
+                            .h_full()
+                            .rounded_none()
+                            .icon(IconName::SquareTerminal)
+                            .accessibility_label(tab.name.clone())
+                            .child(
+                                div()
+                                    .flex()
+                                    .min_w_0()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_color(
+                                                if tab.terminal.read(cx).session_state()
+                                                    == opsssh_term_core::SessionState::Connected
+                                                {
+                                                    cx.theme().success
+                                                } else {
+                                                    rgb(p.muted).into()
+                                                },
+                                            )
+                                            .child("\u{25cf}"),
+                                    )
+                                    .child(div().min_w_0().truncate().child(tab.name.clone())),
+                            )
                             .tooltip(format!(
                                 "{} · {}",
                                 tab.name,
@@ -1491,12 +1727,13 @@ impl Workspace {
                 .child(self.shortcuts(cx))
                 .into_any_element()
         } else if let Some(index) = self.navigation.active.and_then(|id| self.session_index(id)) {
-            self.session(index, cx)
+            self.session(index, window, cx)
         } else {
             self.servers(window, cx)
         };
         div()
             .id("opsssh-workspace")
+            .font_family(cx.theme().font_family.clone())
             .key_context(if terminal_open {
                 "OpsSSH OpsSSHTerminalOpen"
             } else if home {
@@ -1515,20 +1752,71 @@ impl Workspace {
             .on_action(cx.listener(Self::new_server))
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::quit))
+            .on_mouse_move(
+                cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
+                    if let Some((id, start, start_width)) = this.panel_drag
+                        && let Some(i) = this.session_index(id)
+                    {
+                        let available = f32::from(window.viewport_size().width)
+                            - if this.store.settings.sidebar_collapsed
+                                || window.viewport_size().width < px(1100.)
+                            {
+                                68.
+                            } else {
+                                228.
+                            }
+                            - 32.;
+                        this.sessions[i].files_width = (start_width + start
+                            - f32::from(event.position.x))
+                        .clamp(280., (available - 480.).max(280.));
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.finish_panel_drag(cx)),
+            )
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.finish_panel_drag(cx)),
+            )
+            .child(
+                TitleBar::new()
+                    .h(px(32.))
+                    .bg(rgb(p.sidebar))
+                    .on_close_window(
+                        cx.listener(|this, _, window, cx| this.quit(&Quit, window, cx)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_xs()
+                            .child(div().text_color(rgb(p.ruby)).child(">_"))
+                            .child("OpsSSH"),
+                    ),
+            )
             .child(
                 div()
                     .id("workspace-tabs")
-                    .h(px(52.))
-                    .px_3()
+                    .h(px(54.))
+                    .px_2()
                     .flex_shrink_0()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap_0()
                     .bg(rgb(p.sidebar))
                     .border_b_1()
                     .border_color(rgb(p.border))
                     .child(
                         Button::new("home-tab")
+                            .h_full()
+                            .w(px(140.))
+                            .rounded_none()
+                            .border_r_1()
+                            .border_color(rgb(p.border))
                             .ghost()
                             .selected(home)
                             .icon(gpui_kit_assets::IconName::House)
@@ -1538,11 +1826,12 @@ impl Workspace {
                     .child(
                         div()
                             .id("open-tabs")
+                            .h_full()
                             .flex_1()
                             .min_w_0()
                             .overflow_x_scroll()
                             .flex()
-                            .gap_1()
+                            .gap_0()
                             .children(tabs),
                     )
                     .child(
@@ -1562,21 +1851,20 @@ impl Workspace {
                     .min_h_0()
                     .flex()
                     .child(
-                        self.sidebar(narrow, cx).with_animation(
-                            ("sidebar-enter", self.transition as usize),
-                            Animation::new(std::time::Duration::from_millis(
-                                if self.store.settings.reduced_motion {
-                                    0
+                        self.sidebar(narrow, cx).overflow_hidden().with_spring(
+                            "sidebar-width",
+                            SpringAnimation::new(SpringConfig::new(180., 27., 1.))
+                                .to(if self.store.settings.sidebar_collapsed || narrow {
+                                    68.
                                 } else {
-                                    260
-                                },
-                            ))
-                            .with_easing(design::spring_out),
-                            |d, t| {
-                                d.opacity((0.6 + 0.4 * t).clamp(0., 1.))
-                                    .relative()
-                                    .left(px(-14. * (1. - t)))
-                            },
+                                    228.
+                                })
+                                .from(if self.store.settings.sidebar_collapsed || narrow {
+                                    68.
+                                } else {
+                                    228.
+                                }),
+                            |d, width| d.w(px(width)),
                         ),
                     )
                     .child(
@@ -1618,15 +1906,11 @@ impl Workspace {
                                         if self.store.settings.reduced_motion || terminal_open {
                                             0
                                         } else {
-                                            260
+                                            140
                                         },
                                     ))
                                     .with_easing(design::spring_out),
-                                    |d, t| {
-                                        d.opacity((0.65 + 0.35 * t).clamp(0., 1.))
-                                            .relative()
-                                            .top(px(16. * (1. - t)))
-                                    },
+                                    |d, t| d.opacity((0.7 + 0.3 * t).clamp(0., 1.)),
                                 ),
                             ),
                     ),

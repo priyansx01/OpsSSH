@@ -16,6 +16,7 @@ use opsssh_ssh_core::SshCommand;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 pub enum FilePaneEvent {
+    ClosePanel,
     InsertText(u64, String),
     FocusTerminal,
     DestinationValidated(u64, String),
@@ -1129,9 +1130,8 @@ impl FilePane {
                 })
                 .when_some(task.replacement.as_ref(), |d, _| {
                     d.child(
-                        Button::new(("drop-replace", id))
+                        crate::design::PrimaryAction::new(("drop-replace", id))
                             .small()
-                            .primary()
                             .label(tr("upload-replace"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.replace_transfer(id, cx);
@@ -1241,6 +1241,7 @@ impl FilePane {
             theme.accent,
             theme.primary,
         );
+        let full_path = entry.path.clone();
         let grid = self.full_page && self.grid;
         let size = entry
             .size
@@ -1258,6 +1259,9 @@ impl FilePane {
         });
         let mut cell = div()
             .id(("file-entry", index))
+            .tooltip(move |window, cx| {
+                gpui_component::tooltip::Tooltip::new(full_path.clone()).build(window, cx)
+            })
             .flex_1()
             .min_w_0()
             .h_full()
@@ -1443,10 +1447,10 @@ impl FilePane {
                 ),
             )
             .child(
-                Button::new("upload")
+                crate::design::PrimaryAction::new("upload")
                     .small()
-                    .primary()
                     .label(tr("file-upload"))
+                    .disabled(!self.available)
                     .on_click(cx.listener(|this, _, window, cx| this.pick_upload(window, cx))),
             )
             .into_any_element()
@@ -1463,7 +1467,7 @@ impl FilePane {
                 Button::new("download")
                     .small()
                     .label(tr("file-download"))
-                    .disabled(self.selected.is_none())
+                    .disabled(self.selected.is_none() || !self.available)
                     .on_click(cx.listener(|this, _, window, cx| this.pick_download(window, cx))),
             )
             .child(
@@ -1471,7 +1475,7 @@ impl FilePane {
                     .small()
                     .ghost()
                     .label(tr("file-delete"))
-                    .disabled(self.selected.is_none())
+                    .disabled(self.selected.is_none() || !self.available)
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let Some(entry) = this.selected.and_then(|index| this.entries.get(index))
                         {
@@ -1495,6 +1499,7 @@ impl FilePane {
                 Button::new("mkdir")
                     .small()
                     .label(tr("file-create-folder"))
+                    .disabled(!self.available)
                     .on_click(cx.listener(|this, _, _, cx| {
                         match opsssh_drop::join_remote(
                             &this.directory,
@@ -1555,8 +1560,8 @@ impl FilePane {
             .flex()
             .items_center()
             .justify_between()
-            .px_4()
-            .py_3()
+            .px_3()
+            .py_2()
             .border_b_1()
             .border_color(border)
             .child(
@@ -1576,11 +1581,27 @@ impl FilePane {
                             .child(tr("file-connection-label")),
                     ),
             )
-            .child(div().text_xs().text_color(muted).child(format!(
-                "{} {}",
-                self.visible.len(),
-                tr("file-items")
-            )))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(div().text_xs().text_color(muted).child(format!(
+                        "{} {}",
+                        self.visible.len(),
+                        tr("file-items")
+                    )))
+                    .child(
+                        Button::new("close-remote-files")
+                            .ghost()
+                            .icon(IconName::Close)
+                            .tooltip(tr("close-remote-files"))
+                            .accessibility_label(tr("close-remote-files"))
+                            .on_click(
+                                cx.listener(|_, _, _, cx| cx.emit(FilePaneEvent::ClosePanel)),
+                            ),
+                    ),
+            )
             .into_any_element()
     }
     fn path_controls(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -1588,10 +1609,10 @@ impl FilePane {
             return self.full_page_path_controls(cx);
         }
         div()
-            .p_3()
+            .p_2()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_1()
             .child(
                 Input::new(&self.path)
                     .small()
@@ -1631,10 +1652,10 @@ impl FilePane {
                             ),
                     )
                     .child(
-                        Button::new("upload")
+                        crate::design::PrimaryAction::new("upload")
                             .small()
-                            .primary()
                             .label(tr("file-upload"))
+                            .disabled(!self.available)
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.pick_upload(window, cx)),
                             ),
@@ -1658,6 +1679,7 @@ impl FilePane {
             .child(
                 Button::new("focus-file-list")
                     .ghost()
+                    .small()
                     .label(tr("file-name-column"))
                     .tooltip(tr("file-list-help"))
                     .accessibility_label(tr("file-list-help"))
@@ -1919,22 +1941,22 @@ impl FilePane {
         let theme = cx.theme();
         let border = theme.border;
         div()
-            .p_3()
+            .p_2()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_1()
             .border_t_1()
             .border_color(border)
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap_1()
                     .child(
                         Button::new("download")
                             .small()
                             .label(tr("file-download"))
-                            .disabled(self.selected.is_none())
+                            .disabled(self.selected.is_none() || !self.available)
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.pick_download(window, cx)),
                             ),
@@ -1944,7 +1966,7 @@ impl FilePane {
                             .small()
                             .ghost()
                             .label(tr("file-delete"))
-                            .disabled(self.selected.is_none())
+                            .disabled(self.selected.is_none() || !self.available)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(entry) =
                                     this.selected.and_then(|index| this.entries.get(index))
@@ -1963,7 +1985,7 @@ impl FilePane {
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap_1()
                     .child(
                         Input::new(&self.folder)
                             .small()
@@ -1973,6 +1995,7 @@ impl FilePane {
                         Button::new("mkdir")
                             .small()
                             .label(tr("file-create-folder"))
+                            .disabled(!self.available)
                             .on_click(cx.listener(
                                 |this, _, _, cx| match opsssh_drop::join_remote(
                                     &this.directory,
@@ -2036,12 +2059,12 @@ impl FilePane {
         let subtle = theme.muted;
         let mut tasks = div()
             .id("transfer-tasks")
-            .max_h(px(220.))
+            .max_h(px(if self.full_page { 220. } else { 140. }))
             .overflow_y_scroll()
             .flex()
             .flex_col()
-            .gap_2()
-            .p_3()
+            .gap_1()
+            .p_2()
             .border_t_1()
             .border_color(border)
             .bg(subtle)
@@ -2085,7 +2108,6 @@ impl FilePane {
             return self.completed_transfer_card(task, cx);
         }
         let theme = cx.theme();
-        let background = theme.sidebar;
         let foreground = theme.sidebar_foreground;
         let border = theme.border;
         let muted = theme.muted_foreground;
@@ -2093,9 +2115,7 @@ impl FilePane {
         let active = task.state.active();
         let mut card = div()
             .p_2()
-            .rounded_md()
-            .bg(background)
-            .border_1()
+            .border_b_1()
             .border_color(border)
             .flex()
             .flex_col()
@@ -2147,9 +2167,8 @@ impl FilePane {
                         .child(format!("{} {path}", tr("upload-file-exists"))),
                 )
                 .child(
-                    Button::new(("transfer-replace", id))
+                    crate::design::PrimaryAction::new(("transfer-replace", id))
                         .small()
-                        .primary()
                         .label(tr("upload-replace"))
                         .on_click(cx.listener(move |this, _, _, cx| this.replace_transfer(id, cx))),
                 );
@@ -2259,6 +2278,7 @@ impl Render for FilePane {
             .h_full()
             .min_h_0()
             .min_w_0()
+            .overflow_y_scroll()
             .bg(background)
             .text_color(foreground);
         pane = pane
@@ -2272,7 +2292,14 @@ impl Render for FilePane {
             pane = pane.child(self.list_header(cx));
         }
         pane = pane
-            .child(self.entries_view(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(120.))
+                    .child(self.entries_view(cx)),
+            )
             .child(self.file_actions(cx));
         if let Some(path) = self.pending_delete.clone() {
             pane = pane.child(self.delete_confirmation(path, cx));

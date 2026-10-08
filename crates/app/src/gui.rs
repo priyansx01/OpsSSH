@@ -49,6 +49,8 @@ struct Tab {
     environment: String,
     files: Option<Entity<FilePane>>,
     files_visible: bool,
+    files_width: f32,
+    workspace_key: Option<String>,
     follow: bool,
     followed_directory: Option<String>,
     file_generation: u64,
@@ -78,6 +80,9 @@ struct Workspace {
     launched: Instant,
     first_frame_recorded: bool,
     load_failed: bool,
+    environment_filter: String,
+    terminal_focus_released: bool,
+    panel_drag: Option<(SessionId, f32, f32)>,
 }
 pub fn run(open_terminal: bool) {
     run_internal(open_terminal, None);
@@ -115,14 +120,15 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
     bind_workspace_keys(cx);
     cx.on_window_closed(|cx,_|{if cx.windows().is_empty(){cx.quit();}}).detach();
     #[allow(unused_mut)]
-    let mut dimensions=size(px(1280.),px(820.));
+    let mut dimensions=size(px(1440.),px(900.));
     #[cfg(feature="capture")]
     if capture_path.is_some() {
         let dimension=|key:&str,default:f32|std::env::var(key).ok().and_then(|v|v.parse::<f32>().ok()).filter(|v|v.is_finite()).unwrap_or(default).clamp(640.,2560.);
-        dimensions=size(px(dimension("OPSSSH_CAPTURE_WIDTH",1280.)),px(dimension("OPSSSH_CAPTURE_HEIGHT",820.)));
+        dimensions=size(px(dimension("OPSSSH_CAPTURE_WIDTH",1440.)),px(dimension("OPSSSH_CAPTURE_HEIGHT",900.)));
     }
+    if capture_path.is_none() && let Some(display)=cx.primary_display() {let available=display.visible_bounds().size;dimensions=size(dimensions.width.min(available.width),dimensions.height.min(available.height));}
     let bounds=Bounds::centered(None,dimensions,cx);
-    let result=cx.open_window(WindowOptions{window_bounds:Some(WindowBounds::Windowed(bounds)),..WindowOptions::default()},move|window,cx|{
+    let result=cx.open_window(WindowOptions{window_bounds:Some(WindowBounds::Windowed(bounds)),window_min_size:Some(size(px(1000.),px(700.))),window_decorations:Some(gpui::WindowDecorations::Client),..gpui_component::TitleBar::window_options()},move|window,cx|{
         window.set_window_title("OpsSSH");
         let workspace=cx.new(|cx: &mut Context<Workspace>|{
             let home_focus=cx.focus_handle();let terminal_focus=Workspace::terminal_focus_subscriptions(&home_focus,window,cx);let search=cx.new(|cx|InputState::new(window,cx).placeholder("Search name, host, user, environment or tags"));
@@ -130,7 +136,7 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
             let (path,mut message)=match opsssh_platform::app_data_dir(){Ok(dir)=>(dir.join("servers.toml"),String::new()),Err(error)=>(PathBuf::new(),format!("Cannot locate settings folder: {error}"))};
             let mut load_failed=false;
             let store=if path.as_os_str().is_empty(){load_failed=true;Store::default()}else{match Store::load(&path){Ok(store)=>store,Err(error)=>{message=format!("Cannot load servers. Fix the settings file before saving: {error}");load_failed=true;Store::default()}}};
-            let mut workspace=Workspace{home_focus,capture:None,upload_dialog:None,_terminal_focus:terminal_focus,search,store,path,sessions:vec![],navigation:SessionTabs::default(),transition:0,pending_close:None,quit_dialog:false,uptime_timer:None,editor:None,settings_page:false,help_page:false,message,filter:"All servers".into(),hovered_card:None,config:vec![],launched,first_frame_recorded:false,load_failed};
+            let mut workspace=Workspace{home_focus,capture:None,upload_dialog:None,_terminal_focus:terminal_focus,search,store,path,sessions:vec![],navigation:SessionTabs::default(),transition:0,pending_close:None,quit_dialog:false,uptime_timer:None,editor:None,settings_page:false,help_page:false,message,filter:"All servers".into(),hovered_card:None,config:vec![],launched,first_frame_recorded:false,load_failed,environment_filter:String::new(),terminal_focus_released:false,panel_drag:None};
             crate::design::apply(&workspace.store.settings.theme,window,cx);
             crate::design::set_reduced_motion(workspace.store.settings.reduced_motion,cx);
             crate::design::observe_system(window).detach();
@@ -143,6 +149,15 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
                 if screen.contains("servers") || screen.contains("list") || screen.contains("many") {
                     let count=if screen.contains("many"){500}else{6};
                     for i in 0..count {let _=workspace.store.upsert(Profile{name:if i==5 {"Research / a deliberately long server name to verify truncation".into()}else{format!("{} {:02}",["Atlas gateway","Build runner","Payments API","Staging database","Personal lab"][i%5],i+1)},host:format!("host-{}.example.test",i+1),user:"deploy".into(),environment:["Production","Staging","Development"][i%3].into(),auth:[opsssh_store::Auth::Agent,opsssh_store::Auth::Password,opsssh_store::Auth::Key][i%3].clone(),favorite:i%2==0,..Profile::default()});}
+                }
+                if screen.contains("config") {
+                    workspace.filter="From SSH config".into();
+                    for (name, host) in [("github-ismart", "github.com"), ("github.com", "github.com"), ("gitlab.com", "gitlab.com")] {
+                        workspace.config.push((Profile { name:name.into(), ssh_alias:name.into(), host:host.into(), user:"git".into(), environment:"Development".into(), identity_file:"~/.ssh/id_ed25519".into(), auth:opsssh_store::Auth::Key, ..Profile::default() }, vec![]));
+                    }
+                    let id=workspace.navigation.allocate();
+                    workspace.sessions.push(Tab { id, name:"github-ismart".into(), endpoint:Some("git@github.com:22".into()), profile_id:None, upload_directory:None, keyboard_capture:false, persistent_name:None, protected:false, connected_at:Some(Instant::now()), page:SessionPage::Terminal, infrastructure:None, ssh_management:None, terminal:cx.new(|cx| TerminalView::preview_connected_local(window,cx)), color:environment_color("Development"), environment:"Development".into(), files:None, files_visible:false, files_width:0., workspace_key:None, follow:true, followed_directory:None, file_generation:0, files_needs_rebind:false });
+                    workspace.navigation.active=None;
                 }
                 if screen.contains("list") {workspace.store.settings.server_view="list".into();}
                 if screen.contains("light") {crate::design::apply("light",window,cx);}
@@ -179,6 +194,7 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
                     window.on_next_frame(move|window,cx|{let _=this.update(cx,|this,cx|this.choose_upload_destination(id,vec![],window,cx));});
                 }
                 if screen.contains("settings") {workspace.settings_page=true;}
+                if screen.contains("help") {workspace.help_page=true;}
                 if screen.contains("connection") {let this=cx.entity().downgrade();window.on_next_frame(move|window,cx|{let _=this.update(cx,|this,cx|this.new_server(&NewServer,window,cx));});}
                 if screen.contains("key") {let this=cx.entity().downgrade();window.on_next_frame(move|window,cx|{let _=this.update(cx,|this,cx|this.edit(Profile{host:"host.example.test".into(),user:"deploy".into(),auth:opsssh_store::Auth::Key,..Profile::default()},window,cx));});}
                 let timer=cx.background_executor().timer(std::time::Duration::from_secs(2));cx.spawn_in(window,async move|this,cx|{timer.await;let _=this.update_in(cx,|_,window,cx|{match window.render_to_image().and_then(|image|image.save(&path).map_err(Into::into)){Ok(())=>eprintln!("Saved rendered frame to {}",path.display()),Err(error)=>eprintln!("Frame export failed: {error}")};cx.quit();});}).detach();}
@@ -216,6 +232,8 @@ impl Workspace {
                                 };
                                 if event.release_capture {
                                     this.sessions[index].keyboard_capture = false;
+                                    this.terminal_focus_released = true;
+                                    window.focus(&this.home_focus, cx);
                                     this.update_keyboard_capture(window, cx);
                                     cx.notify();
                                 } else if this.navigation.active == Some(SessionId(event.target))
@@ -299,7 +317,8 @@ impl Workspace {
     }
 
     fn restore_terminal_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.terminal_visible()
+        if self.terminal_focus_released
+            || !self.terminal_visible()
             || self.editor.is_some()
             || self.pending_close.is_some()
             || self.quit_dialog
@@ -463,6 +482,8 @@ impl Workspace {
             environment: tr("local-session"),
             files: None,
             files_visible: false,
+            files_width: 0.,
+            workspace_key: None,
             follow: true,
             followed_directory: None,
             file_generation: 0,
@@ -545,6 +566,7 @@ impl Workspace {
         }
     }
     fn activate_session(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<Self>) {
+        self.terminal_focus_released = false;
         let Some(index) = self.session_index(id) else {
             return;
         };
@@ -693,8 +715,7 @@ impl Workspace {
                                 .gap_2()
                                 .when(remote, |d| {
                                     d.child(
-                                        Button::new("stay-connected")
-                                            .primary()
+                                        crate::design::PrimaryAction::new("stay-connected")
                                             .label(tr("stay-connected"))
                                             .on_click(move |_, window, cx| {
                                                 let _ = stay.update(cx, |this, cx| {
@@ -1099,11 +1120,29 @@ impl Workspace {
                     {
                         this.select_page(id, page, window, cx);
                     }
+                    if let Some(tab) = this.sessions.iter().find(|tab| {
+                        tab.terminal == terminal
+                            && tab.files_visible
+                            && tab.files.is_none()
+                            && terminal.read(cx).session_state()
+                                == opsssh_term_core::SessionState::Connected
+                    }) {
+                        let terminal = tab.terminal.clone();
+                        this.background_files(&terminal, window, cx);
+                    }
                     this.sync_visibility(cx);
                     cx.notify();
                 })
                 .detach();
                 let id = self.navigation.allocate();
+                let workspace_key = opsssh_store::workspace_key(&profile);
+                let preference = self
+                    .store
+                    .settings
+                    .workspaces
+                    .get(&workspace_key)
+                    .cloned()
+                    .unwrap_or_default();
                 self.sessions.push(Tab {
                     id,
                     profile_id: (profile.id != 0).then_some(profile.id),
@@ -1128,7 +1167,9 @@ impl Workspace {
                     color: environment_color(&profile.environment),
                     environment: profile.environment.clone(),
                     files: None,
-                    files_visible: false,
+                    files_visible: preference.files_open,
+                    files_width: preference.files_width,
+                    workspace_key: Some(workspace_key),
                     follow: true,
                     followed_directory: None,
                     file_generation: 0,
@@ -1143,6 +1184,158 @@ impl Workspace {
         }
         cx.notify();
     }
+    fn remember_files(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(tab) = self.sessions.iter().find(|tab| tab.id == id) else {
+            return;
+        };
+        let Some(key) = tab.workspace_key.clone() else {
+            return;
+        };
+        let preference = opsssh_store::WorkspacePreference {
+            files_open: tab.files_visible,
+            files_width: tab.files_width,
+        };
+        let old = self.store.clone();
+        self.store.settings.workspaces.insert(key, preference);
+        if !self.persist() {
+            self.store = old;
+        }
+        cx.notify();
+    }
+    fn close_files(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.session_index(id) {
+            self.sessions[index].files_visible = false;
+            if self.sessions[index].page == SessionPage::Files {
+                self.sessions[index].page = SessionPage::Terminal;
+                if let Some(files) = self.sessions[index].files.clone() {
+                    files.update(cx, |files, cx| files.set_full_page(false, cx));
+                }
+            }
+        }
+        self.panel_drag = None;
+        self.remember_files(id, cx);
+        self.terminal_focus_released = false;
+        self.restore_terminal_focus(window, cx);
+        cx.notify();
+    }
+    fn finish_panel_drag(&mut self, cx: &mut Context<Self>) {
+        if let Some((id, _, _)) = self.panel_drag.take() {
+            self.remember_files(id, cx);
+        }
+    }
+    fn profile_sessions(&self, profile: &Profile, cx: &App) -> Vec<SessionId> {
+        let endpoint = format!("{}@{}:{}", profile.user, profile.host, profile.port);
+        let preference_key = opsssh_store::workspace_key(profile);
+        self.sessions
+            .iter()
+            .filter(|tab| {
+                tab.endpoint.as_deref() == Some(&endpoint)
+                    && (if profile.id == 0 {
+                        tab.workspace_key
+                            .as_ref()
+                            .map_or(tab.name == profile.name, |key| key == &preference_key)
+                    } else {
+                        tab.profile_id == Some(profile.id)
+                    })
+                    && !matches!(
+                        tab.terminal.read(cx).session_state(),
+                        opsssh_term_core::SessionState::Closed
+                            | opsssh_term_core::SessionState::Disconnected
+                    )
+            })
+            .map(|tab| tab.id)
+            .collect()
+    }
+    fn disconnect_profile(
+        &mut self,
+        profile: &Profile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let sessions = self.profile_sessions(profile, cx);
+        if sessions.is_empty() {
+            return;
+        }
+        if sessions.len() == 1 {
+            self.confirm_disconnect(sessions[0], window, cx);
+            return;
+        }
+        let weak = cx.entity().downgrade();
+        let rows = sessions
+            .into_iter()
+            .filter_map(|id| {
+                self.session_index(id)
+                    .map(|i| (id, format!("{} #{}", self.sessions[i].name, id.0)))
+            })
+            .collect::<Vec<_>>();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title(tr("choose-session"))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .children(rows.iter().map(|(id, name)| {
+                            let id = *id;
+                            let weak = weak.clone();
+                            Button::new(("disconnect-session", id.0 as usize))
+                                .label(name.clone())
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.confirm_disconnect(id, window, cx)
+                                    });
+                                })
+                        })),
+                )
+                .width(px(440.))
+        });
+    }
+    fn confirm_disconnect(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.session_index(id) else {
+            return;
+        };
+        let name = self.sessions[index].name.clone();
+        let weak = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title(format!("{} {}?", tr("disconnect"), name))
+                .child(div().text_sm().child(tr("disconnect-server-help")))
+                .footer(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Button::new("confirm-server-disconnect")
+                                .danger()
+                                .label(tr("disconnect"))
+                                .on_click({
+                                    let weak = weak.clone();
+                                    move |_, window, cx| {
+                                        window.close_dialog(cx);
+                                        let _ = weak.update(cx, |this, cx| {
+                                            if let Some(i) = this.session_index(id) {
+                                                this.sessions[i]
+                                                    .terminal
+                                                    .update(cx, |t, cx| t.disconnect(cx));
+                                            }
+                                            this.sync_visibility(cx);
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(
+                            Button::new("cancel-server-disconnect")
+                                .label(tr("cancel"))
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        ),
+                )
+                .overlay_closable(false)
+                .width(px(460.))
+        });
+    }
     fn ensure_files(
         &mut self,
         terminal: &Entity<TerminalView>,
@@ -1150,12 +1343,16 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<Entity<FilePane>> {
         let pane = self.background_files(terminal, window, cx)?;
-        if let Some(tab) = self
+        if let Some(id) = self
             .sessions
-            .iter_mut()
+            .iter()
             .find(|tab| &tab.terminal == terminal)
+            .map(|tab| tab.id)
         {
-            tab.files_visible = true;
+            if let Some(index) = self.session_index(id) {
+                self.sessions[index].files_visible = true;
+            }
+            self.remember_files(id, cx);
         }
         cx.notify();
         Some(pane)
@@ -1204,6 +1401,17 @@ impl Workspace {
                     return;
                 }
                 FilePaneEvent::InsertText(id, text) => (id, text),
+                FilePaneEvent::ClosePanel => {
+                    if let Some(id) = this
+                        .sessions
+                        .iter()
+                        .find(|tab| tab.files.as_ref() == Some(pane))
+                        .map(|tab| tab.id)
+                    {
+                        this.close_files(id, window, cx);
+                    }
+                    return;
+                }
                 FilePaneEvent::FocusTerminal => {
                     if this.sessions.iter().any(|tab| {
                         tab.files.as_ref() == Some(pane) && this.navigation.active == Some(tab.id)
@@ -1240,6 +1448,8 @@ impl Workspace {
             .into_iter()
             .filter(|p| {
                 p.matches(query)
+                    && (self.environment_filter.is_empty()
+                        || p.environment == self.environment_filter)
                     && match self.filter.as_str() {
                         "All servers" | "From SSH config" => true,
                         "Favourites" => p.favorite,
@@ -1325,6 +1535,83 @@ impl Render for Workspace {
 mod tests {
     use super::*;
     use gpui::{Focusable, TestAppContext, VisualTestContext};
+
+    #[gpui::test]
+    fn config_alias_status_does_not_inherit_a_different_profile_on_the_same_host(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let mut workspace = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| fixture(window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        VisualTestContext::update(cx, |_, cx| {
+            workspace.update(cx, |this, cx| {
+                let mut alias = Profile {
+                    name: "same-host".into(),
+                    host: "fixture.invalid".into(),
+                    user: "deploy".into(),
+                    ..Profile::default()
+                };
+                let tab = &mut this.sessions[0];
+                tab.name = alias.name.clone();
+                tab.workspace_key = Some(opsssh_store::workspace_key(&alias));
+                let id = tab.id;
+                assert_eq!(this.profile_sessions(&alias, cx), vec![id]);
+                alias.name = "another-alias".into();
+                assert!(this.profile_sessions(&alias, cx).is_empty());
+                alias.name = "same-host".into();
+                alias.id = 42;
+                this.sessions[0].workspace_key = Some(opsssh_store::workspace_key(&alias));
+                this.sessions[0].profile_id = Some(42);
+                alias.id = 0;
+                assert!(this.profile_sessions(&alias, cx).is_empty());
+            });
+        });
+    }
+    #[gpui::test]
+    fn closing_files_retains_transfers_and_release_keeps_chrome_focus(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let mut workspace = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| fixture(window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        VisualTestContext::update(cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                let i = this.session_index(this.navigation.active.unwrap()).unwrap();
+                let id = this.sessions[i].id;
+                let pane = cx.new(|cx| FilePane::preview(window, cx));
+                pane.update(cx, |pane, cx| {
+                    pane.preview_completed_upload("'/home/deploy/file.txt' ".into(), cx);
+                });
+                this.sessions[i].files = Some(pane.clone());
+                this.sessions[i].files_visible = true;
+                this.sessions[i].files_width = 340.;
+                this.close_files(id, window, cx);
+                assert!(!this.sessions[i].files_visible);
+                assert_eq!(this.sessions[i].files.as_ref().unwrap(), &pane);
+                assert_eq!(this.sessions[i].files_width, 340.);
+                assert_eq!(pane.read(cx).pending_upload_paths().len(), 1);
+                this.terminal_focus_released = true;
+                this.home_focus.focus(window, cx);
+                this.restore_terminal_focus(window, cx);
+                assert_eq!(window.focused(cx), Some(this.home_focus.clone()));
+            });
+        });
+        cx.run_until_parked();
+        VisualTestContext::update(cx, |window, cx| {
+            let _ = window.draw(cx);
+            workspace.update(cx, |this, cx| {
+                assert_eq!(window.focused(cx), Some(this.home_focus.clone()))
+            });
+        });
+    }
 
     #[gpui::test]
     fn completed_upload_inserts_once_after_focus_returns_and_preserves_modal_guards(
@@ -1492,6 +1779,8 @@ mod tests {
                     environment: String::new(),
                     files: None,
                     files_visible: false,
+                    files_width: 0.,
+                    workspace_key: None,
                     follow: true,
                     followed_directory: None,
                     file_generation: 0,
@@ -1523,6 +1812,9 @@ mod tests {
             launched: Instant::now(),
             first_frame_recorded: false,
             load_failed: true,
+            environment_filter: String::new(),
+            terminal_focus_released: false,
+            panel_drag: None,
         }
     }
 

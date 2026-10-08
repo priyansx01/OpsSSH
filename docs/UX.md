@@ -4,10 +4,21 @@ OpsSSH uses GPUI Component 0.7.1 with application-owned semantic colors. Ruby ma
 primary actions; neutral charcoal surfaces separate navigation, content, and
 dialogs. Light and system-following themes use the same component hierarchy.
 System UI typography and monospace endpoints remain native to each platform.
+Windows explicitly uses Segoe UI for interface text and Consolas for metadata.
+
+The window opens at 1440x900 logical pixels (clamped to the display work area),
+with a 32px native title bar, integrated 54px tab strip, and 228px sidebar that
+collapses to 68px. Native window controls retain the live-session close guard.
+The minimum window is 1000x700; long pages and short files panes scroll internally.
 
 The server page has virtualized cards and a list alternative, search, environment
 groups, favorites, and name/recent sorting. Recency is recorded only after a
 saved connection reaches Connected; exported profiles omit local timestamps.
+Connection cards show the actual transport state, with a stable-width Connect
+or Disconnect action. Disconnect requires confirmation and retains the tab and
+terminal history; multiple sessions get a session chooser. Reconnect is explicit.
+SSH-config aliases are read-only: Customize creates a saved profile, and aliases
+support Duplicate and Copy SSH command but cannot be removed from this UI.
 There are no synthetic reachability indicators in the application.
 
 Connection setup starts with host and port side by side, username, and authentication. Details and
@@ -19,10 +30,19 @@ the dialog; failed checks retain entered values.
 
 Session entities stay alive while navigating home or settings. Outside terminal focus, Ctrl/Cmd+W cannot
 close a hidden terminal from settings, help, or a connection dialog. Files use
-a resizable panel with per-task cancellation and current-file byte progress.
+a shared terminal/files frame with a keyboard-operable divider. Files start
+closed for a new server. Visibility and width are remembered locally per saved
+profile or SSH alias and endpoint; changing the endpoint starts fresh. These
+preferences are excluded from shared profile exports. The panel close button
+hides it without cancelling transfers or discarding pending upload paths.
+Closing the full-page file view returns to Terminal. Transfers retain per-task
+cancellation and current-file byte progress.
 Click the file list's Name heading, or activate it with the keyboard, to use
 arrow keys and Enter. Enter opens a directory or presents the download picker.
-Selection actions overlay the terminal instead of changing its PTY dimensions.
+Opening the files panel resizes the PTY at most about 30 times per second,
+including the final size, without clearing terminal selection. Terminal output
+appears immediately. Ctrl+Alt+F12 releases native keyboard capture and places
+focus on the workspace chrome; the terminal does not immediately reclaim it.
 
 Appearance, terminal size, navigation state, and view/sort choices are persisted
 in the existing version-1 store with defaults for older files. UI text is served
@@ -227,3 +247,15 @@ completed path appearing in a real local PTY without submitting it.
 `snapshot-session-upload-replace` previews the repeated `/opt/test.txt` upload prompt.
 Windows physical-key and live VM/tmux acceptance should
 be exercised interactively; automated tests verify hook routing and encoder bytes.
+
+The shared primary action uses a restrained ruby gradient and tight shadow.
+Sidebar labels fade during expansion, cards lift at most 2px on hover, and page
+changes crossfade briefly. Menus and dialogs use the component motion system.
+Reduced motion disables spatial transitions. Terminal input and search have no
+entrance animation.
+
+Redesign review fixtures include `snapshot-config`, `snapshot-help`, and their
+`-light` variants in addition to the screens above. GitHub example aliases and
+their preview status exist only in memory in the capture process; they never
+write to SSH config or connect to those hosts. Windows debug binaries reserve
+8 MiB of main-thread virtual stack for native GPUI composition.

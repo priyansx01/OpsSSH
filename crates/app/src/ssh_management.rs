@@ -454,8 +454,7 @@ impl SshManagementView {
                         .gap_2()
                         .when(editable, |body| {
                             body.child(
-                                Button::new("ssh-management-submit")
-                                    .primary()
+                                crate::design::PrimaryAction::new("ssh-management-submit")
                                     .label(tr(if busy {
                                         "sshmgmt-working"
                                     } else if matches!(editor, Editor::Repair) {
@@ -831,8 +830,7 @@ impl Render for SshManagementView {
                             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                     )
                     .child(
-                        Button::new("ssh-add-key")
-                            .primary()
+                        crate::design::PrimaryAction::new("ssh-add-key")
                             .label(tr("sshmgmt-add"))
                             .disabled(!mutable)
                             .on_click(cx.listener(|this, _, window, cx| {

@@ -166,9 +166,73 @@ fn expand_proxy(argument: &str, profile: &Profile) -> Result<String, String> {
     Ok(result)
 }
 
+/// A clipboard command contains only explicit public connection options, never credentials.
+pub fn ssh_command(profile: &Profile) -> Result<String, String> {
+    profile.validate().map_err(|error| error.to_string())?;
+    let shell = if opsssh_platform::info().os == "windows" {
+        opsssh_drop::Shell::PowerShell
+    } else {
+        opsssh_drop::Shell::Posix
+    };
+    let quote = |text: &str| opsssh_drop::quote(text, shell).map_err(|error| error.to_string());
+    if profile.id == 0 && !profile.name.is_empty() {
+        return Ok(format!("ssh {}", quote(&profile.name)?));
+    }
+    let mut parts = vec!["ssh".to_owned(), "-p".to_owned(), profile.port.to_string()];
+    if !profile.identity_file.is_empty() {
+        parts.extend(["-i".into(), quote(&profile.identity_file)?]);
+    }
+    if !profile.proxy_jump.is_empty() {
+        parts.extend(["-J".into(), quote(&profile.proxy_jump)?]);
+    }
+    if !profile.certificate_file.is_empty() {
+        parts.extend([
+            "-o".into(),
+            quote(&format!("CertificateFile={}", profile.certificate_file))?,
+        ]);
+    }
+    if !profile.proxy_command.is_empty() && !profile.proxy_review_required {
+        parts.extend([
+            "-o".into(),
+            quote(&format!("ProxyCommand={}", profile.proxy_command))?,
+        ]);
+    }
+    let destination = if profile.user.is_empty() {
+        profile.host.clone()
+    } else {
+        format!("{}@{}", profile.user, profile.host)
+    };
+    parts.push(quote(&destination)?);
+    Ok(parts.join(" "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn clipboard_command_quotes_public_options_and_omits_unreviewed_proxy() {
+        let mut p = Profile {
+            id: 1,
+            name: "Example".into(),
+            host: "example.test".into(),
+            user: "deploy".into(),
+            port: 2222,
+            identity_file: "C:/keys/my key's.pub".into(),
+            proxy_command: "secret-proxy".into(),
+            proxy_review_required: true,
+            ..Profile::default()
+        };
+        let command = ssh_command(&p).unwrap();
+        assert!(command.contains("-p 2222"));
+        assert!(command.contains("deploy@example.test"));
+        assert!(!command.contains("secret-proxy"));
+        p.id = 0;
+        p.name = "github-ismart".into();
+        assert_eq!(ssh_command(&p).unwrap(), "ssh 'github-ismart'");
+        p.id = 1;
+        p.user.clear();
+        assert!(!ssh_command(&p).unwrap().contains("@example.test"));
+    }
     #[test]
     fn refuses_unreviewed_proxy_and_unsupported_options() {
         let mut p = Profile {

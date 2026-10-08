@@ -375,3 +375,23 @@ sshmgmt-name-type = Name / key type
 sshmgmt-fingerprint = SHA-256 fingerprint
 sshmgmt-account = Account
 sshmgmt-actions = Actions
+
+connection-connected = Connected
+connection-disconnected = Disconnected
+connection-connecting = Connecting
+connection-reconnecting = Reconnecting
+active-connections = active
+workspace-breadcrumb = OpsSSH / Workspace
+copy-ssh-command = Copy SSH command
+close-remote-files = Close remote files
+resize-remote-files = Resize remote files (Left/Right arrow keys)
+choose-session = Choose a session to disconnect
+disconnect-server-help = Disconnect this session and cancel its transfers? Terminal history remains available. Protected work can be restored through tmux.
+
+address-copied = Connection address copied
+
+ssh-command-copied = SSH command copied
+
+reconnect-server = Reconnect
+
+config-alias = From SSH config

@@ -76,6 +76,9 @@ pub struct TerminalView {
     cell_height: Pixels,
     font_size: f32,
     dimensions: TerminalSize,
+    last_resize: Option<Instant>,
+    pending_resize: Option<TerminalSize>,
+    resize_task: Option<Task<()>>,
     selection: Option<Selection>,
     anchor: Option<(Position, bool)>,
     composition: Composition,
@@ -155,9 +158,34 @@ impl TerminalView {
         self.sync_task = None;
         self.error = None;
         self.authentication = None;
+        self.pending_resize = None;
+        self.resize_task = None;
         self.connection_generation = self.connection_generation.wrapping_add(1);
         cx.notify();
     }
+    /// Explicit reconnect after a disconnect; retain the rendered buffer until new output arrives.
+    pub fn reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(
+            self.state(),
+            SessionState::Disconnected | SessionState::Closed
+        ) {
+            return;
+        }
+        let Some(options) = self.connection_options.clone() else {
+            return;
+        };
+        let generation = self.connection_generation.wrapping_add(1);
+        let font_size = self.font_size;
+        let snapshot = self.snapshot.clone();
+        self.disconnect(cx);
+        let mut replacement = Self::start(Some(options), window, cx);
+        replacement.connection_generation = generation;
+        replacement.snapshot = snapshot;
+        replacement.set_font_size(font_size, cx);
+        *self = replacement;
+        cx.notify();
+    }
+
     pub fn is_tmux_protected(&self) -> bool {
         self.connection_options
             .as_ref()
@@ -417,6 +445,9 @@ impl TerminalView {
             cell_height: px(22.),
             font_size: 16.0,
             dimensions,
+            last_resize: None,
+            pending_resize: None,
+            resize_task: None,
             selection: None,
             anchor: None,
             composition: Composition::default(),
@@ -1328,6 +1359,16 @@ impl TerminalView {
         cx.stop_propagation();
     }
 
+    fn apply_pending_resize(&mut self, cx: &mut Context<Self>) {
+        if let Some(dimensions) = self.pending_resize.take()
+            && let Some(session) = &self.session
+            && session.resize(dimensions).is_ok()
+        {
+            self.dimensions = dimensions;
+            self.last_resize = Some(Instant::now());
+            cx.notify();
+        }
+    }
     fn layout(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -1356,12 +1397,26 @@ impl TerminalView {
             .floor()
             .clamp(1., 500.) as u16;
         let dimensions = TerminalSize::new(columns, rows).unwrap();
-        if dimensions != self.dimensions
-            && let Some(session) = &self.session
-            && session.resize(dimensions).is_ok()
-        {
-            self.dimensions = dimensions;
-            self.selection = None;
+        if dimensions != self.dimensions {
+            self.pending_resize = Some(dimensions);
+            let delay = self
+                .last_resize
+                .map(|last| std::time::Duration::from_millis(34).saturating_sub(last.elapsed()))
+                .unwrap_or_default();
+            if delay.is_zero() {
+                self.apply_pending_resize(cx);
+            } else if self.resize_task.is_none() {
+                let timer = cx.background_executor().timer(delay);
+                self.resize_task = Some(cx.spawn(async move |this, cx| {
+                    timer.await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.resize_task = None;
+                        this.apply_pending_resize(cx);
+                    });
+                }));
+            }
+        } else {
+            self.pending_resize = None;
         }
         if self.shapes.len() != self.snapshot.rows.len() {
             self.shapes.clear();
@@ -1930,6 +1985,66 @@ mod clipboard_tests {
     use gpui::{Entity, TestAppContext, VisualTestContext};
     use opsssh_term_core::{Cell, TerminalBackend};
 
+    struct ResizeTestHost;
+    impl Render for ResizeTestHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+    #[gpui::test]
+    fn resize_burst_coalesces_and_applies_final_size_without_clearing_selection(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let session = Session::local(LocalShellOptions::default()).unwrap();
+        let executor = cx.background_executor.clone();
+        let mut view = None;
+        let (_host, cx) = cx.add_window_view(|window, cx| {
+            view = Some(cx.new(|cx| {
+                let mut view = fixture(window, cx);
+                view.stopped = false;
+                view.session = Some(session);
+                view
+            }));
+            ResizeTestHost
+        });
+        let view = view.unwrap();
+        let expected = VisualTestContext::update(cx, |window, cx| {
+            view.update(cx, |view, cx| {
+                view.selection = Some(Selection::Linear {
+                    start: Position { row: 0, column: 0 },
+                    end: Position { row: 0, column: 4 },
+                });
+                view.last_resize = Some(Instant::now());
+                let before = view.dimensions;
+                view.layout(
+                    Bounds::new(point(px(0.), px(0.)), size(px(900.), px(420.))),
+                    window,
+                    cx,
+                );
+                assert!(view.resize_task.is_some());
+                assert_eq!(view.dimensions, before);
+                view.layout(
+                    Bounds::new(point(px(0.), px(0.)), size(px(1100.), px(520.))),
+                    window,
+                    cx,
+                );
+                let final_size = view.pending_resize.unwrap();
+                assert_eq!(view.dimensions, before);
+                assert_eq!(view.snapshot.rows[0].cells[0].text, "a");
+                final_size
+            })
+        });
+        executor.advance_clock(std::time::Duration::from_millis(40));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.dimensions, expected);
+            assert!(view.pending_resize.is_none());
+            assert!(view.resize_task.is_none());
+            assert!(view.selection.is_some());
+            assert_eq!(view.snapshot.rows[0].cells[0].text, "a");
+        });
+    }
     #[gpui::test]
     fn root_focus_bindings_cannot_consume_terminal_tab_keys(cx: &mut TestAppContext) {
         cx.update(|cx| {

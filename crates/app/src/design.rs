@@ -20,18 +20,18 @@ pub struct Palette {
     pub on_ruby: u32,
 }
 pub const DARK: Palette = Palette {
-    canvas: 0x141416,
-    sidebar: 0x19191c,
-    surface: 0x202024,
-    raised: 0x27272c,
-    hover: 0x303036,
-    border: 0x424249,
-    text: 0xf4f4f5,
-    muted: 0xaaaab4,
-    ruby: 0xbc3150,
-    ruby_hover: 0xce3a5b,
-    ruby_pressed: 0xa32440,
-    ruby_tint: 0x3c202a,
+    canvas: 0x111114,
+    sidebar: 0x18181c,
+    surface: 0x202025,
+    raised: 0x25252b,
+    hover: 0x2b2b33,
+    border: 0x34343c,
+    text: 0xf1eff2,
+    muted: 0xaaa6b0,
+    ruby: 0xc72c55,
+    ruby_hover: 0xcf3059,
+    ruby_pressed: 0xb8264c,
+    ruby_tint: 0x351d27,
     on_ruby: 0xffffff,
 };
 pub const LIGHT: Palette = Palette {
@@ -82,9 +82,14 @@ pub fn apply(theme: &str, window: &mut Window, cx: &mut App) {
     }
     let p = palette(cx);
     Theme::update(cx, |theme| {
+        #[cfg(target_os = "windows")]
+        {
+            theme.font_family = "Segoe UI".into();
+            theme.mono_font_family = "Consolas".into();
+        }
         theme.radius = px(7.);
-        theme.radius_lg = px(12.);
-        theme.shadow = true;
+        theme.radius_lg = px(8.);
+        theme.shadow = false;
         theme.focus_ring = true;
         let c = &mut theme.colors;
         c.background = color(p.canvas);
@@ -110,7 +115,11 @@ pub fn apply(theme: &str, window: &mut Window, cx: &mut App) {
         c.button_primary_foreground = c.primary_foreground;
         c.accent = color(p.hover);
         c.accent_foreground = color(p.text);
-        c.ring = color(p.ruby);
+        c.ring = color(if theme.mode.is_dark() {
+            0xe54870
+        } else {
+            0xab2343
+        });
         c.caret = color(p.text);
         c.selection = color(p.ruby_tint);
         c.button = color(p.raised);
@@ -119,7 +128,7 @@ pub fn apply(theme: &str, window: &mut Window, cx: &mut App) {
         c.button_foreground = color(p.text);
         c.secondary = color(p.raised);
         c.secondary_hover = color(p.hover);
-        c.secondary_active = color(p.hover);
+        c.secondary_active = color(p.ruby_tint);
         c.secondary_foreground = color(p.text);
         c.button_secondary = c.secondary;
         c.button_secondary_hover = c.secondary_hover;
@@ -190,8 +199,8 @@ pub fn set_reduced_motion(reduced: bool, cx: &mut App) {
     Theme::update(cx, |theme| {
         theme.motion = Default::default();
         theme.motion.duration_fast = std::time::Duration::from_millis(120);
-        theme.motion.duration_normal = std::time::Duration::from_millis(190);
-        theme.motion.duration_slow = std::time::Duration::from_millis(280);
+        theme.motion.duration_normal = std::time::Duration::from_millis(160);
+        theme.motion.duration_slow = std::time::Duration::from_millis(200);
         if reduced {
             theme.motion.duration_fast = std::time::Duration::ZERO;
             theme.motion.duration_normal = std::time::Duration::ZERO;
@@ -202,15 +211,103 @@ pub fn set_reduced_motion(reduced: bool, cx: &mut App) {
     });
 }
 
-/// A short underdamped entrance; bounded properties clamp its overshoot.
+/// Restrained ease-out without overshoot.
 pub fn spring_out(t: f32) -> f32 {
-    if t <= 0. {
-        return 0.;
+    1. - (1. - t.clamp(0., 1.)).powi(3)
+}
+
+pub fn action_gradient(hover: bool) -> gpui::Background {
+    let (start, end) = if hover {
+        (0xcf3059, 0xab254a)
+    } else {
+        (0xc72c55, 0x9b2142)
+    };
+    gpui::linear_gradient(
+        135.,
+        gpui::linear_color_stop(rgb(start), 0.),
+        gpui::linear_color_stop(rgb(end), 1.),
+    )
+}
+
+/// Native button semantics on a shared gradient surface; disabled controls stay flat.
+#[derive(gpui::IntoElement)]
+pub struct PrimaryAction {
+    id: gpui::ElementId,
+    button: gpui_component::button::Button,
+    disabled: bool,
+}
+impl PrimaryAction {
+    pub fn new(id: impl Into<gpui::ElementId>) -> Self {
+        let id = id.into();
+        Self {
+            button: gpui_component::button::Button::new(id.clone()),
+            id,
+            disabled: false,
+        }
     }
-    if t >= 1. {
-        return 1.;
+    pub fn label(mut self, value: impl Into<gpui::SharedString>) -> Self {
+        self.button = self.button.label(value);
+        self
     }
-    1. - (1. - t).powi(3) * (10. * t).cos()
+    pub fn icon(mut self, value: gpui_component::IconName) -> Self {
+        self.button = self.button.icon(value);
+        self
+    }
+    pub fn small(mut self) -> Self {
+        use gpui_component::Sizable;
+        self.button = self.button.small();
+        self
+    }
+    pub fn w(mut self, value: gpui::Pixels) -> Self {
+        use gpui::Styled;
+        self.button = self.button.w(value);
+        self
+    }
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        use gpui_component::Disableable;
+        self.disabled = disabled;
+        self.button = self.button.disabled(disabled);
+        self
+    }
+    pub fn on_click(
+        mut self,
+        handler: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.button = self.button.on_click(handler);
+        self
+    }
+}
+impl gpui::RenderOnce for PrimaryAction {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl gpui::IntoElement {
+        use gpui::{div, prelude::*};
+        use gpui_component::button::{ButtonCustomVariant, ButtonVariants};
+        let variant = ButtonCustomVariant::new(cx).foreground(color(if self.disabled {
+            palette(cx).muted
+        } else {
+            0xffffff
+        }));
+        div()
+            .id(self.id)
+            .flex_shrink_0()
+            .rounded(px(6.))
+            .bg(if self.disabled {
+                rgb(palette(cx).raised).into()
+            } else {
+                action_gradient(false)
+            })
+            .when(!self.disabled, |d| {
+                d.shadow(vec![gpui::BoxShadow {
+                    color: gpui::rgba(0xc72c5518).into(),
+                    offset: gpui::point(px(0.), px(2.)),
+                    blur_radius: px(5.),
+                    spread_radius: px(0.),
+                    inset: false,
+                }])
+                .hover(|d| d.bg(action_gradient(true)))
+                .active(|d| d.opacity(0.94))
+            })
+            .child(self.button.custom(variant))
+    }
 }
 
 #[cfg(test)]
@@ -231,6 +328,12 @@ mod tests {
         let a = luminance(a);
         let b = luminance(b);
         (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+    #[test]
+    fn gradient_labels_meet_normal_text_contrast() {
+        for stop in [0xC72C55, 0x9B2142, 0xCF3059, 0xAB254A] {
+            assert!(contrast(0xffffff, stop) >= 4.5);
+        }
     }
     #[test]
     fn text_tokens_meet_normal_text_contrast() {

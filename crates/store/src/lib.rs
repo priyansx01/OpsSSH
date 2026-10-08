@@ -119,6 +119,34 @@ impl Profile {
             .all(|needle| chars.by_ref().any(|c| c == needle))
     }
 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkspacePreference {
+    pub files_open: bool,
+    pub files_width: f32,
+}
+impl Default for WorkspacePreference {
+    fn default() -> Self {
+        Self {
+            files_open: false,
+            files_width: 0.,
+        }
+    }
+}
+/// Namespaced IDs for saved profiles and endpoint-qualified SSH config aliases. Never includes credentials.
+pub fn workspace_key(profile: &Profile) -> String {
+    if profile.id != 0 {
+        format!(
+            "saved:{}:{}@{}:{}",
+            profile.id, profile.user, profile.host, profile.port
+        )
+    } else {
+        format!(
+            "config:{}:{}@{}:{}",
+            profile.name, profile.user, profile.host, profile.port
+        )
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
@@ -129,6 +157,7 @@ pub struct Settings {
     pub sidebar_collapsed: bool,
     pub reduced_motion: bool,
     pub sort: String,
+    pub workspaces: std::collections::BTreeMap<String, WorkspacePreference>,
     #[serde(with = "connection_times")]
     pub last_connected: std::collections::BTreeMap<u64, u64>,
 }
@@ -142,6 +171,7 @@ impl Default for Settings {
             sidebar_collapsed: false,
             reduced_motion: false,
             sort: "name".into(),
+            workspaces: Default::default(),
             last_connected: std::collections::BTreeMap::new(),
         }
     }
@@ -218,6 +248,15 @@ impl Store {
         ) {
             return Err(invalid("sort must be name, last_connected or environment"));
         }
+        if self.settings.workspaces.len() > 10000
+            || self.settings.workspaces.iter().any(|(key, value)| {
+                key.len() > 2048
+                    || !value.files_width.is_finite()
+                    || !(0.0..=1200.0).contains(&value.files_width)
+            })
+        {
+            return Err(invalid("Invalid workspace panel preferences"));
+        }
         if self.settings.last_connected.len() > 10000
             || self
                 .settings
@@ -233,6 +272,7 @@ impl Store {
         self.validate()?;
         let mut safe = self.clone();
         safe.settings.last_connected.clear();
+        safe.settings.workspaces.clear();
         for profile in &mut safe.servers {
             profile.proxy_review_required = true;
             // A program argument can contain a token; never include commands in shared exports.
@@ -342,6 +382,52 @@ mod connection_times {
 mod tests {
     use super::*;
     #[test]
+    fn workspace_preferences_are_local_and_follow_endpoint_identity() {
+        let mut store = Store::default();
+        let id = store
+            .upsert(Profile {
+                host: "first.test".into(),
+                user: "deploy".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let profile = store.servers[0].clone();
+        let key = workspace_key(&profile);
+        store.settings.workspaces.insert(
+            key.clone(),
+            WorkspacePreference {
+                files_open: true,
+                files_width: 360.,
+            },
+        );
+        let restored = Store::parse(&toml::to_string(&store).unwrap()).unwrap();
+        assert_eq!(restored.settings.workspaces[&key].files_width, 360.);
+        assert!(restored.settings.workspaces[&key].files_open);
+        assert!(
+            Store::parse(&store.export().unwrap())
+                .unwrap()
+                .settings
+                .workspaces
+                .is_empty()
+        );
+        let mut changed = profile.clone();
+        changed.name = "Renamed".into();
+        assert_eq!(workspace_key(&changed), key);
+        changed.host = "second.test".into();
+        assert_ne!(workspace_key(&changed), key);
+        assert_eq!(changed.id, id);
+        changed = profile;
+        changed.id = 0;
+        let alias = workspace_key(&changed);
+        changed.name = "Second alias".into();
+        assert_ne!(workspace_key(&changed), alias);
+        assert!(!WorkspacePreference::default().files_open);
+        store.settings.workspaces.get_mut(&key).unwrap().files_width = f32::NAN;
+        assert!(store.validate().is_err());
+        store.settings.workspaces.get_mut(&key).unwrap().files_width = 1201.;
+        assert!(store.validate().is_err());
+    }
+    #[test]
     fn upload_destination_persists_and_is_reset_when_endpoint_changes() {
         let mut store = Store::default();
         let id = store
@@ -388,6 +474,7 @@ mod tests {
         assert!(!store.settings.sidebar_collapsed);
         assert!(!store.settings.reduced_motion);
         assert!(store.settings.last_connected.is_empty());
+        assert!(store.settings.workspaces.is_empty());
     }
     #[test]
     fn settings_round_trip_recency_is_local_and_values_are_validated() {

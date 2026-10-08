@@ -676,8 +676,7 @@ impl Render for ConnectionForm {
                     .flex()
                     .gap_2()
                     .child(
-                        Button::new("save-connect")
-                            .primary()
+                        crate::design::PrimaryAction::new("save-connect")
                             .label(tr("save-connect"))
                             .on_click(cx.listener(|this, _, _, cx| this.submit(true, cx))),
                     )

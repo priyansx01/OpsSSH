@@ -271,8 +271,7 @@ impl Workspace {
                                         }),
                                 )
                                 .child(
-                                    Button::new("save-upload-destination")
-                                        .primary()
+                                    crate::design::PrimaryAction::new("save-upload-destination")
                                         .label(tr(if checking {
                                             "upload-checking"
                                         } else {
