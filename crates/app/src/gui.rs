@@ -159,6 +159,7 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
                     workspace.sessions.push(Tab { id, name:"github-ismart".into(), endpoint:Some("git@github.com:22".into()), profile_id:None, upload_directory:None, keyboard_capture:false, persistent_name:None, protected:false, connected_at:Some(Instant::now()), page:SessionPage::Terminal, infrastructure:None, ssh_management:None, terminal:cx.new(|cx| TerminalView::preview_connected_local(window,cx)), color:environment_color("Development"), environment:"Development".into(), files:None, files_visible:false, files_width:0., workspace_key:None, follow:true, followed_directory:None, file_generation:0, files_needs_rebind:false });
                     workspace.navigation.active=None;
                 }
+                if screen.contains("hover") {workspace.hovered_card=Some(0);}
                 if screen.contains("list") {workspace.store.settings.server_view="list".into();}
                 if screen.contains("light") {crate::design::apply("light",window,cx);}
                 if screen.contains("files") || screen.contains("upload") {

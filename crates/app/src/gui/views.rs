@@ -12,6 +12,29 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+fn card_hover<E: gpui::Styled>(element: E, p: design::Palette) -> E {
+    let ruby: gpui::Hsla = rgb(p.ruby).into();
+    let glow = if p.canvas == design::LIGHT.canvas {
+        0xffedf1
+    } else {
+        0x2b151c
+    };
+    element
+        .bg(gpui::linear_gradient(
+            135.,
+            gpui::linear_color_stop(rgb(glow), 0.),
+            gpui::linear_color_stop(rgb(p.surface), 1.),
+        ))
+        .border_color(ruby.opacity(0.6))
+        .shadow(vec![gpui::BoxShadow {
+            color: ruby.opacity(0.08),
+            offset: gpui::point(px(0.), px(3.)),
+            blur_radius: px(16.),
+            spread_radius: px(0.),
+            inset: false,
+        }])
+}
+
 fn sidebar_label(key: &'static str, reduced: bool) -> AnyElement {
     let label = div().flex_1().min_w_0().truncate().child(tr(key));
     if reduced {
@@ -747,7 +770,8 @@ impl Workspace {
             .bg(rgb(p.surface))
             .border_1()
             .border_color(rgb(p.border))
-            .hover(|d| d.border_color(rgb(p.hover)))
+            .hover(|d| card_hover(d, p))
+            .when(self.hovered_card == Some(index), |d| card_hover(d, p))
             .flex()
             .gap_3()
             .when(!list, |d| d.flex_col())
