@@ -67,6 +67,24 @@ Native spring motion animates server cards, tabs, navigation, dialogs, and uploa
 feedback. Terminal typing and output stay immediate. Reduced motion removes
 movement and animated loading indicators.
 
+Right-click a file or folder, use its ⋯ button, or press Shift+F10 for file actions.
+Copy and Move choose a destination on the same server. Existing files require
+replacement confirmation; folders are never merged by these actions. Move uses
+the server's atomic rename extension for replacement, with no copy/delete fallback.
+Folder downloads skip symlinks; recursive deletion removes links without following
+their targets. Cancellation retains completed changes and reports partial results.
+
+Permissions provides presets, an advanced read/write/execute matrix, octal modes,
+special bits, and owner/group editing. Numeric ownership IDs work without shell
+name lookup. Recursive permissions apply the exact selected mode to both files
+and folders, including executable bits; symlinks are skipped. Only edited ownership
+fields propagate. Operations use the SSH login's privileges without automatic sudo.
+
+Open inside terminal prepares a quoted `cd` command without pressing Enter or
+interrupting a harness. Open in Terminal tab creates a separate shell on the same
+server. Returning from Files to Terminal keeps the file panel closed; open it
+manually with the terminal's Files button. New connections also start with it closed.
+
 ## Development tools
 
 ```sh

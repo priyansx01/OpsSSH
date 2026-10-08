@@ -6,14 +6,16 @@ use gpui::{
     Window, div, prelude::*, px, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable,
+    ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, WindowExt,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
-    menu::{DropdownMenu, PopupMenuItem},
+    menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
 };
-use opsssh_sftp::{Entry, SftpClient, TransferControl, WriteMode};
-use opsssh_ssh_core::SshCommand;
+use opsssh_sftp::{Entry, PermissionChange, RemoteAttributes, SftpClient, TransferControl};
+use opsssh_ssh_core::{ExecRequest, SshCommand};
 use std::{path::PathBuf, sync::Arc, time::Duration};
+mod actions;
+use actions::FileEditor;
 
 pub enum FilePaneEvent {
     ClosePanel,
@@ -22,6 +24,7 @@ pub enum FilePaneEvent {
     DestinationValidated(u64, String),
     DestinationFailed(u64, String),
     ChooseUploadDestination,
+    OpenTerminal { directory: String, new_tab: bool },
 }
 #[derive(Clone)]
 enum Job {
@@ -47,7 +50,29 @@ enum Job {
         control: TransferControl,
     },
     Mkdir(String),
-    Delete(String),
+    Delete {
+        path: String,
+        control: TransferControl,
+    },
+    Attributes {
+        path: String,
+        serial: u64,
+    },
+    Permissions {
+        path: String,
+        serial: u64,
+        expected: RemoteAttributes,
+        change: PermissionChange,
+        owner: Option<String>,
+        group: Option<String>,
+        control: TransferControl,
+    },
+    RemoteTransfer {
+        source: String,
+        target: String,
+        copy: bool,
+        control: TransferControl,
+    },
 }
 enum Update {
     Listed(String, Vec<Entry>),
@@ -60,6 +85,14 @@ enum Update {
     DestinationFailed(u64, String),
     Started(u64),
     Finished(u64, Result<(), String>),
+    Attributes {
+        serial: u64,
+        result: Result<(RemoteAttributes, String, String), String>,
+    },
+    PermissionsFinished {
+        serial: u64,
+        result: Result<(RemoteAttributes, String), String>,
+    },
 }
 struct QueuedJob {
     id: u64,
@@ -142,6 +175,8 @@ pub struct FilePane {
     worker_generation: u64,
     available: bool,
     pending_validation: Option<u64>,
+    editor: Option<FileEditor>,
+    editor_serial: u64,
     #[cfg(feature = "capture")]
     _preview_jobs: Option<Receiver<QueuedJob>>,
 }
@@ -262,6 +297,8 @@ impl FilePane {
             worker_generation: 0,
             available: true,
             pending_validation: None,
+            editor: None,
+            editor_serial: 0,
             _preview_jobs: Some(preview_jobs),
         }
     }
@@ -332,6 +369,8 @@ impl FilePane {
             worker_generation: 0,
             available: true,
             pending_validation: None,
+            editor: None,
+            editor_serial: 0,
             #[cfg(feature = "capture")]
             _preview_jobs: None,
         };
@@ -447,6 +486,12 @@ impl FilePane {
                             return;
                         }
                         match update {
+                            Update::Attributes { serial, result } => {
+                                this.receive_attributes(serial, result, window, cx);
+                            }
+                            Update::PermissionsFinished { serial, result } => {
+                                this.receive_permissions(serial, result, window, cx);
+                            }
                             Update::DestinationValidated(request, path) => {
                                 this.pending_validation = None;
                                 cx.emit(FilePaneEvent::DestinationValidated(request, path));
@@ -578,6 +623,8 @@ impl FilePane {
         self.available = false;
         self.pending = 0;
         self.pending_delete = None;
+        self.editor = None;
+        self.editor_serial = self.editor_serial.wrapping_add(1);
         if let Some(request) = self.pending_validation.take() {
             cx.emit(FilePaneEvent::DestinationFailed(
                 request,
@@ -737,9 +784,30 @@ impl FilePane {
                 format!("{} · {name}", tr("file-attachment")),
                 control.clone(),
             )),
+            Job::RemoteTransfer {
+                source,
+                copy,
+                control,
+                ..
+            } => Some((
+                format!(
+                    "{} · {source}",
+                    if *copy { "Copy" } else { "Move / rename" }
+                ),
+                control.clone(),
+            )),
+            Job::Delete { path, control } => Some((format!("Delete · {path}"), control.clone())),
+            Job::Permissions { path, control, .. } => {
+                Some((format!("Permissions · {path}"), control.clone()))
+            }
             _ => None,
         };
-        let retry = transfer.as_ref().map(|_| job.clone());
+        // Mutations need a fresh item review, rather than replaying old ownership
+        // or a partially completed delete/copy against a changed remote tree.
+        let retry = match &job {
+            Job::Upload { .. } | Job::Download { .. } | Job::Attachment { .. } => Some(job.clone()),
+            _ => None,
+        };
         match self.jobs.try_send(QueuedJob { id, job }) {
             Ok(()) => {
                 self.pending += 1;
@@ -910,36 +978,7 @@ impl FilePane {
         else {
             return;
         };
-        if entry.is_directory {
-            self.message = tr("file-select-download");
-            cx.notify();
-            return;
-        }
-        let directory = opsssh_platform::home_dir().unwrap_or_default();
-        let picker = cx.prompt_for_new_path(&directory, Some(&entry.name));
-        cx.spawn_in(window, async move |this, cx| match picker.await {
-            Ok(Ok(Some(local))) => {
-                let _ = this.update_in(cx, |this, _, cx| {
-                    let control = TransferControl::default();
-                    this.enqueue(
-                        Job::Download {
-                            remote: entry.path,
-                            local,
-                            control,
-                        },
-                        cx,
-                    );
-                });
-            }
-            Ok(Err(error)) => {
-                let _ = this.update_in(cx, |this, _, cx| {
-                    this.message = error.to_string();
-                    cx.notify();
-                });
-            }
-            _ => {}
-        })
-        .detach();
+        self.download_entry(entry, window, cx);
     }
 }
 impl FilePane {
@@ -1275,6 +1314,7 @@ impl FilePane {
             .hover(move |style| style.bg(hover));
         if grid {
             cell = cell
+                .relative()
                 .flex_col()
                 .p_3()
                 .gap_2()
@@ -1296,6 +1336,8 @@ impl FilePane {
                 .child(
                     div()
                         .text_sm()
+                        .flex_shrink_0()
+                        .h(px(20.))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .truncate()
                         .child(entry.name.clone()),
@@ -1351,6 +1393,29 @@ impl FilePane {
                 );
             }
         }
+        let target = entry.clone();
+        let overflow_target = entry.clone();
+        let weak = cx.entity().downgrade();
+        let overflow_view = weak.clone();
+        let options = Button::new(("file-options", index))
+            .ghost()
+            .small()
+            .icon(IconName::Ellipsis)
+            .tooltip("File actions")
+            .dropdown_menu(move |menu, _, cx| {
+                if let Some(view) = overflow_view.upgrade() {
+                    view.update(cx, |state, cx| {
+                        state.action_menu(overflow_target.clone(), menu, cx)
+                    })
+                } else {
+                    menu
+                }
+            });
+        cell = if grid {
+            cell.child(div().absolute().top_2().right_2().child(options))
+        } else {
+            cell.child(options)
+        };
         cell.on_click(
             cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                 this.list_focus.focus(window, cx);
@@ -1367,6 +1432,13 @@ impl FilePane {
                 cx.notify();
             }),
         )
+        .context_menu(move |menu, _, cx| {
+            if let Some(view) = weak.upgrade() {
+                view.update(cx, |state, cx| state.action_menu(target.clone(), menu, cx))
+            } else {
+                menu
+            }
+        })
         .into_any_element()
     }
 }
@@ -1479,11 +1551,7 @@ impl FilePane {
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let Some(entry) = this.selected.and_then(|index| this.entries.get(index))
                         {
-                            if entry.is_directory {
-                                this.message = tr("file-directory-delete-unavailable");
-                            } else {
-                                this.pending_delete = Some(entry.path.clone());
-                            }
+                            this.pending_delete = Some(entry.path.clone());
                         }
                         cx.notify();
                     })),
@@ -1971,11 +2039,7 @@ impl FilePane {
                                 if let Some(entry) =
                                     this.selected.and_then(|index| this.entries.get(index))
                                 {
-                                    if entry.is_directory {
-                                        this.message = tr("file-directory-delete-unavailable");
-                                    } else {
-                                        this.pending_delete = Some(entry.path.clone());
-                                    }
+                                    this.pending_delete = Some(entry.path.clone());
                                 }
                                 cx.notify();
                             })),
@@ -2023,7 +2087,7 @@ impl FilePane {
             .flex()
             .flex_col()
             .gap_2()
-            .child(tr("file-delete-confirm"))
+            .child("Permanently delete this item and everything inside it? This cannot be undone.")
             .child(div().text_xs().child(path))
             .child(
                 div()
@@ -2036,7 +2100,13 @@ impl FilePane {
                             .label(tr("file-delete-permanently"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(path) = this.pending_delete.take() {
-                                    this.enqueue(Job::Delete(path), cx);
+                                    this.enqueue(
+                                        Job::Delete {
+                                            path,
+                                            control: TransferControl::default(),
+                                        },
+                                        cx,
+                                    );
                                 }
                             })),
                     )
@@ -2229,6 +2299,11 @@ impl Render for FilePane {
                     .and_then(|index| this.visible.iter().position(|&i| i == index));
                 let step = this.columns;
                 match event.keystroke.key.as_str() {
+                    "f10" if event.keystroke.modifiers.shift => {
+                        this.keyboard_actions(window, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
                     "down" => {
                         this.selected = Some(
                             this.visible
@@ -2452,7 +2527,7 @@ async fn worker(
             Job::ValidateDestination { request, .. } => Some(*request),
             _ => None,
         };
-        let result = execute(&client, &home, job, &updates, id).await;
+        let result = execute(&client, &commands, &home, job, &updates, id).await;
         let result = result.map_err(|error| error.to_string());
         if let Err(error) = &result {
             let _ = updates.send(Update::Message(error.to_string())).await;
@@ -2493,6 +2568,7 @@ async fn upload_size(paths: &[PathBuf], control: &TransferControl) -> opsssh_sft
 }
 async fn execute(
     client: &SftpClient,
+    commands: &Sender<SshCommand>,
     home: &str,
     job: Job,
     updates: &Sender<Update>,
@@ -2554,16 +2630,14 @@ async fn execute(
             local,
             control,
         } => {
-            control.set_total(client.identity(&remote).await?.size);
-            let bytes = client
-                .download(&remote, &local, WriteMode::CreateNew, &control)
-                .await?;
+            let report = client.download_tree(&remote, &local, &control).await?;
             updates
                 .send(Update::Message(format!(
-                    "{}: {bytes} B",
+                    "{}: {report}",
                     tr("file-download-complete")
                 )))
                 .await?;
+            actions::report_result(&report)?;
         }
         Job::Attachment {
             bytes,
@@ -2594,10 +2668,119 @@ async fn execute(
                 .await?;
             refresh_parent(client, &path, updates).await;
         }
-        Job::Delete(path) => {
-            client.remove_file_confirmed(&path).await?;
-            updates.send(Update::Message(tr("file-deleted"))).await?;
+        Job::Delete { path, control } => {
+            let report = client.delete_tree(&path, &control).await?;
+            updates
+                .send(Update::Message(format!("Delete: {report}")))
+                .await?;
             refresh_parent(client, &path, updates).await;
+            actions::report_result(&report)?;
+        }
+        Job::Attributes { path, serial } => {
+            let result = actions::load_attributes(client, commands, &path)
+                .await
+                .map_err(|e| e.to_string());
+            updates.send(Update::Attributes { serial, result }).await?;
+        }
+        Job::Permissions {
+            path,
+            serial,
+            expected,
+            mut change,
+            owner,
+            group,
+            control,
+        } => {
+            let result = async {
+                if let Some(owner) = owner {
+                    change.uid = Some(actions::resolve_identity(commands, &owner, false).await?);
+                }
+                if let Some(group) = group {
+                    change.gid = Some(actions::resolve_identity(commands, &group, true).await?);
+                }
+                let report = client
+                    .change_permissions(&path, &expected, &change, &control)
+                    .await?;
+                let attrs = client.attributes(&path).await?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>((attrs, report))
+            }
+            .await;
+            let message = result
+                .as_ref()
+                .map(|(_, r)| r.to_string())
+                .map_err(|e| e.to_string());
+            updates
+                .send(Update::PermissionsFinished {
+                    serial,
+                    result: result
+                        .as_ref()
+                        .map(|(a, r)| (a.clone(), r.to_string()))
+                        .map_err(|e| e.to_string()),
+                })
+                .await?;
+            refresh_parent(client, &path, updates).await;
+            let (_, report) = result?;
+            updates
+                .send(Update::Message(format!("Permissions: {}", message?)))
+                .await?;
+            actions::report_result(&report)?;
+        }
+        Job::RemoteTransfer {
+            source,
+            target,
+            copy,
+            control,
+        } => {
+            let (source, target) = client.transfer_target(&source, &target).await?;
+            let mut replace = false;
+            let mut atomic = None;
+            let mut reviewed = None;
+            if client.exists(&target).await? {
+                let a = client.attributes(&target).await?;
+                let s = client.attributes(&source).await?;
+                if a.is_directory || a.is_symlink || !a.is_regular || !s.is_regular {
+                    return Err(
+                        "Destination exists. Choose another name; folders are never merged.".into(),
+                    );
+                }
+                if !copy {
+                    atomic = Some(actions::atomic_renamer(commands, &control).await?);
+                }
+                reviewed = Some((s, a));
+                request_upload_replacement(updates, id, target.clone(), &control).await?;
+                replace = true;
+            }
+            if let Some((s, a)) = &reviewed
+                && (client.attributes(&source).await? != *s
+                    || client.attributes(&target).await? != *a)
+            {
+                return Err(
+                    "Source or destination changed during confirmation; review again".into(),
+                );
+            }
+            let result = if copy {
+                client
+                    .copy_tree(&source, &target, replace, &control)
+                    .await
+                    .and_then(|r| {
+                        actions::report_result(&r)?;
+                        Ok(r.to_string())
+                    })
+            } else if let Some(renamer) = atomic {
+                let (s, a) = reviewed.as_ref().ok_or("Missing replacement review")?;
+                renamer
+                    .replace(&source, &target, s, a, &control)
+                    .await
+                    .map(|()| "Moved and replaced atomically".into())
+            } else {
+                client
+                    .rename_item(&source, &target, &control)
+                    .await
+                    .map(|()| "Moved successfully".into())
+            };
+            refresh_parent(client, &source, updates).await;
+            refresh_parent(client, &target, updates).await;
+            updates.send(Update::Message(result?)).await?;
         }
     }
     Ok(())

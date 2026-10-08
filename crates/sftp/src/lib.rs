@@ -16,6 +16,10 @@ use std::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+mod operations;
+pub use operations::{
+    AtomicRenamer, OperationReport, PermissionChange, RemoteAttributes, parse_mode, symbolic_mode,
+};
 #[derive(Debug)]
 struct UploadCollision(FileAttributes);
 impl fmt::Display for UploadCollision {
@@ -93,6 +97,7 @@ pub struct SftpClient {
     session: SftpSession,
     host_key: String,
     slots: tokio::sync::Semaphore,
+    symlink_target_first: tokio::sync::Mutex<Option<bool>>,
 }
 impl fmt::Debug for SftpClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -112,6 +117,7 @@ impl SftpClient {
             session: SftpSession::new(stream).await?,
             host_key,
             slots: tokio::sync::Semaphore::new(3),
+            symlink_target_first: tokio::sync::Mutex::new(None),
         })
     }
     pub async fn canonicalize(&self, path: &str) -> Result<String> {

@@ -159,6 +159,7 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
                     if screen.contains("upload-complete") {tab.files.as_ref().unwrap().update(cx,|files,cx|files.preview_completed_upload("'/srv/uploads/screenshot.png' ".into(),cx));}
                     if screen.contains("upload-replace") {tab.files.as_ref().unwrap().update(cx,|files,cx|files.preview_upload_replacement(cx));}
                     if screen.contains("session") && screen.contains("files") {tab.page=SessionPage::Files;tab.files.as_ref().unwrap().update(cx,|f,cx|f.set_full_page(true,cx));}
+                    if screen.contains("permissions") {let files=tab.files.as_ref().unwrap().clone();let advanced=screen.contains("advanced");window.on_next_frame(move|window,cx|{files.update(cx,|pane,cx|pane.preview_permissions(advanced,window,cx));});}
                 }
                 if screen.contains("session") || screen.contains("close") || screen.contains("background") {
                     if workspace.sessions.is_empty(){workspace.open_local(&OpenLocalTerminal,window,cx);}
@@ -566,9 +567,12 @@ impl Workspace {
         };
         if page == SessionPage::Files {
             let terminal = self.sessions[index].terminal.clone();
-            if self.ensure_files(&terminal, window, cx).is_none() {
+            if self.background_files(&terminal, window, cx).is_none() {
                 return;
             }
+        }
+        if page == SessionPage::Terminal {
+            self.sessions[index].files_visible = false;
         }
         if page == SessionPage::Infrastructure && self.sessions[index].infrastructure.is_none() {
             let terminal = self.sessions[index].terminal.read(cx);
@@ -917,6 +921,16 @@ impl Workspace {
         cx.notify();
     }
     fn connect(&mut self, profile: Profile, window: &mut Window, cx: &mut Context<Self>) {
+        self.connect_shell(profile, None, None, window, cx);
+    }
+    fn connect_shell(
+        &mut self,
+        profile: Profile,
+        options: Option<opsssh_ssh_core::ConnectionOptions>,
+        mut directory: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let endpoint = format!("{}@{}:{}", profile.user, profile.host, profile.port);
         if profile.tmux_session.is_some()
             && let Some(id) = self
@@ -936,7 +950,10 @@ impl Workspace {
             self.activate_session(id, window, cx);
             return;
         }
-        match crate::connections::options(&profile, &self.store) {
+        match options
+            .map(Ok)
+            .unwrap_or_else(|| crate::connections::options(&profile, &self.store))
+        {
             Ok(options) => {
                 let terminal = cx.new(|cx| {
                     let mut terminal = TerminalView::connect(options, window, cx);
@@ -968,6 +985,14 @@ impl Workspace {
                             == opsssh_term_core::SessionState::Connected
                     {
                         recorded = true;
+                        if let Some(path) = directory.take()
+                            && let Ok(quoted) = opsssh_drop::quote(&path, opsssh_drop::Shell::Posix)
+                            && let Some(commands) = terminal.read(cx).ssh_commands()
+                        {
+                            let _ = commands.try_send(opsssh_ssh_core::SshCommand::Write(
+                                format!("cd -- {quoted}\r").into_bytes(),
+                            ));
+                        }
                         let old = this.store.clone();
                         let timestamp = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -1118,7 +1143,8 @@ impl Workspace {
                     color: environment_color(&profile.environment),
                     environment: profile.environment.clone(),
                     files: None,
-                    files_visible: preference.files_open,
+                    // Terminal files are opened only by the Files button.
+                    files_visible: false,
                     files_width: preference.files_width,
                     workspace_key: Some(workspace_key),
                     follow: true,
@@ -1308,6 +1334,59 @@ impl Workspace {
         cx.notify();
         Some(pane)
     }
+    fn open_terminal_directory(
+        &mut self,
+        pane: &Entity<FilePane>,
+        directory: &str,
+        new_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self
+            .sessions
+            .iter()
+            .position(|tab| tab.files.as_ref() == Some(pane))
+        else {
+            return;
+        };
+        let Ok(quoted) = opsssh_drop::quote(directory, opsssh_drop::Shell::Posix) else {
+            return;
+        };
+        let terminal = self.sessions[index].terminal.clone();
+        if terminal.read(cx).session_state() != opsssh_term_core::SessionState::Connected {
+            return;
+        }
+        if new_tab {
+            let Some(options) = terminal.read(cx).fresh_shell_options() else {
+                return;
+            };
+            let tab = &self.sessions[index];
+            let profile = Profile {
+                id: tab.profile_id.unwrap_or_default(),
+                name: tab.name.clone(),
+                host: options.host.clone(),
+                user: options.username.clone(),
+                port: options.port,
+                environment: tab.environment.clone(),
+                terminal_upload_directory: tab.upload_directory.clone(),
+                ..Profile::default()
+            };
+            self.connect_shell(
+                profile,
+                Some(options),
+                Some(directory.to_owned()),
+                window,
+                cx,
+            );
+        } else {
+            let id = self.sessions[index].id;
+            self.select_page(id, SessionPage::Terminal, window, cx);
+            terminal.update(cx, |view, cx| {
+                view.insert_text(&format!("cd -- {quoted}"), cx);
+                view.focus(window, cx);
+            });
+        }
+    }
     fn background_files(
         &mut self,
         terminal: &Entity<TerminalView>,
@@ -1337,6 +1416,10 @@ impl Workspace {
         cx.observe(&files, |_, _, cx| cx.notify()).detach();
         cx.subscribe_in(&files, window, move |this, pane, event, window, cx| {
             let (id, text) = match event {
+                FilePaneEvent::OpenTerminal { directory, new_tab } => {
+                    this.open_terminal_directory(pane, directory, *new_tab, window, cx);
+                    return;
+                }
                 FilePaneEvent::ChooseUploadDestination => {
                     if let Some(id) = this
                         .sessions
@@ -1557,6 +1640,70 @@ mod tests {
             workspace.update(cx, |this, cx| {
                 assert_eq!(window.focused(cx), Some(this.home_focus.clone()))
             });
+        });
+    }
+
+    #[gpui::test]
+    fn returning_to_terminal_never_reopens_files_until_manual_button(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let mut workspace = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| fixture(window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        VisualTestContext::update(cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                let index = this.session_index(this.navigation.active.unwrap()).unwrap();
+                let id = this.sessions[index].id;
+                let files = cx.new(|cx| FilePane::preview(window, cx));
+                this.sessions[index].files = Some(files.clone());
+                this.sessions[index].files_visible = false;
+                this.select_page(id, SessionPage::Files, window, cx);
+                assert!(!this.sessions[index].files_visible);
+                this.select_page(id, SessionPage::Terminal, window, cx);
+                this.activate_session(id, window, cx);
+                assert!(!this.sessions[index].files_visible);
+                let terminal = this.sessions[index].terminal.clone();
+                this.ensure_files(&terminal, window, cx);
+                assert!(this.sessions[index].files_visible);
+                this.select_page(id, SessionPage::Terminal, window, cx);
+                assert!(!this.sessions[index].files_visible);
+                assert_eq!(this.sessions[index].files.as_ref(), Some(&files));
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn file_terminal_action_prepares_quoted_cd_without_enter(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let mut workspace = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| fixture(window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        VisualTestContext::update(cx, |window, cx| {
+            workspace.as_ref().unwrap().update(cx, |this, cx| {
+                let index = this.session_index(this.navigation.active.unwrap()).unwrap();
+                let terminal = cx.new(|cx| TerminalView::preview_connected_local(window, cx));
+                let pane = cx.new(|cx| FilePane::preview(window, cx));
+                this.sessions[index].terminal = terminal.clone();
+                this.sessions[index].files = Some(pane.clone());
+                this.sessions[index].page = SessionPage::Files;
+                this.sessions[index].files_visible = true;
+                let path = "/srv/a b'雪";
+                this.open_terminal_directory(&pane, path, false, window, cx);
+                let expected = format!(
+                    "cd -- {}",
+                    opsssh_drop::quote(path, opsssh_drop::Shell::Posix).unwrap()
+                );
+                assert_eq!(terminal.read(cx).preview_sent_input(), expected.as_bytes());
+                assert!(!expected.contains(['\r', '\n']));
+                assert!(!this.sessions[index].files_visible);
+                assert_eq!(this.sessions[index].page, SessionPage::Terminal);
+            })
         });
     }
 

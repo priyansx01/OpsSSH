@@ -191,6 +191,14 @@ impl TerminalView {
             .as_ref()
             .is_some_and(|o| o.tmux.is_some())
     }
+    /// Reuse this session's immutable endpoint/auth configuration for a new shell.
+    pub fn fresh_shell_options(&self) -> Option<ConnectionOptions> {
+        self.connection_options.clone().map(|mut options| {
+            options.tmux = None;
+            options.reconnect = false;
+            options
+        })
+    }
     fn connect_without_protection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.tmux_missing {
             return;
