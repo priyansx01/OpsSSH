@@ -1103,7 +1103,9 @@ impl Workspace {
                         range
                             .map(|row| {
                                 div()
-                                    .h(px(if list { 144. } else { 256. }))
+                                    // Leave room inside the scroll clip for the hover lift and glow.
+                                    .h(px(if list { 148. } else { 264. }))
+                                    .pt_2()
                                     .pb_4()
                                     .flex()
                                     .gap_4()
