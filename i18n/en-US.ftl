@@ -115,7 +115,7 @@ settings-font-help = Text size applies to open sessions and new terminals.
 font-decrease = Decrease terminal text size
 font-increase = Increase terminal text size
 settings-shortcuts = Keyboard shortcuts
-settings-terminal-shortcuts = Terminal keys go directly to your shell or terminal app. Workspace and clipboard shortcuts are paused on the Terminal page. Use the buttons to navigate and the right-click menu to copy, paste, or send Alt+Tab to the VM.
+settings-terminal-shortcuts = Terminal keys go directly to your shell or terminal app. Workspace and clipboard shortcuts are paused on the Terminal page. Use the buttons to navigate and right-click to copy or paste. On Windows, Keyboard captured sends system shortcuts to the VM; Ctrl+Alt+F12 releases capture.
 settings-data = Connection profiles
 settings-data-help = Import or export connection profiles without passwords or private key contents.
 help-description = Start with New connection, enter a host and username, and choose how to sign in. Passwords are requested securely when connecting. Review the server fingerprint before trusting a new host. Open Files from an authenticated session to browse and transfer remote files.
@@ -185,6 +185,20 @@ term-copy = Copy
 term-paste = Paste
 term-select-all = Select all
 term-send-alt-tab = Send Alt+Tab to VM
+keyboard-captured = Keyboard captured
+keyboard-released = Keyboard released
+keyboard-capture-help = Send system shortcuts to the VM. Ctrl+Alt+F12 releases capture.
+upload-destination = Upload destination
+upload-destination-title = Terminal upload destination
+upload-destination-help = Choose an existing remote folder. File drops upload in the background and insert their path without opening Files.
+upload-remember = Remember for this server
+upload-browse = Browse this path
+upload-use-folder = Use this folder
+upload-checking = Checking folder…
+upload-invalid-directory = Enter a valid remote folder path.
+upload-copy-path = Copy path
+upload-insert-path = Insert path
+form-upload-directory = Terminal uploads → Destination
 term-dismiss = Dismiss
 
 term-sign-in-title = Sign in to your server
@@ -296,3 +310,7 @@ infra-swap = swap
 infra-root-disk = Root disk
 infra-processes = Processes
 infra-process-cpu-help = CPU: 100% = one core
+
+keyboard-capture-failed = Keyboard capture was released after a delivery failure. Restart to enable it again; terminal keys and Send Alt+Tab remain available.
+
+keyboard-paused = Capture paused

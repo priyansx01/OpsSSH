@@ -189,6 +189,9 @@ pub fn set_reduced_motion(reduced: bool, cx: &mut App) {
     cx.set_reduce_motion(reduced);
     Theme::update(cx, |theme| {
         theme.motion = Default::default();
+        theme.motion.duration_fast = std::time::Duration::from_millis(120);
+        theme.motion.duration_normal = std::time::Duration::from_millis(190);
+        theme.motion.duration_slow = std::time::Duration::from_millis(280);
         if reduced {
             theme.motion.duration_fast = std::time::Duration::ZERO;
             theme.motion.duration_normal = std::time::Duration::ZERO;
@@ -197,6 +200,17 @@ pub fn set_reduced_motion(reduced: bool, cx: &mut App) {
             theme.motion.distance_medium = gpui::rems(0.);
         }
     });
+}
+
+/// A short underdamped entrance; bounded properties clamp its overshoot.
+pub fn spring_out(t: f32) -> f32 {
+    if t <= 0. {
+        return 0.;
+    }
+    if t >= 1. {
+        return 1.;
+    }
+    1. - (1. - t).powi(3) * (10. * t).cos()
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 use crate::connection_form::{ConnectionForm, FormEvent};
 use crate::files::{FilePane, FilePaneEvent};
 mod session_tabs;
+mod terminal_uploads;
 mod views;
 use crate::infrastructure::InfrastructureView;
 use crate::localization::text as tr;
@@ -31,6 +32,9 @@ enum SessionPage {
 struct Tab {
     id: SessionId,
     endpoint: Option<String>,
+    profile_id: Option<u64>,
+    upload_directory: Option<String>,
+    keyboard_capture: bool,
     persistent_name: Option<String>,
     protected: bool,
     connected_at: Option<Instant>,
@@ -49,6 +53,8 @@ struct Tab {
 }
 struct Workspace {
     home_focus: FocusHandle,
+    capture: Option<opsssh_platform::keyboard_capture::KeyboardCapture>,
+    upload_dialog: Option<terminal_uploads::UploadDialog>,
     _terminal_focus: Vec<gpui::Subscription>,
     search: Entity<InputState>,
     store: Store,
@@ -64,6 +70,7 @@ struct Workspace {
     help_page: bool,
     message: String,
     filter: String,
+    hovered_card: Option<usize>,
     config: Vec<(Profile, Vec<String>)>,
     launched: Instant,
     first_frame_recorded: bool,
@@ -98,6 +105,7 @@ fn bind_workspace_keys(cx: &mut App) {
 
 fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
     let launched = Instant::now();
+    let enable_native_capture = capture_path.is_none();
     opsssh_platform::application().with_assets(gpui_kit_assets::AllAssets).run(move|cx:&mut App|{
     gpui_component::init(cx);Theme::change(ThemeMode::Dark,None,cx);
     bind_workspace_keys(cx);
@@ -118,7 +126,7 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
             let (path,mut message)=match opsssh_platform::app_data_dir(){Ok(dir)=>(dir.join("servers.toml"),String::new()),Err(error)=>(PathBuf::new(),format!("Cannot locate settings folder: {error}"))};
             let mut load_failed=false;
             let store=if path.as_os_str().is_empty(){load_failed=true;Store::default()}else{match Store::load(&path){Ok(store)=>store,Err(error)=>{message=format!("Cannot load servers. Fix the settings file before saving: {error}");load_failed=true;Store::default()}}};
-            let mut workspace=Workspace{home_focus,_terminal_focus:terminal_focus,search,store,path,sessions:vec![],navigation:SessionTabs::default(),transition:0,pending_close:None,quit_dialog:false,uptime_timer:None,editor:None,settings_page:false,help_page:false,message,filter:"All servers".into(),config:vec![],launched,first_frame_recorded:false,load_failed};
+            let mut workspace=Workspace{home_focus,capture:None,upload_dialog:None,_terminal_focus:terminal_focus,search,store,path,sessions:vec![],navigation:SessionTabs::default(),transition:0,pending_close:None,quit_dialog:false,uptime_timer:None,editor:None,settings_page:false,help_page:false,message,filter:"All servers".into(),hovered_card:None,config:vec![],launched,first_frame_recorded:false,load_failed};
             crate::design::apply(&workspace.store.settings.theme,window,cx);
             crate::design::set_reduced_motion(workspace.store.settings.reduced_motion,cx);
             crate::design::observe_system(window).detach();
@@ -134,16 +142,17 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
                 }
                 if screen.contains("list") {workspace.store.settings.server_view="list".into();}
                 if screen.contains("light") {crate::design::apply("light",window,cx);}
-                if screen.contains("files") {
+                if screen.contains("files") || screen.contains("upload") {
                     workspace.open_local(&OpenLocalTerminal,window,cx);
                     let files=cx.new(|cx|if screen.contains("files-list") {FilePane::preview_list(window,cx)}else{FilePane::preview(window,cx)});
-                    let tab=workspace.sessions.last_mut().unwrap();tab.files=Some(files);tab.files_visible=true;
-                    if screen.contains("session") {tab.page=SessionPage::Files;tab.files.as_ref().unwrap().update(cx,|f,cx|f.set_full_page(true,cx));}
+                    let tab=workspace.sessions.last_mut().unwrap();tab.files=Some(files);tab.files_visible=screen.contains("files");
+                    if screen.contains("upload-progress") || screen.contains("upload-failed") {tab.files.as_ref().unwrap().update(cx,|files,_|files.preview_transfer(screen.contains("failed")));}
+                    if screen.contains("session") && screen.contains("files") {tab.page=SessionPage::Files;tab.files.as_ref().unwrap().update(cx,|f,cx|f.set_full_page(true,cx));}
                 }
                 if screen.contains("session") || screen.contains("close") || screen.contains("background") {
                     if workspace.sessions.is_empty(){workspace.open_local(&OpenLocalTerminal,window,cx);}
                     let tab=workspace.sessions.last_mut().unwrap();
-                    tab.name="Atlas development VM".into();tab.endpoint=Some("deploy@atlas.example.test:22".into());tab.environment="Development".into();tab.protected=true;tab.persistent_name=Some("harness".into());
+                    tab.keyboard_capture=true;tab.name="Atlas development VM".into();tab.endpoint=Some("deploy@atlas.example.test:22".into());tab.environment="Development".into();tab.protected=true;tab.persistent_name=Some("harness".into());
                     if screen.contains("clipboard") {
                         let terminal=tab.terminal.clone();
                         let timer=cx.background_executor().timer(std::time::Duration::from_millis(900));
@@ -153,6 +162,10 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
                     if screen.contains("background") {workspace.navigation.hide(tab.id);}
                     if screen.contains("close") {let id=tab.id;let this=cx.entity().downgrade();window.on_next_frame(move|window,cx|{let _=this.update(cx,|this,cx|this.request_close(id,window,cx));});}
                 }
+                if screen.contains("upload-destination") {
+                    let id=workspace.sessions.last().unwrap().id;let this=cx.entity().downgrade();
+                    window.on_next_frame(move|window,cx|{let _=this.update(cx,|this,cx|this.choose_upload_destination(id,vec![],window,cx));});
+                }
                 if screen.contains("settings") {workspace.settings_page=true;}
                 if screen.contains("connection") {let this=cx.entity().downgrade();window.on_next_frame(move|window,cx|{let _=this.update(cx,|this,cx|this.new_server(&NewServer,window,cx));});}
                 if screen.contains("key") {let this=cx.entity().downgrade();window.on_next_frame(move|window,cx|{let _=this.update(cx,|this,cx|this.edit(Profile{host:"host.example.test".into(),user:"deploy".into(),auth:opsssh_store::Auth::Key,..Profile::default()},window,cx));});}
@@ -160,6 +173,7 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
             #[cfg(not(feature="capture"))]let _=capture_path;
             workspace
         });
+        if enable_native_capture {workspace.update(cx,|this,cx|this.install_keyboard_capture(window,cx));}
         let weak=workspace.downgrade();
         window.on_window_should_close(cx,move|window,cx| {weak.update(cx,|this,cx| this.quit(&Quit,window,cx)).is_err()});
         cx.new(|cx|Root::new(workspace,window,cx))
@@ -167,6 +181,86 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
 });
 }
 impl Workspace {
+    fn install_keyboard_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if opsssh_platform::info().os != "windows" {
+            return;
+        }
+        match opsssh_platform::keyboard_capture::KeyboardCapture::new(window) {
+            Ok(capture) => {
+                let receive = capture.events();
+                self.capture = Some(capture);
+                self._terminal_focus.push(
+                    cx.observe_window_activation(window, |this, window, cx| {
+                        this.update_keyboard_capture(window, cx)
+                    }),
+                );
+                cx.spawn_in(window, async move |this, cx| {
+                    while let Ok(event) = receive.recv().await {
+                        if this
+                            .update_in(cx, |this, window, cx| {
+                                let Some(index) = this.session_index(SessionId(event.target))
+                                else {
+                                    return;
+                                };
+                                if event.release_capture {
+                                    this.sessions[index].keyboard_capture = false;
+                                    this.update_keyboard_capture(window, cx);
+                                    cx.notify();
+                                } else if this.navigation.active == Some(SessionId(event.target))
+                                    && this.terminal_visible()
+                                    && !window.has_active_dialog(cx)
+                                    && this.sessions[index]
+                                        .terminal
+                                        .read(cx)
+                                        .accepts_terminal_keys(window)
+                                {
+                                    this.sessions[index].terminal.update(cx, |terminal, cx| {
+                                        terminal.captured_key(event, cx)
+                                    });
+                                }
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+            Err(error) => {
+                self.message = format!(
+                    "Keyboard capture unavailable: {error}. Terminal shortcuts still pass through; use Send Alt+Tab from the menu."
+                )
+            }
+        }
+    }
+
+    fn update_keyboard_capture(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let target = if self.terminal_visible()
+            && self.editor.is_none()
+            && self.pending_close.is_none()
+            && !self.quit_dialog
+            && self.upload_dialog.is_none()
+            && !window.has_active_dialog(cx)
+        {
+            self.navigation
+                .active
+                .and_then(|id| self.session_index(id))
+                .and_then(|index| {
+                    let tab = &self.sessions[index];
+                    let terminal = tab.terminal.read(cx);
+                    (tab.keyboard_capture
+                        && tab.endpoint.is_some()
+                        && terminal.accepts_terminal_keys(window))
+                    .then_some((tab.id.0, terminal.connection_generation()))
+                })
+        } else {
+            None
+        };
+        if let Some(capture) = &self.capture {
+            capture.set_target(target);
+        }
+    }
     fn terminal_focus_subscriptions(
         home: &FocusHandle,
         window: &mut Window,
@@ -197,6 +291,8 @@ impl Workspace {
             || self.editor.is_some()
             || self.pending_close.is_some()
             || self.quit_dialog
+            || self.upload_dialog.is_some()
+            || window.has_active_dialog(cx)
         {
             return;
         }
@@ -253,6 +349,9 @@ impl Workspace {
         self.sessions.push(Tab {
             id,
             endpoint: None,
+            profile_id: None,
+            upload_directory: None,
+            keyboard_capture: false,
             persistent_name: None,
             protected: false,
             connected_at: Some(Instant::now()),
@@ -655,7 +754,26 @@ impl Workspace {
                     match this.store.upsert(profile.clone()) {
                         Ok(id) => {
                             profile.id = id;
+                            profile.terminal_upload_directory = this
+                                .store
+                                .servers
+                                .iter()
+                                .find(|p| p.id == id)
+                                .and_then(|p| p.terminal_upload_directory.clone());
                             if this.persist() {
+                                let endpoint =
+                                    format!("{}@{}:{}", profile.user, profile.host, profile.port);
+                                for tab in &mut this.sessions {
+                                    if tab.profile_id == Some(id) {
+                                        if tab.endpoint.as_deref() == Some(&endpoint) {
+                                            tab.upload_directory =
+                                                profile.terminal_upload_directory.clone();
+                                        } else {
+                                            tab.profile_id = None;
+                                            tab.upload_directory = None;
+                                        }
+                                    }
+                                }
                                 this.editor = None;
                                 window.close_dialog(cx);
                                 if *connect {
@@ -738,28 +856,20 @@ impl Workspace {
                 self.help_page = false;
                 let profile_id = profile.id;
                 let mut recorded = false;
-                cx.subscribe_in(&terminal, window, |this, terminal, event, window, cx| {
-                    let Some(pane) = this.ensure_files(terminal, window, cx) else {
-                        return;
-                    };
-                    match event {
+                cx.subscribe_in(
+                    &terminal,
+                    window,
+                    |this, terminal, event, window, cx| match event {
                         TerminalViewEvent::UploadFiles(paths) => {
-                            let view = terminal.read(cx);
-                            let target = if view.at_shell_prompt() {
-                                view.current_directory().map(str::to_owned)
-                            } else {
-                                None
-                            };
-                            let insert = target.is_none();
-                            pane.update(cx, |pane, cx| {
-                                pane.upload_files(paths.clone(), target, insert, cx)
-                            });
+                            this.terminal_drop(terminal, paths.clone(), window, cx)
                         }
                         TerminalViewEvent::UploadClipboard(item) => {
-                            pane.update(cx, |pane, cx| pane.upload_clipboard(item.clone(), cx))
+                            if let Some(pane) = this.background_files(terminal, window, cx) {
+                                pane.update(cx, |pane, cx| pane.upload_clipboard(item.clone(), cx));
+                            }
                         }
-                    }
-                })
+                    },
+                )
                 .detach();
                 cx.observe_in(&terminal, window, move |this, terminal, window, cx| {
                     if !recorded
@@ -859,6 +969,9 @@ impl Workspace {
                 let id = self.navigation.allocate();
                 self.sessions.push(Tab {
                     id,
+                    profile_id: (profile.id != 0).then_some(profile.id),
+                    upload_directory: profile.terminal_upload_directory.clone(),
+                    keyboard_capture: true,
                     endpoint: Some(format!(
                         "{}@{}:{}",
                         profile.user, profile.host, profile.port
@@ -898,11 +1011,27 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<FilePane>> {
+        let pane = self.background_files(terminal, window, cx)?;
+        if let Some(tab) = self
+            .sessions
+            .iter_mut()
+            .find(|tab| &tab.terminal == terminal)
+        {
+            tab.files_visible = true;
+        }
+        cx.notify();
+        Some(pane)
+    }
+    fn background_files(
+        &mut self,
+        terminal: &Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<FilePane>> {
         let index = self
             .sessions
             .iter()
             .position(|tab| &tab.terminal == terminal)?;
-        self.sessions[index].files_visible = true;
         if let Some(files) = &self.sessions[index].files {
             return Some(files.clone());
         }
@@ -919,20 +1048,51 @@ impl Workspace {
         let generation = view.connection_generation();
         let files =
             cx.new(|cx| FilePane::new(commands, fingerprint, directory.clone(), window, cx));
-        cx.subscribe(&files, move |this, pane, event, cx| {
-            let FilePaneEvent::InsertText(text) = event;
+        cx.observe(&files, |_, _, cx| cx.notify()).detach();
+        cx.subscribe_in(&files, window, move |this, pane, event, window, cx| {
+            let (id, text) = match event {
+                FilePaneEvent::InsertText(id, text) => (id, text),
+                FilePaneEvent::FocusTerminal => {
+                    if this.sessions.iter().any(|tab| {
+                        tab.files.as_ref() == Some(pane) && this.navigation.active == Some(tab.id)
+                    }) {
+                        this.restore_terminal_focus(window, cx);
+                    }
+                    return;
+                }
+                FilePaneEvent::DestinationValidated(request, path) => {
+                    this.destination_validated(pane, *request, path.clone(), window, cx);
+                    return;
+                }
+                FilePaneEvent::DestinationFailed(request, error) => {
+                    this.destination_failed(pane, *request, error.clone(), cx);
+                    return;
+                }
+            };
             // FilePane discards old worker updates; also require this pane's current live transport.
             if let Some(tab) = this
                 .sessions
                 .iter()
-                .find(|s| s.files.as_ref() == Some(&pane))
+                .find(|s| s.files.as_ref() == Some(pane))
                 && !tab.files_needs_rebind
                 && tab.terminal.read(cx).connection_generation() == tab.file_generation
                 && tab.terminal.read(cx).session_state()
                     == opsssh_term_core::SessionState::Connected
             {
-                tab.terminal
-                    .update(cx, |terminal, cx| terminal.insert_text(text, cx));
+                if this.navigation.active == Some(tab.id)
+                    && this.terminal_visible()
+                    && this.editor.is_none()
+                    && this.pending_close.is_none()
+                    && !this.quit_dialog
+                    && this.upload_dialog.is_none()
+                    && !window.has_active_dialog(cx)
+                    && tab.terminal.read(cx).accepts_terminal_keys(window)
+                {
+                    tab.terminal
+                        .update(cx, |terminal, cx| terminal.insert_text(text, cx));
+                } else {
+                    pane.update(cx, |pane, cx| pane.defer_insert(*id, cx));
+                }
             }
         })
         .detach();
@@ -1038,6 +1198,67 @@ mod tests {
     use super::*;
     use gpui::{Focusable, TestAppContext, VisualTestContext};
 
+    #[gpui::test]
+    fn terminal_drops_keep_files_closed_and_remember_the_chosen_destination(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let mut workspace = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| fixture(window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        let terminal = VisualTestContext::update(cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                let index = this.session_index(this.navigation.active.unwrap()).unwrap();
+                let terminal = cx.new(|cx| TerminalView::preview_connected_local(window, cx));
+                let pane = cx.new(|cx| FilePane::preview(window, cx));
+                this.sessions[index].terminal = terminal.clone();
+                this.sessions[index].files = Some(pane);
+                terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+                terminal
+            })
+        });
+        VisualTestContext::update(cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                let index = this.session_index(this.navigation.active.unwrap()).unwrap();
+                this.terminal_drop(&terminal, vec![PathBuf::from("first.txt")], window, cx);
+                assert!(!this.sessions[index].files_visible);
+                assert_eq!(this.sessions[index].page, SessionPage::Terminal);
+                assert!(this.upload_dialog.is_some());
+            })
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        VisualTestContext::update(cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                assert!(this.upload_dialog.is_none());
+                let index = this.session_index(this.navigation.active.unwrap()).unwrap();
+                let terminal = this.sessions[index].terminal.clone();
+                this.terminal_drop(&terminal, vec![PathBuf::from("second.txt")], window, cx);
+                let dialog = this.upload_dialog.as_mut().unwrap();
+                dialog.checking = true;
+                let pane = dialog.pane.clone();
+                let request = dialog.request;
+                this.destination_validated(&pane, request + 1, "/wrong".into(), window, cx);
+                assert!(this.upload_dialog.is_some());
+                this.destination_validated(&pane, request, "/srv/uploads".into(), window, cx);
+                assert!(this.upload_dialog.is_none());
+                assert_eq!(
+                    this.sessions[index].upload_directory.as_deref(),
+                    Some("/srv/uploads")
+                );
+                this.terminal_drop(&terminal, vec![PathBuf::from("third.txt")], window, cx);
+                assert!(this.upload_dialog.is_none());
+                assert!(!this.sessions[index].files_visible);
+                assert_eq!(pane.read(cx).active_transfers(), 2);
+                terminal.update(cx, |terminal, cx| terminal.disconnect(cx));
+            })
+        });
+    }
+
     fn fixture(window: &mut Window, cx: &mut Context<Workspace>) -> Workspace {
         let home_focus = cx.focus_handle();
         let terminal_focus = Workspace::terminal_focus_subscriptions(&home_focus, window, cx);
@@ -1056,6 +1277,9 @@ mod tests {
                 Tab {
                     id,
                     endpoint: Some("deploy@fixture.invalid:22".into()),
+                    profile_id: None,
+                    upload_directory: None,
+                    keyboard_capture: true,
                     persistent_name: None,
                     protected: false,
                     connected_at: None,
@@ -1076,6 +1300,8 @@ mod tests {
             .collect();
         Workspace {
             home_focus,
+            capture: None,
+            upload_dialog: None,
             _terminal_focus: terminal_focus,
             search: cx.new(|cx| InputState::new(window, cx)),
             store: Store::default(),
@@ -1091,6 +1317,7 @@ mod tests {
             help_page: false,
             message: String::new(),
             filter: "All servers".into(),
+            hovered_card: None,
             config: vec![],
             launched: Instant::now(),
             first_frame_recorded: false,
@@ -1101,7 +1328,13 @@ mod tests {
     #[gpui::test]
     fn hiding_and_reopening_retains_the_terminal_entity(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
-        let (workspace, cx) = cx.add_window_view(fixture);
+        let mut workspace = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| fixture(window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
         VisualTestContext::update(cx, |window, cx| {
             workspace.update(cx, |this, cx| {
                 let id = this.sessions[0].id;
@@ -1124,7 +1357,13 @@ mod tests {
     #[gpui::test]
     fn disconnect_and_stale_close_target_cannot_remove_another_session(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
-        let (workspace, cx) = cx.add_window_view(fixture);
+        let mut workspace = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| fixture(window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
         VisualTestContext::update(cx, |window, cx| {
             workspace.update(cx, |this, cx| {
                 let first = this.sessions[0].id;

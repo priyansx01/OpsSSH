@@ -34,12 +34,28 @@ Select text by dragging, then right-click for Copy, Paste, or Select all beside
 the pointer. Alt+drag selects a rectangle. Keyboard shortcuts, including
 Ctrl/Cmd+C/V, Ctrl/Cmd+Shift+C/V, and Shift+Insert, go directly to the terminal
 application. Ctrl+C reaches the remote process even when text is selected.
-Use right-click Copy/Paste for the local clipboard. Windows owns physical
-Alt+Tab; use right-click Send Alt+Tab to VM to send that combination explicitly.
+Use right-click Copy/Paste for the local clipboard. On Windows, Keyboard captured
+forwards Alt+Tab, Alt+Shift+Tab, Alt+Escape, Alt+F4, and Ctrl+Escape while the
+connected VM terminal owns focus. Ctrl+Alt+F12 releases capture; click the toolbar
+control to enable it again. Dialogs, menus, other pages, and inactive windows
+suspend capture. Windows-key combinations and Ctrl+Alt+Delete remain local.
+Right-click Send Alt+Tab to VM is also available when capture is released.
 Shift bypasses application
 mouse reporting for local selection/scrollback. Input is blocked while disconnected
 and is never queued for later replay. Multiline paste without bracketed-paste mode
 requires review. Ctrl/Cmd-click opens HTTP/HTTPS terminal hyperlinks.
+
+Dropping a file keeps the terminal open. Choose a remote upload folder once and
+remember it for that server; future drops use that folder automatically. Change it
+with Upload destination or the connection's advanced session settings. A circular
+progress tray shows preparation, upload, cancellation, and failure. Successful
+uploads insert quoted remote paths without pressing Enter. If you move away from
+the original terminal, use Insert path or Copy path from its transfer feedback.
+Files and folders never overwrite existing remote names automatically.
+
+Native spring motion animates server cards, tabs, navigation, dialogs, and upload
+feedback. Terminal typing and output stay immediate. Reduced motion removes
+movement and animated loading indicators.
 
 ## Development tools
 

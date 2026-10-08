@@ -18,6 +18,9 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 pub struct TransferControl {
     cancelled: Arc<AtomicBool>,
     bytes: Arc<AtomicU64>,
+    batch_bytes: Arc<AtomicU64>,
+    total: Arc<AtomicU64>,
+    total_known: Arc<AtomicBool>,
 }
 impl TransferControl {
     pub fn cancel(&self) {
@@ -25,6 +28,21 @@ impl TransferControl {
     }
     pub fn transferred(&self) -> u64 {
         self.bytes.load(Ordering::Acquire)
+    }
+    pub fn batch_transferred(&self) -> u64 {
+        self.batch_bytes.load(Ordering::Acquire)
+    }
+    pub fn total_bytes(&self) -> Option<u64> {
+        self.total_known
+            .load(Ordering::Acquire)
+            .then(|| self.total.load(Ordering::Acquire))
+    }
+    pub fn set_total(&self, bytes: u64) {
+        self.total.store(bytes, Ordering::Release);
+        self.total_known.store(true, Ordering::Release);
+    }
+    pub fn ensure_active(&self) -> Result<()> {
+        self.check()
     }
     fn check(&self) -> Result<()> {
         if self.cancelled.load(Ordering::Acquire) {
@@ -348,6 +366,7 @@ async fn copy<A: AsyncRead + Unpin, B: AsyncWrite + Unpin>(
     let mut buffer = vec![0; 65536];
     let mut total = offset;
     control.bytes.store(total, Ordering::Release);
+    control.batch_bytes.fetch_add(offset, Ordering::Release);
     loop {
         control.check()?;
         let bytes = source.read(&mut buffer).await?;
@@ -358,6 +377,9 @@ async fn copy<A: AsyncRead + Unpin, B: AsyncWrite + Unpin>(
         destination.write_all(&buffer[..bytes]).await?;
         total += bytes as u64;
         control.bytes.store(total, Ordering::Release);
+        control
+            .batch_bytes
+            .fetch_add(bytes as u64, Ordering::Release);
     }
     destination.flush().await?;
     Ok(total)
@@ -405,5 +427,22 @@ mod tests {
         );
         assert_eq!(output, data);
         assert_eq!(control.transferred(), 200000);
+    }
+    #[tokio::test]
+    async fn batch_progress_accumulates_across_files_and_resume_offsets() {
+        let control = TransferControl::default();
+        assert_eq!(control.total_bytes(), None);
+        control.set_total(12);
+        let mut output = Vec::new();
+        copy(&mut &b"hello"[..], &mut output, 0, &control)
+            .await
+            .unwrap();
+        assert_eq!(control.batch_transferred(), 5);
+        copy(&mut &b"world"[..], &mut output, 2, &control)
+            .await
+            .unwrap();
+        assert_eq!(control.transferred(), 7);
+        assert_eq!(control.batch_transferred(), 12);
+        assert_eq!(control.total_bytes(), Some(12));
     }
 }

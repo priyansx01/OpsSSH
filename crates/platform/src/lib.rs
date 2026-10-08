@@ -7,6 +7,9 @@ mod pty;
 pub use pty::{NativeTerminal, NativeTerminalFactory, TerminalKiller};
 
 #[cfg(feature = "gui")]
+pub mod keyboard_capture;
+
+#[cfg(feature = "gui")]
 pub fn application() -> gpui::Application {
     gpui_platform::application()
 }

@@ -109,6 +109,18 @@ impl TerminalView {
         Self::start(None, window, cx)
     }
 
+    /// Development fixture with a real local PTY, without asynchronous startup races.
+    #[cfg(feature = "test-support")]
+    pub fn preview_connected_local(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut view = Self::connect(ConnectionOptions::new("", "", PathBuf::new()), window, cx);
+        view.notice_task = None;
+        view.connection_options = None;
+        view.session =
+            Some(Session::local(LocalShellOptions::default()).expect("local preview PTY"));
+        view.error = None;
+        view
+    }
+
     pub fn connect(
         options: ConnectionOptions,
         window: &mut Window,
@@ -199,6 +211,45 @@ impl TerminalView {
 
     pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.paste_text(text, cx);
+    }
+
+    pub fn accepts_terminal_keys(&self, window: &Window) -> bool {
+        window.is_window_active()
+            && self.focus.is_focused(window)
+            && self.state().accepts_input()
+            && self.prompt.is_none()
+            && self.paste_preview.is_none()
+    }
+
+    /// Native system keys are already suppressed by the platform hook, so use the
+    /// encoder directly rather than re-injecting them into the Windows input queue.
+    pub fn captured_key(
+        &mut self,
+        event: opsssh_platform::keyboard_capture::CapturedKey,
+        cx: &mut Context<Self>,
+    ) {
+        if self.prompt.is_some()
+            || self.paste_preview.is_some()
+            || self.connection_generation != event.generation
+        {
+            return;
+        }
+        if let Some(session) = &self.session
+            && let Ok(bytes) = encode_key(
+                session.state(),
+                session.modes(),
+                event.key,
+                event.modifiers,
+                event.kind,
+            )
+        {
+            if event.kind != KeyEventKind::Release {
+                self.selection = None;
+                session.scroll_to_bottom();
+            }
+            self.send(bytes, cx);
+            cx.notify();
+        }
     }
 
     pub fn set_font_size(&mut self, font_size: f32, cx: &mut Context<Self>) {
@@ -1383,7 +1434,10 @@ impl Render for TerminalView {
             .text_color(colors.foreground)
             .track_focus(&self.focus)
             .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| {
-                if view.state().accepts_input() {
+                if view.state().accepts_input()
+                    && view.prompt.is_none()
+                    && view.paste_preview.is_none()
+                {
                     cx.emit(TerminalViewEvent::UploadFiles(
                         paths.0.iter().cloned().collect(),
                     ));
@@ -1813,6 +1867,62 @@ mod clipboard_tests {
     use super::*;
     use gpui::{Entity, TestAppContext, VisualTestContext};
     use opsssh_term_core::{Cell, TerminalBackend};
+
+    #[gpui::test]
+    fn native_captured_keys_use_the_encoder_and_reject_stale_generations(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let session = Session::local(LocalShellOptions::default()).unwrap();
+        let (view, cx) = cx.add_window_view(fixture);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.stopped = false;
+                view.session = Some(session);
+                view.session
+                    .as_ref()
+                    .unwrap()
+                    .backend()
+                    .lock()
+                    .unwrap()
+                    .ingest(b"\x1b[>11u")
+                    .unwrap();
+                let mut event = opsssh_platform::keyboard_capture::CapturedKey {
+                    target: 1,
+                    generation: view.connection_generation,
+                    key: Key::Tab,
+                    modifiers: Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    kind: KeyEventKind::Press,
+                    release_capture: false,
+                };
+                for kind in [
+                    KeyEventKind::Press,
+                    KeyEventKind::Repeat,
+                    KeyEventKind::Release,
+                ] {
+                    event.kind = kind;
+                    view.captured_key(event, cx);
+                }
+                assert_eq!(
+                    view.sent_input.concat(),
+                    b"\x1b[9;3:1u\x1b[9;3:2u\x1b[9;3:3u"
+                );
+                view.sent_input.clear();
+                event.generation += 1;
+                view.captured_key(event, cx);
+                assert!(view.sent_input.is_empty());
+                event.generation = view.connection_generation;
+                view.paste_preview = Some("review".into());
+                view.captured_key(event, cx);
+                assert!(view.sent_input.is_empty());
+                view.paste_preview = None;
+                view.disconnect(cx);
+                view.captured_key(event, cx);
+                assert!(view.sent_input.is_empty());
+            })
+        });
+    }
 
     fn fixture(window: &mut Window, cx: &mut Context<TerminalView>) -> TerminalView {
         // Invalid options fail before opening any SSH connection.

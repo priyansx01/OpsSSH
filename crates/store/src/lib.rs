@@ -37,6 +37,7 @@ pub struct Profile {
     pub identities_only: bool,
     pub strict_host_key: bool,
     pub ssh_alias: String,
+    pub terminal_upload_directory: Option<String>,
 }
 impl Default for Profile {
     fn default() -> Self {
@@ -64,11 +65,17 @@ impl Default for Profile {
             identities_only: false,
             strict_host_key: false,
             ssh_alias: String::new(),
+            terminal_upload_directory: None,
         }
     }
 }
 impl Profile {
     pub fn validate(&self) -> io::Result<()> {
+        if self.terminal_upload_directory.as_ref().is_some_and(|path| {
+            path.is_empty() || path.len() > 4096 || path.chars().any(char::is_control)
+        }) {
+            return Err(invalid("invalid terminal upload directory"));
+        }
         if self.host.is_empty()
             || self.host.starts_with('-')
             || self
@@ -249,6 +256,16 @@ impl Store {
         Ok(())
     }
     pub fn upsert(&mut self, mut profile: Profile) -> io::Result<u64> {
+        if self
+            .servers
+            .iter()
+            .find(|old| old.id == profile.id)
+            .is_some_and(|old| {
+                old.host != profile.host || old.port != profile.port || old.user != profile.user
+            })
+        {
+            profile.terminal_upload_directory = None;
+        }
         profile.validate()?;
         if profile.name.trim().is_empty() {
             profile.name = profile.host.clone();
@@ -324,6 +341,42 @@ mod connection_times {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn upload_destination_persists_and_is_reset_when_endpoint_changes() {
+        let mut store = Store::default();
+        let id = store
+            .upsert(Profile {
+                host: "server.test".into(),
+                user: "deploy".into(),
+                terminal_upload_directory: Some("/srv/uploads".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let serialized = store.export().unwrap();
+        let restored = Store::parse(&serialized).unwrap();
+        assert_eq!(
+            restored.servers[0].terminal_upload_directory.as_deref(),
+            Some("/srv/uploads")
+        );
+        let mut renamed = store.servers[0].clone();
+        renamed.name = "Renamed".into();
+        store.upsert(renamed).unwrap();
+        assert!(store.servers[0].terminal_upload_directory.is_some());
+        for change in 0..3 {
+            let mut changed = store.servers[0].clone();
+            changed.terminal_upload_directory = Some("/srv/uploads".into());
+            match change {
+                0 => changed.host = "other.test".into(),
+                1 => changed.port = 2222,
+                _ => changed.user = "other".into(),
+            }
+            store.upsert(changed).unwrap();
+            assert_eq!(store.servers[0].id, id);
+            assert_eq!(store.servers[0].terminal_upload_directory, None);
+        }
+        let legacy = Store::parse("version=1\n[[servers]]\nid=1\nhost='legacy.test'\n").unwrap();
+        assert_eq!(legacy.servers[0].terminal_upload_directory, None);
+    }
     #[test]
     fn older_settings_receive_new_defaults() {
         let store = Store::parse(

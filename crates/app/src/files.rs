@@ -16,11 +16,18 @@ use opsssh_ssh_core::SshCommand;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 pub enum FilePaneEvent {
-    InsertText(String),
+    InsertText(u64, String),
+    FocusTerminal,
+    DestinationValidated(u64, String),
+    DestinationFailed(u64, String),
 }
 #[derive(Clone)]
 enum Job {
     List(String),
+    ValidateDestination {
+        request: u64,
+        path: String,
+    },
     Upload {
         paths: Vec<PathBuf>,
         target: Option<String>,
@@ -45,7 +52,9 @@ enum Update {
     Refreshed(String, Vec<Entry>),
     Message(String),
     Unavailable(String),
-    Insert(String),
+    Insert(u64, String),
+    DestinationValidated(u64, String),
+    DestinationFailed(u64, String),
     Started(u64),
     Finished(u64, Result<(), String>),
 }
@@ -85,6 +94,9 @@ struct TransferTask {
     bytes: u64,
     retry: Option<Job>,
     failure: Option<String>,
+    completed_at: Option<std::time::Instant>,
+    remote_paths: Option<String>,
+    pending_insert: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FileSort {
@@ -118,13 +130,52 @@ pub struct FilePane {
     progress_task: Option<Task<()>>,
     worker_generation: u64,
     available: bool,
+    pending_validation: Option<u64>,
+    #[cfg(feature = "capture")]
+    _preview_jobs: Option<Receiver<QueuedJob>>,
 }
 impl EventEmitter<FilePaneEvent> for FilePane {}
 impl FilePane {
+    pub fn directory(&self) -> &str {
+        &self.directory
+    }
+    pub fn folders(&self) -> Vec<Entry> {
+        self.entries
+            .iter()
+            .filter(|e| e.is_directory && !e.is_symlink)
+            .cloned()
+            .collect()
+    }
+    pub fn validate_destination(&mut self, request: u64, path: String, cx: &mut Context<Self>) {
+        if !self.available {
+            cx.emit(FilePaneEvent::DestinationFailed(
+                request,
+                self.message.clone(),
+            ));
+            return;
+        }
+        self.pending_validation = Some(request);
+        self.enqueue(Job::ValidateDestination { request, path }, cx);
+    }
+    pub fn change_retry_destination(&mut self, path: String, cx: &mut Context<Self>) {
+        for task in &mut self.transfers {
+            if !task.state.active()
+                && let Some(Job::Upload {
+                    target,
+                    insert: true,
+                    ..
+                }) = &mut task.retry
+            {
+                *target = Some(path.clone());
+            }
+        }
+        cx.notify();
+    }
+
     /// In-memory visual fixture: no SSH channel, filesystem work, or user data.
     #[cfg(feature = "capture")]
     pub fn preview(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (jobs, _) = async_channel::bounded(32);
+        let (jobs, preview_jobs) = async_channel::bounded(32);
         let path = cx.new(|cx| InputState::new(window, cx).default_value("/srv/application"));
         let folder =
             cx.new(|cx| InputState::new(window, cx).placeholder(tr("file-folder-placeholder")));
@@ -189,10 +240,15 @@ impl FilePane {
                 bytes: 2048,
                 retry: None,
                 failure: None,
+                completed_at: None,
+                remote_paths: None,
+                pending_insert: false,
             }],
             progress_task: None,
             worker_generation: 0,
             available: true,
+            pending_validation: None,
+            _preview_jobs: Some(preview_jobs),
         }
     }
     pub fn new(
@@ -261,6 +317,9 @@ impl FilePane {
             progress_task: None,
             worker_generation: 0,
             available: true,
+            pending_validation: None,
+            #[cfg(feature = "capture")]
+            _preview_jobs: None,
         };
         match thread {
             Ok(_) => pane.enqueue(
@@ -274,6 +333,28 @@ impl FilePane {
             Err(error) => pane.message = format!("{}: {error}", tr("file-worker-error")),
         };
         pane
+    }
+    #[cfg(feature = "capture")]
+    pub fn preview_transfer(&mut self, failed: bool) {
+        let task = &mut self.transfers[0];
+        task.label = format!("{}: deployment.tar.gz", tr("file-upload"));
+        task.state = if failed {
+            TransferState::Failed
+        } else {
+            TransferState::Running
+        };
+        task.bytes = 42 * 1024 * 1024;
+        task.control.set_total(64 * 1024 * 1024);
+        task.completed_at = None;
+        task.retry = Some(Job::Upload {
+            paths: vec![PathBuf::from("deployment.tar.gz")],
+            target: Some("/srv/uploads".into()),
+            insert: true,
+            control: task.control.clone(),
+        });
+        if failed {
+            task.failure = Some("Permission denied: choose another upload destination".into());
+        }
     }
     #[cfg(feature = "capture")]
     pub fn preview_list(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -322,6 +403,14 @@ impl FilePane {
                             return;
                         }
                         match update {
+                            Update::DestinationValidated(request, path) => {
+                                this.pending_validation = None;
+                                cx.emit(FilePaneEvent::DestinationValidated(request, path));
+                            }
+                            Update::DestinationFailed(request, error) => {
+                                this.pending_validation = None;
+                                cx.emit(FilePaneEvent::DestinationFailed(request, error));
+                            }
                             Update::Listed(path, entries) => {
                                 if this.directory != path {
                                     this.search
@@ -353,6 +442,12 @@ impl FilePane {
                             Update::Unavailable(message) => {
                                 this.message = message;
                                 this.available = false;
+                                if let Some(request) = this.pending_validation.take() {
+                                    cx.emit(FilePaneEvent::DestinationFailed(
+                                        request,
+                                        this.message.clone(),
+                                    ));
+                                }
                                 this.pending = 0;
                                 for task in &mut this.transfers {
                                     if task.state.active() {
@@ -364,7 +459,14 @@ impl FilePane {
                                     }
                                 }
                             }
-                            Update::Insert(text) => cx.emit(FilePaneEvent::InsertText(text)),
+                            Update::Insert(id, text) => {
+                                if let Some(task) =
+                                    this.transfers.iter_mut().find(|task| task.id == id)
+                                {
+                                    task.remote_paths = Some(text.clone());
+                                }
+                                cx.emit(FilePaneEvent::InsertText(id, text));
+                            }
                             Update::Started(id) => {
                                 if let Some(task) =
                                     this.transfers.iter_mut().find(|task| task.id == id)
@@ -379,7 +481,7 @@ impl FilePane {
                                 if let Some(task) =
                                     this.transfers.iter_mut().find(|task| task.id == id)
                                 {
-                                    task.bytes = task.control.transferred();
+                                    task.bytes = task.control.batch_transferred();
                                     task.failure = result.err();
                                     task.state = if success {
                                         TransferState::Completed
@@ -389,11 +491,21 @@ impl FilePane {
                                         TransferState::Failed
                                     };
                                     if success {
+                                        task.completed_at = Some(std::time::Instant::now());
                                         task.retry = None;
                                         task.failure = None;
                                     }
                                 }
                                 this.pending = this.pending.saturating_sub(1);
+                                if success {
+                                    cx.spawn_in(window, async move |this, cx| {
+                                        cx.background_executor()
+                                            .timer(Duration::from_secs(4))
+                                            .await;
+                                        let _ = this.update(cx, |_, cx| cx.notify());
+                                    })
+                                    .detach();
+                                }
                             }
                         };
                         cx.notify();
@@ -414,6 +526,12 @@ impl FilePane {
         self.available = false;
         self.pending = 0;
         self.pending_delete = None;
+        if let Some(request) = self.pending_validation.take() {
+            cx.emit(FilePaneEvent::DestinationFailed(
+                request,
+                tr("file-interrupted"),
+            ));
+        }
         self.progress_task = None;
         interrupt_transfers(&mut self.transfers);
         self.message = tr("file-interrupted");
@@ -479,11 +597,7 @@ impl FilePane {
                 control,
                 ..
             } => {
-                *target = if *insert {
-                    None
-                } else {
-                    Some(self.directory.clone())
-                };
+                let _ = (target, insert);
                 *control = TransferControl::default();
             }
             Job::Download { remote, local, .. } => {
@@ -589,11 +703,23 @@ impl FilePane {
                         bytes: 0,
                         retry,
                         failure: None,
+                        completed_at: None,
+                        remote_paths: None,
+                        pending_insert: false,
                     });
                 }
                 self.message = format!("{}: {}", tr("file-pending-count"), self.pending);
             }
-            Err(_) => self.message = tr("file-queue-error"),
+            Err(error) => {
+                if let Job::ValidateDestination { request, .. } = error.into_inner().job {
+                    self.pending_validation = None;
+                    cx.emit(FilePaneEvent::DestinationFailed(
+                        request,
+                        tr("file-queue-error"),
+                    ));
+                }
+                self.message = tr("file-queue-error");
+            }
         };
         cx.notify();
     }
@@ -613,7 +739,7 @@ impl FilePane {
                 this.progress_task = None;
                 let mut changed = false;
                 for task in &mut this.transfers {
-                    let bytes = task.control.transferred();
+                    let bytes = task.control.batch_transferred();
                     if bytes != task.bytes {
                         task.bytes = bytes;
                         changed = true;
@@ -757,6 +883,176 @@ impl FilePane {
     }
 }
 impl FilePane {
+    pub fn defer_insert(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(task) = self.transfers.iter_mut().find(|task| task.id == id) {
+            task.pending_insert = true;
+        }
+        cx.notify();
+    }
+
+    pub fn terminal_tray(&self, reduced: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+        use gpui::{Animation, AnimationExt};
+        use gpui_component::progress::ProgressCircle;
+        let mut tray = div()
+            .id("terminal-upload-tray")
+            .max_h(px(160.))
+            .overflow_y_scroll()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_2();
+        for task in self.transfers.iter().rev().filter(|task| {
+            task.state != TransferState::Completed
+                || task.pending_insert
+                || task
+                    .completed_at
+                    .is_some_and(|at| at.elapsed() < Duration::from_secs(4))
+        }) {
+            let id = task.id;
+            let total = task.control.total_bytes();
+            let percent = if task.state == TransferState::Completed {
+                100.
+            } else {
+                total
+                    .filter(|total| *total > 0)
+                    .map(|total| (task.bytes as f64 / total as f64 * 100.).min(99.) as f32)
+                    .unwrap_or(0.)
+            };
+            let active = task.state.active();
+            let destination = match task.retry.as_ref() {
+                Some(Job::Upload {
+                    target: Some(path), ..
+                }) => path.clone(),
+                _ => String::new(),
+            };
+            let paths = task.remote_paths.clone();
+            let mut card = div()
+                .id(("terminal-transfer", id))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_3()
+                .p_3()
+                .rounded_lg()
+                .bg(cx.theme().background)
+                .border_1()
+                .border_color(cx.theme().border)
+                .child(if task.failure.is_some() {
+                    Icon::new(IconName::Info)
+                        .small()
+                        .text_color(cx.theme().danger)
+                        .into_any_element()
+                } else {
+                    ProgressCircle::new(("drop-progress", id))
+                        .small()
+                        .value(percent)
+                        .loading(active && total.is_none() && !reduced)
+                        .accessibility_label(format!("{}: {:.0}%", task.state.label(), percent))
+                        .into_any_element()
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(div().text_sm().overflow_hidden().child(task.label.clone()))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if let Some(error) = &task.failure {
+                                    error.clone()
+                                } else {
+                                    format!(
+                                        "{} · {:.0}% · {}{}",
+                                        task.state.label(),
+                                        percent,
+                                        format_bytes(task.bytes),
+                                        if destination.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!(" → {destination}")
+                                        }
+                                    )
+                                }),
+                        ),
+                )
+                .when(active, |d| {
+                    d.child(
+                        Button::new(("drop-cancel", id))
+                            .small()
+                            .ghost()
+                            .label(tr("file-cancel-transfer"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.cancel_transfer(id, cx);
+                                cx.emit(FilePaneEvent::FocusTerminal);
+                            })),
+                    )
+                })
+                .when(!active && task.retry.is_some(), |d| {
+                    d.child(
+                        Button::new(("drop-retry", id))
+                            .small()
+                            .ghost()
+                            .label(tr("file-retry-transfer"))
+                            .disabled(!self.available)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.retry_transfer(id, window, cx);
+                                cx.emit(FilePaneEvent::FocusTerminal);
+                            })),
+                    )
+                })
+                .when_some(paths.clone(), |d, text| {
+                    d.child(
+                        Button::new(("drop-copy", id))
+                            .small()
+                            .ghost()
+                            .label(tr("upload-copy-path"))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                                cx.emit(FilePaneEvent::FocusTerminal);
+                            })),
+                    )
+                })
+                .when(task.pending_insert && self.available, |d| {
+                    d.child(
+                        Button::new(("drop-insert", id))
+                            .small()
+                            .ghost()
+                            .label(tr("upload-insert-path"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(task) =
+                                    this.transfers.iter_mut().find(|task| task.id == id)
+                                {
+                                    task.pending_insert = false;
+                                    if let Some(text) = task.remote_paths.clone() {
+                                        cx.emit(FilePaneEvent::FocusTerminal);
+                                        cx.emit(FilePaneEvent::InsertText(id, text));
+                                    }
+                                }
+                                cx.notify();
+                            })),
+                    )
+                });
+            // Animate the feedback card, never the terminal grid or its input handler.
+            card = card.opacity(1.);
+            tray = tray.child(
+                card.with_animation(
+                    ("drop-enter", id),
+                    Animation::new(Duration::from_millis(if reduced { 0 } else { 240 }))
+                        .with_easing(crate::design::spring_out),
+                    |d, t| {
+                        d.opacity(t.clamp(0., 1.))
+                            .relative()
+                            .top(px(12. * (1. - t)))
+                    },
+                ),
+            );
+        }
+        tray.into_any_element()
+    }
     fn entry_element(&self, index: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         let entry = &self.entries[index];
         let theme = cx.theme();
@@ -1811,7 +2107,7 @@ fn format_bytes(bytes: u64) -> String {
 fn interrupt_transfers(transfers: &mut [TransferTask]) {
     for task in transfers {
         if task.state.active() {
-            task.bytes = task.control.transferred();
+            task.bytes = task.control.batch_transferred();
             task.control.cancel();
             task.state = TransferState::Failed;
             task.failure = Some(tr("file-interrupted-transfer"));
@@ -1933,22 +2229,64 @@ async fn worker(
             break;
         }
         let _ = updates.send(Update::Started(id)).await;
-        let result = execute(&client, &home, job, &updates).await;
+        let validating = match &job {
+            Job::ValidateDestination { request, .. } => Some(*request),
+            _ => None,
+        };
+        let result = execute(&client, &home, job, &updates, id).await;
         let result = result.map_err(|error| error.to_string());
         if let Err(error) = &result {
             let _ = updates.send(Update::Message(error.to_string())).await;
+            if let Some(request) = validating {
+                let _ = updates
+                    .send(Update::DestinationFailed(request, error.clone()))
+                    .await;
+            }
         }
         let _ = updates.send(Update::Finished(id, result)).await;
     }
     Ok(())
+}
+/// Runs on the transfer worker, never on GPUI's input/render thread.
+async fn upload_size(paths: &[PathBuf], control: &TransferControl) -> opsssh_sftp::Result<u64> {
+    let mut pending = paths.to_vec();
+    let mut bytes = 0u64;
+    while let Some(path) = pending.pop() {
+        control.ensure_active()?;
+        let metadata = tokio::fs::symlink_metadata(&path).await?;
+        if metadata.is_symlink() {
+            return Err("recursive upload does not follow symbolic links".into());
+        }
+        if metadata.is_dir() {
+            let mut entries = tokio::fs::read_dir(&path).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                pending.push(entry.path());
+            }
+        } else if metadata.is_file() {
+            bytes = bytes
+                .checked_add(metadata.len())
+                .ok_or("upload size exceeds limits")?;
+        } else {
+            return Err("only regular files and folders can be uploaded".into());
+        }
+    }
+    Ok(bytes)
 }
 async fn execute(
     client: &SftpClient,
     home: &str,
     job: Job,
     updates: &Sender<Update>,
+    id: u64,
 ) -> opsssh_sftp::Result<()> {
     match job {
+        Job::ValidateDestination { request, path } => {
+            let path = client.canonicalize(&path).await?;
+            client.list(&path).await?;
+            updates
+                .send(Update::DestinationValidated(request, path))
+                .await?;
+        }
         Job::List(path) => {
             let path = client.canonicalize(&path).await?;
             let entries = client.list(&path).await?;
@@ -1964,6 +2302,7 @@ async fn execute(
                 Some(path) => client.canonicalize(&path).await?,
                 None => client.private_staging(home).await?,
             };
+            control.set_total(upload_size(&paths, &control).await?);
             let mut inserted = vec![];
             for path in paths {
                 let name = path
@@ -1976,7 +2315,7 @@ async fn execute(
             }
             if insert {
                 updates
-                    .send(Update::Insert(format!("{} ", inserted.join(" "))))
+                    .send(Update::Insert(id, format!("{} ", inserted.join(" "))))
                     .await?;
             } else {
                 refresh_directory(client, &directory, updates).await;
@@ -1993,6 +2332,7 @@ async fn execute(
             local,
             control,
         } => {
+            control.set_total(client.identity(&remote).await?.size);
             let bytes = client
                 .download(&remote, &local, WriteMode::CreateNew, &control)
                 .await?;
@@ -2008,14 +2348,15 @@ async fn execute(
             name,
             control,
         } => {
+            control.set_total(bytes.len() as u64);
             let directory = client.private_staging(home).await?;
             let path = opsssh_drop::join_remote(&directory, &name)?;
             client.upload_bytes(&bytes, &path, &control).await?;
             updates
-                .send(Update::Insert(format!(
-                    "{} ",
-                    opsssh_drop::quote(&path, opsssh_drop::Shell::Posix)?
-                )))
+                .send(Update::Insert(
+                    id,
+                    format!("{} ", opsssh_drop::quote(&path, opsssh_drop::Shell::Posix)?),
+                ))
                 .await?;
             updates
                 .send(Update::Message(format!(
@@ -2056,6 +2397,53 @@ async fn refresh_directory(client: &SftpClient, path: &str, updates: &Sender<Upd
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparation_counts_nested_files_and_obeys_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        std::fs::write(root.path().join("one"), b"hello").unwrap();
+        std::fs::write(root.path().join("nested/測試.txt"), b"world!").unwrap();
+        std::fs::write(root.path().join("empty"), b"").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let control = TransferControl::default();
+        assert_eq!(
+            runtime
+                .block_on(upload_size(&[root.path().to_owned()], &control))
+                .unwrap(),
+            11
+        );
+        control.cancel();
+        assert!(
+            runtime
+                .block_on(upload_size(&[root.path().to_owned()], &control))
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "capture")]
+    #[gpui::test]
+    fn failed_jobs_keep_destination_and_deferred_paths_survive_recovery(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (pane, cx) = cx.add_window_view(FilePane::preview);
+        cx.update(|_,cx|pane.update(cx,|pane,cx| {
+            pane.preview_transfer(true);
+            let id=pane.transfers[0].id;
+            pane.transfers[0].remote_paths=Some("'/srv/uploads/example.txt' ".into());
+            pane.defer_insert(id,cx);
+            pane.directory="/unrelated".into();
+            pane.change_retry_destination("/new/uploads".into(),cx);
+            assert!(matches!(&pane.transfers[0].retry,Some(Job::Upload{target:Some(path),insert:true,..}) if path=="/new/uploads"));
+            pane.suspend(cx);
+            assert!(pane.transfers[0].pending_insert);
+            assert_eq!(pane.transfers[0].remote_paths.as_deref(),Some("'/srv/uploads/example.txt' "));
+        }));
+    }
 
     fn entry(name: &str, directory: bool, size: Option<u64>, modified: Option<u32>) -> Entry {
         Entry {
@@ -2160,6 +2548,9 @@ mod tests {
                 bytes: 0,
                 retry: Some(job),
                 failure: None,
+                completed_at: None,
+                remote_paths: None,
+                pending_insert: false,
             },
             TransferTask {
                 id: 2,
@@ -2169,6 +2560,9 @@ mod tests {
                 bytes: 32,
                 retry: None,
                 failure: None,
+                completed_at: None,
+                remote_paths: None,
+                pending_insert: false,
             },
         ];
         interrupt_transfers(&mut tasks);

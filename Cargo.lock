@@ -5370,6 +5370,7 @@ dependencies = [
  "opsssh-term-core",
  "opsssh-term-view",
  "shlex 2.0.1",
+ "tempfile",
  "tokio",
 ]
 
@@ -5400,13 +5401,16 @@ dependencies = [
 name = "opsssh-platform"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "directories",
  "gpui-pre",
  "gpui-pre-platform",
  "opsssh-term-core",
  "portable-pty",
+ "raw-window-handle",
  "russh",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

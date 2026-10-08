@@ -316,12 +316,16 @@ async fn private_staging_and_recursive_upload_use_real_sftp_operations() {
     tokio::fs::write(local.path().join("nested/two"), b"two")
         .await
         .unwrap();
+    let progress = TransferControl::default();
+    progress.set_total(6);
     assert_eq!(
         client
-            .upload_tree(local.path(), "/tree", &TransferControl::default())
+            .upload_tree(local.path(), "/tree", &progress)
             .await
             .unwrap(),
         6
     );
     assert_eq!(files.lock().unwrap()["/tree/nested/two"], b"two");
+    assert_eq!(progress.batch_transferred(), 6);
+    assert_eq!(progress.total_bytes(), Some(6));
 }

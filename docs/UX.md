@@ -140,11 +140,17 @@ and negotiated key releases reach the harness without rewriting them as local
 copy/paste actions. Local clipboard operations remain available through the
 right-click menu.
 
-Windows intercepts physical Alt+Tab before the app receives it. Right-click
-Send Alt+Tab to VM sends the terminal key encoding directly, using ESC+Tab in
-legacy mode and the negotiated Kitty encoding otherwise. Press and any required
-release are sent together; disconnected/authenticating/review states block it.
-This does not claim to capture Windows system shortcuts.
+Windows VM terminals enable foreground-only keyboard capture by default. The
+platform owns a Win32 hook on a dedicated message thread and forwards Alt+Tab,
+Alt+Shift+Tab, Alt+Escape, Alt+F4, and Ctrl+Escape through the existing encoder.
+Ctrl+Alt+F12 releases capture until the toolbar toggle is enabled again. Capture
+suspends during dialogs, menus, paste review, authentication, disconnection,
+window deactivation, and navigation away. Secure/Windows-key chords pass through.
+Installation/delivery errors fail open; generation checks reject stale events.
+Only the audited platform FFI module permits unsafe code.
+
+The right-click Send Alt+Tab action remains available as a fallback. Both paths
+use ESC+Tab in legacy mode and the negotiated Kitty encoding otherwise.
 
 Shift+Enter remains distinct from Enter when the application negotiates the
 Kitty keyboard protocol. Legacy Enter behavior remains compatible with ordinary
@@ -152,10 +158,43 @@ shells. A tmux server can filter extended keys before a harness receives them;
 see the [harness terminal configuration](https://code.claude.com/docs/en/terminal-config#configure-tmux)
 for configuring that layer. OpsSSH does not modify the VM's tmux configuration.
 
-The workspace suite passed 118 tests; strict Clippy and the normal GUI build
-passed. GUI tests exercise the actual workspace bindings, verify that Home shortcuts
+The workspace suite includes regressions for terminal ownership and native capture. GUI tests exercise the actual workspace bindings, verify that Home shortcuts
 still work, inspect the encoded transport bytes for harness shortcuts and
 negotiated Shift+Enter, forward former clipboard shortcuts and their releases,
 exercise the Send Alt+Tab menu in legacy and Kitty modes, restore
 workspace/empty focus, and protect authentication inputs. Live
 harness and tmux acceptance on a disposable VM remains a release check.
+
+
+## Background terminal uploads and motion
+
+Terminal drops initialize SFTP without opening Files. A compact folder picker
+validates existing remote directories and remembers the canonical destination in
+the server profile. Endpoint changes clear that preference; an old live session
+is detached from the edited profile rather than saving paths for the wrong host.
+The destination can be edited in advanced connection session settings or from
+the terminal toolbar. Unchecked Remember applies to the current drop only.
+
+The bounded terminal tray shows circular batch progress, Cancel, Retry, and
+remote path actions. Preparation scans folders off the UI thread and rejects
+symlinks. Cumulative bytes do not reset between files; completion waits for remote
+close acknowledgements. Uploads retain exclusive-create semantics. Failed jobs
+keep their chosen destination, and Change destination updates explicit retries.
+Queued validation replies are tied to their dialog request and worker generation.
+
+Paths are inserted without Enter only into the active original terminal with its
+live connection generation, focus, and modal guards satisfied. Otherwise the
+tray keeps an Insert path action. Completed feedback disappears after four seconds
+unless insertion is pending; transfer history remains in Files.
+
+GPUI springs animate card entrance/hover and tab indicators. Short underdamped
+sidebar/page and upload-card transitions add expressive motion. Terminal page
+changes, the grid, cursor, selection, and IME remain immediate. GPUI Kit supplies
+dialog/button and progress transitions. Reduced motion resolves springs immediately
+and replaces indeterminate rotation with static feedback. Settled animations do
+not schedule frames.
+
+Native previews: `snapshot-session-upload-progress`,
+`snapshot-session-upload-failed`, and `snapshot-session-upload-destination` with
+the `capture` feature. Windows physical-key and live VM/tmux acceptance should
+be exercised interactively; automated tests verify hook routing and encoder bytes.

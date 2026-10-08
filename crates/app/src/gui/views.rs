@@ -1,7 +1,9 @@
 //! Workspace presentation. SSH/session ownership stays in the parent controller.
 use super::*;
 use crate::design;
-use gpui::{Animation, AnimationExt, AnyElement, ease_out_quint, uniform_list};
+use gpui::{
+    Animation, AnimationExt, AnyElement, SpringAnimation, SpringConfig, relative, uniform_list,
+};
 use gpui_component::{
     ActiveTheme, Icon, IconName, Selectable, h_resizable,
     menu::{DropdownMenu, PopupMenuItem},
@@ -356,7 +358,7 @@ impl Workspace {
         list: bool,
         index: usize,
         cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
+    ) -> AnyElement {
         let p = design::palette(cx);
         let config = profile.id == 0;
         let connect = profile.clone();
@@ -538,6 +540,26 @@ impl Workspace {
                 .truncate()
                 .child(last),
         )
+        .on_hover(cx.listener(move |this, hovered, _, cx| {
+            this.hovered_card = if *hovered { Some(index) } else { None };
+            cx.notify();
+        }))
+        .with_spring(
+            ("server-motion", index),
+            SpringAnimation::new(SpringConfig::new(650., 32., 1.))
+                .to(if self.hovered_card == Some(index) {
+                    -3.
+                } else {
+                    0.
+                })
+                .from(18.),
+            |d, offset| {
+                d.opacity(((18. - offset) / 18.).clamp(0., 1.))
+                    .relative()
+                    .top(px(offset))
+            },
+        )
+        .into_any_element()
     }
     fn servers(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = design::palette(cx);
@@ -1148,6 +1170,55 @@ impl Workspace {
                         )
                         .child(div().flex_1())
                         .when(tab.endpoint.is_some(), |d| {
+                            d.when(
+                                self.capture.is_some()
+                                    || (cfg!(feature = "capture")
+                                        && self.load_failed
+                                        && opsssh_platform::info().os == "windows"),
+                                |d| {
+                                    d.child(
+                                        Button::new("keyboard-capture")
+                                            .ghost()
+                                            .selected(tab.keyboard_capture)
+                                            .label(tr(if !tab.keyboard_capture {
+                                                "keyboard-released"
+                                            } else if !live {
+                                                "keyboard-paused"
+                                            } else {
+                                                "keyboard-captured"
+                                            }))
+                                            .tooltip(tr("keyboard-capture-help"))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                if let Some(index) = this.session_index(id) {
+                                                    this.sessions[index].keyboard_capture =
+                                                        !this.sessions[index].keyboard_capture;
+                                                    this.sessions[index]
+                                                        .terminal
+                                                        .update(cx, |terminal, cx| {
+                                                            terminal.focus(window, cx)
+                                                        });
+                                                }
+                                                this.update_keyboard_capture(window, cx);
+                                                cx.notify();
+                                            })),
+                                    )
+                                },
+                            )
+                            .child(
+                                Button::new("terminal-upload-destination")
+                                    .ghost()
+                                    .label(tr("upload-destination"))
+                                    .tooltip(
+                                        tab.upload_directory
+                                            .clone()
+                                            .unwrap_or_else(|| tr("upload-destination-help")),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.choose_upload_destination(id, vec![], window, cx)
+                                    })),
+                            )
+                        })
+                        .when(tab.endpoint.is_some(), |d| {
                             d.child(
                                 Button::new("toggle-files")
                                     .ghost()
@@ -1199,6 +1270,11 @@ impl Workspace {
                             })
                         }),
                 )
+                .when_some(files.clone(), |d, files| {
+                    d.child(files.update(cx, |files, cx| {
+                        files.terminal_tray(self.store.settings.reduced_motion, cx)
+                    }))
+                })
                 .child(
                     div()
                         .flex_1()
@@ -1296,6 +1372,18 @@ impl Workspace {
         if terminal_open && (window.focused(cx).is_none() || self.home_focus.is_focused(window)) {
             self.restore_terminal_focus(window, cx);
         }
+        if self
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.has_failed())
+        {
+            self.message = tr("keyboard-capture-failed");
+            for tab in &mut self.sessions {
+                tab.keyboard_capture = false;
+            }
+            self.capture = None;
+        }
+        self.update_keyboard_capture(window, cx);
         let tabs = self
             .navigation
             .open
@@ -1316,6 +1404,24 @@ impl Workspace {
                     .bg(rgb(if selected { p.raised } else { p.sidebar }))
                     .border_1()
                     .border_color(rgb(if selected { p.border } else { p.sidebar }))
+                    .relative()
+                    .when(selected, |d| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .bottom_0()
+                                .left_0()
+                                .h(px(2.))
+                                .bg(rgb(p.ruby))
+                                .with_spring(
+                                    ("tab-indicator", id.0 as usize),
+                                    SpringAnimation::new(SpringConfig::new(700., 36., 1.))
+                                        .to(1.)
+                                        .from(0.),
+                                    |d, t| d.w(relative(t.clamp(0., 1.))),
+                                ),
+                        )
+                    })
                     .child(
                         Button::new(("tab", id.0 as usize))
                             .ghost()
@@ -1442,11 +1548,15 @@ impl Workspace {
                                 if self.store.settings.reduced_motion {
                                     0
                                 } else {
-                                    160
+                                    260
                                 },
                             ))
-                            .with_easing(ease_out_quint()),
-                            |d, t| d.opacity(0.6 + 0.4 * t),
+                            .with_easing(design::spring_out),
+                            |d, t| {
+                                d.opacity((0.6 + 0.4 * t).clamp(0., 1.))
+                                    .relative()
+                                    .left(px(-14. * (1. - t)))
+                            },
                         ),
                     )
                     .child(
@@ -1485,14 +1595,18 @@ impl Workspace {
                                 div().flex_1().min_h_0().child(content).with_animation(
                                     ("page-enter", self.transition as usize),
                                     Animation::new(std::time::Duration::from_millis(
-                                        if self.store.settings.reduced_motion {
+                                        if self.store.settings.reduced_motion || terminal_open {
                                             0
                                         } else {
-                                            140
+                                            260
                                         },
                                     ))
-                                    .with_easing(ease_out_quint()),
-                                    |d, t| d.opacity(0.65 + 0.35 * t),
+                                    .with_easing(design::spring_out),
+                                    |d, t| {
+                                        d.opacity((0.65 + 0.35 * t).clamp(0., 1.))
+                                            .relative()
+                                            .top(px(16. * (1. - t)))
+                                    },
                                 ),
                             ),
                     ),

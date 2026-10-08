@@ -41,6 +41,7 @@ mod tests {
             tags: vec!["api".into(), "critical".into()],
             tmux_session: Some("ops".into()),
             favorite: true,
+            terminal_upload_directory: Some("/srv/uploads".into()),
             ..Profile::default()
         };
         let expected = original.clone();
@@ -176,6 +177,7 @@ struct Fields {
     proxy: Entity<InputState>,
     tmux: Entity<InputState>,
     keepalive: Entity<InputState>,
+    upload_directory: Entity<InputState>,
     known_hosts: Entity<InputState>,
     tags: Entity<InputState>,
     agent: Entity<InputState>,
@@ -204,6 +206,10 @@ impl Fields {
                 "form-tmux-name",
             ),
             keepalive: input(p.keepalive_seconds.to_string(), "form-keepalive"),
+            upload_directory: input(
+                p.terminal_upload_directory.clone().unwrap_or_default(),
+                "form-upload-directory",
+            ),
             known_hosts: input(p.known_hosts.clone(), "form-known-hosts"),
             tags: input(p.tags.join(", "), "form-tags"),
             agent: input(p.identity_agent.clone(), "form-agent-socket"),
@@ -285,6 +291,8 @@ impl ConnectionForm {
                 self.errors.insert("form-port", tr("form-invalid-port"));
             }
         }
+        p.terminal_upload_directory =
+            Some(value(&self.fields.upload_directory)).filter(|path| !path.is_empty());
         p.environment = value(&self.fields.environment);
         p.identity_file = value(&self.fields.key);
         if p.auth == Auth::Key && p.identity_file.trim().is_empty() {
@@ -639,6 +647,11 @@ impl Render for ConnectionForm {
                     .child(self.heading("form-session", self.session, cx))
                     .when(self.session, |d| {
                         d.child(self.row("form-keepalive", &self.fields.keepalive, cx))
+                            .child(self.row(
+                                "form-upload-directory",
+                                &self.fields.upload_directory,
+                                cx,
+                            ))
                     })
             })
             .child(
