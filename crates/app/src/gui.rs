@@ -131,7 +131,7 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
     let result=cx.open_window(WindowOptions{window_bounds:Some(WindowBounds::Windowed(bounds)),window_min_size:Some(size(px(1000.),px(700.))),window_decorations:Some(gpui::WindowDecorations::Client),..gpui_component::TitleBar::window_options()},move|window,cx|{
         window.set_window_title("OpsSSH");
         let workspace=cx.new(|cx: &mut Context<Workspace>|{
-            let home_focus=cx.focus_handle();let terminal_focus=Workspace::terminal_focus_subscriptions(&home_focus,window,cx);let search=cx.new(|cx|InputState::new(window,cx).placeholder("Search name, host, user, environment or tags"));
+            let home_focus=cx.focus_handle();let terminal_focus=Workspace::terminal_focus_subscriptions(&home_focus,window,cx);let search=cx.new(|cx|InputState::new(window,cx).placeholder(tr("search-connections")));
             cx.subscribe_in(&search,window,|this,_,event,window,cx|{match event {InputEvent::PressEnter{..}=>{let query=this.search.read(cx).value();if let Some(p)=this.visible_profiles(&query).first().cloned(){this.connect(p,window,cx);}},InputEvent::Change=>cx.notify(),_=>{}}}).detach();
             let (path,mut message)=match opsssh_platform::app_data_dir(){Ok(dir)=>(dir.join("servers.toml"),String::new()),Err(error)=>(PathBuf::new(),format!("Cannot locate settings folder: {error}"))};
             let mut load_failed=false;
@@ -141,7 +141,7 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
             crate::design::set_reduced_motion(workspace.store.settings.reduced_motion,cx);
             crate::design::observe_system(window).detach();
             workspace.reload_config();
-            if open_terminal{workspace.open_local(&OpenLocalTerminal,window,cx);}else{workspace.search.update(cx,|state,cx|state.focus(window,cx));}
+            if open_terminal{workspace.open_local(&OpenLocalTerminal,window,cx);}else{workspace.home_focus.focus(window,cx);}
             #[cfg(feature="capture")]
             if let Some((screen,path))=capture_path{
                 // In-memory fixtures only; snapshot processes cannot save user data.

@@ -20,18 +20,18 @@ pub struct Palette {
     pub on_ruby: u32,
 }
 pub const DARK: Palette = Palette {
-    canvas: 0x111114,
-    sidebar: 0x18181c,
-    surface: 0x202025,
-    raised: 0x25252b,
-    hover: 0x2b2b33,
-    border: 0x34343c,
+    canvas: 0x09090b,
+    sidebar: 0x101014,
+    surface: 0x111115,
+    raised: 0x18181d,
+    hover: 0x36313d,
+    border: 0x2b2931,
     text: 0xf1eff2,
     muted: 0xaaa6b0,
-    ruby: 0xc72c55,
-    ruby_hover: 0xcf3059,
-    ruby_pressed: 0xb8264c,
-    ruby_tint: 0x351d27,
+    ruby: 0xd51b60,
+    ruby_hover: 0xdc2468,
+    ruby_pressed: 0xaf0a48,
+    ruby_tint: 0x321724,
     on_ruby: 0xffffff,
 };
 pub const LIGHT: Palette = Palette {
@@ -218,9 +218,9 @@ pub fn spring_out(t: f32) -> f32 {
 
 pub fn action_gradient(hover: bool) -> gpui::Background {
     let (start, end) = if hover {
-        (0xcf3059, 0xab254a)
+        (0xdc2468, 0xbd1052)
     } else {
-        (0xc72c55, 0x9b2142)
+        (0xd51b60, 0xaf0a48)
     };
     gpui::linear_gradient(
         135.,
@@ -297,7 +297,7 @@ impl gpui::RenderOnce for PrimaryAction {
             })
             .when(!self.disabled, |d| {
                 d.shadow(vec![gpui::BoxShadow {
-                    color: gpui::rgba(0xc72c5518).into(),
+                    color: gpui::rgba(0xd51b6018).into(),
                     offset: gpui::point(px(0.), px(2.)),
                     blur_radius: px(5.),
                     spread_radius: px(0.),
@@ -331,7 +331,7 @@ mod tests {
     }
     #[test]
     fn gradient_labels_meet_normal_text_contrast() {
-        for stop in [0xC72C55, 0x9B2142, 0xCF3059, 0xAB254A] {
+        for stop in [0xD51B60, 0xAF0A48, 0xDC2468, 0xBD1052] {
             assert!(contrast(0xffffff, stop) >= 4.5);
         }
     }

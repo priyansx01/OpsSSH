@@ -395,3 +395,12 @@ ssh-command-copied = SSH command copied
 reconnect-server = Reconnect
 
 config-alias = From SSH config
+
+card-environment = Environment
+card-unassigned = Not set
+card-authentication = Authentication
+card-key = Key
+card-collection = CONNECTIONS
+card-shown = shown
+workspace-subtitle = Connection workspace
+search-connections = Search connections

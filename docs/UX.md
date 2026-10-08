@@ -7,15 +7,21 @@ System UI typography and monospace endpoints remain native to each platform.
 Windows explicitly uses Segoe UI for interface text and Consolas for metadata.
 
 The window opens at 1440x900 logical pixels (clamped to the display work area),
-with a 32px native title bar, integrated 54px tab strip, and 228px sidebar that
+with a 32px native title bar, a 54px tab strip beside the sidebar, and 228px sidebar that
 collapses to 68px. Native window controls retain the live-session close guard.
 The minimum window is 1000x700; long pages and short files panes scroll internally.
 
 The server page has virtualized cards and a list alternative, search, environment
 groups, favorites, and name/recent sorting. Recency is recorded only after a
 saved connection reaches Connected; exported profiles omit local timestamps.
-Connection cards show the actual transport state, with a stable-width Connect
-or Disconnect action. Disconnect requires confirmation and retains the tab and
+Connection cards separate name and endpoint from labeled environment and authentication
+details. Status is shown beside the name and in the footer; a stable-width action
+sits on the right. Connect uses ruby; Disconnect uses a neutral outlined button.
+Recency is available in the name tooltip rather than competing with card actions.
+The page has a bounded toolbar and a collection caption. Dark surfaces use near-black
+neutral tones, with subtle borders instead of a bright outline on card hover.
+The initial page focuses workspace navigation; Ctrl/Cmd+K still focuses search.
+Disconnect requires confirmation and retains the tab and
 terminal history; multiple sessions get a session chooser. Reconnect is explicit.
 SSH-config aliases are read-only: Customize creates a saved profile, and aliases
 support Duplicate and Copy SSH command but cannot be removed from this UI.

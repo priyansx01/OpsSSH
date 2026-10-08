@@ -3,7 +3,7 @@ use super::*;
 use crate::design;
 use gpui::{Animation, AnimationExt, AnyElement, SpringAnimation, SpringConfig, uniform_list};
 use gpui_component::{
-    ActiveTheme, Disableable, Icon, IconName, Selectable, TitleBar,
+    ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, TitleBar,
     menu::{DropdownMenu, PopupMenuItem},
     switch::Switch,
 };
@@ -240,17 +240,28 @@ impl Workspace {
                         div()
                             .rounded_md()
                             .p_2()
-                            .bg(rgb(p.ruby_tint))
-                            .text_color(rgb(p.text))
+                            .bg(rgb(p.ruby))
+                            .text_color(rgb(p.on_ruby))
                             .text_lg()
                             .child(">_"),
                     )
                     .when(!collapsed, |d| {
                         d.child(
                             div()
-                                .text_lg()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child("OpsSSH"),
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child("OpsSSH"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(p.muted))
+                                        .child(tr("workspace-subtitle")),
+                                ),
                         )
                     }),
             );
@@ -446,6 +457,7 @@ impl Workspace {
         let delete = profile.clone();
         let workspace = cx.entity().downgrade();
         let menu = Button::new(("server-menu", index))
+            .small()
             .ghost()
             .icon(IconName::Ellipsis)
             .tooltip(tr("server-actions"))
@@ -517,30 +529,30 @@ impl Workspace {
         let key_tooltip = key_path.clone();
         let address_tooltip = format!("{}@{}:{}", profile.user, profile.host, profile.port);
         let name_tooltip = profile.name.clone();
-        let metadata = div()
-            .truncate()
-            .flex()
-            .gap_2()
-            .text_xs()
-            .text_color(rgb(p.muted))
-            .child(
-                div()
-                    .truncate()
-                    .font_family(cx.theme().mono_font_family.clone())
-                    .id(("key-path", index))
-                    .tooltip(move |window, cx| {
-                        gpui_component::tooltip::Tooltip::new(key_tooltip.clone()).build(window, cx)
-                    })
-                    .child(key_path),
-            )
-            .when(!profile.proxy_jump.is_empty(), |d| {
-                d.child(format!("{} {}", tr("via-label"), profile.proxy_jump))
-            })
-            .when(!profile.proxy_command.is_empty(), |d| {
-                d.child(tr("proxy-label"))
-            });
+        let state_color = if status == Some(opsssh_term_core::SessionState::Connected) {
+            cx.theme().success
+        } else {
+            rgb(p.muted).into()
+        };
+        let action = if connected {
+            Button::new(("connect", index))
+                .w(px(112.))
+                .label(tr("disconnect"))
+                .on_click(cx.listener(move |this, _, w, cx| {
+                    this.disconnect_profile(&connect, w, cx);
+                }))
+                .into_any_element()
+        } else {
+            crate::design::PrimaryAction::new(("connect", index))
+                .w(px(112.))
+                .label(tr("connect-server"))
+                .on_click(cx.listener(move |this, _, w, cx| {
+                    this.connect(connect.clone(), w, cx);
+                }))
+                .into_any_element()
+        };
         let identity = div()
-            .flex_1()
+            .when(list, |d| d.flex_1())
             .min_w_0()
             .flex()
             .flex_col()
@@ -549,7 +561,14 @@ impl Workspace {
                 div()
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .gap_2()
+                    .child(
+                        div()
+                            .size(px(8.))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(state_color),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -558,25 +577,41 @@ impl Workspace {
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .id(("profile-name", index))
                             .tooltip(move |window, cx| {
-                                gpui_component::tooltip::Tooltip::new(name_tooltip.clone())
-                                    .build(window, cx)
+                                gpui_component::tooltip::Tooltip::new(format!(
+                                    "{} \u{b7} {}",
+                                    name_tooltip, last
+                                ))
+                                .build(window, cx)
                             })
                             .child(profile.name.clone()),
                     )
-                    .when(!profile.environment.is_empty(), |d| {
+                    .when(!config, |d| {
                         d.child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .max_w(px(120.))
-                                .flex_shrink_0()
-                                .truncate()
-                                .bg(rgb(p.raised))
-                                .text_xs()
-                                .child(profile.environment.clone()),
+                            Button::new(("favorite", index))
+                                .small()
+                                .ghost()
+                                .icon(IconName::Star)
+                                .selected(profile.favorite)
+                                .tooltip(tr(if profile.favorite {
+                                    "unfavorite-server"
+                                } else {
+                                    "favorite-server"
+                                }))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let old = this.store.clone();
+                                    if let Some(p) =
+                                        this.store.servers.iter_mut().find(|p| p.id == favorite.id)
+                                    {
+                                        p.favorite = !p.favorite;
+                                    }
+                                    if !this.persist() {
+                                        this.store = old;
+                                    }
+                                    cx.notify();
+                                })),
                         )
-                    }),
+                    })
+                    .child(menu),
             )
             .child(
                 div()
@@ -593,127 +628,133 @@ impl Workspace {
                         "{}@{}:{}",
                         profile.user, profile.host, profile.port
                     )),
-            )
-            .child(metadata)
+            );
+        let details = div()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .text_sm()
+            .when(!list, |d| d.pt_3().border_t_1().border_color(rgb(p.border)))
             .child(
                 div()
                     .flex()
+                    .gap_2()
                     .items_center()
-                    .gap_1()
-                    .text_xs()
-                    .text_color(
-                        if status == Some(opsssh_term_core::SessionState::Connected) {
-                            cx.theme().success
+                    .child(
+                        div()
+                            .w(px(92.))
+                            .flex_shrink_0()
+                            .text_color(rgb(p.muted))
+                            .child(tr("card-environment")),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(
+                        if profile.environment.is_empty() {
+                            tr("card-unassigned")
                         } else {
-                            rgb(p.muted).into()
+                            profile.environment.clone()
                         },
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .w(px(92.))
+                            .flex_shrink_0()
+                            .text_color(rgb(p.muted))
+                            .child(tr(if profile.identity_file.is_empty() {
+                                "card-authentication"
+                            } else {
+                                "card-key"
+                            })),
                     )
                     .child(
-                        if status == Some(opsssh_term_core::SessionState::Connected) {
-                            "\u{25cf}"
-                        } else {
-                            "\u{25cb}"
-                        },
-                    )
-                    .child(status_text),
-            );
-        let mut card = div()
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .id(("key-path", index))
+                            .tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(key_tooltip.clone())
+                                    .build(window, cx)
+                            })
+                            .child(key_path),
+                    ),
+            )
+            .when(!profile.proxy_jump.is_empty(), |d| {
+                d.child(
+                    div()
+                        .truncate()
+                        .text_xs()
+                        .text_color(rgb(p.muted))
+                        .child(format!("{} {}", tr("via-label"), profile.proxy_jump)),
+                )
+            })
+            .when(!profile.proxy_command.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(p.muted))
+                        .child(tr("proxy-label")),
+                )
+            });
+        div()
             .id(("server-card", index))
-            .h(px(if list { 124. } else { 228. }))
+            .h(px(if list { 124. } else { 240. }))
             .overflow_hidden()
-            .p_4()
+            .p_5()
             .rounded(px(7.))
             .bg(rgb(p.surface))
             .border_1()
             .border_color(rgb(p.border))
-            .hover(|d| {
-                d.border_color(rgb(p.muted)).shadow(vec![gpui::BoxShadow {
-                    color: gpui::rgba(0x00000014).into(),
-                    offset: gpui::point(px(0.), px(2.)),
-                    blur_radius: px(5.),
-                    spread_radius: px(0.),
-                    inset: false,
-                }])
-            })
+            .hover(|d| d.border_color(rgb(p.hover)))
             .flex()
             .gap_3()
             .when(!list, |d| d.flex_col())
             .when(list, |d| d.items_center())
-            .child(identity);
-        card = card.child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .when(!list, |d| d.pt_3().border_t_1().border_color(rgb(p.border)))
-                .child(
-                    crate::design::PrimaryAction::new(("connect", index))
-                        .w(px(112.))
-                        .label(tr(if connected {
-                            "disconnect"
-                        } else {
-                            "connect-server"
-                        }))
-                        .on_click(cx.listener(move |this, _, w, cx| {
-                            if connected {
-                                this.disconnect_profile(&connect, w, cx);
-                            } else {
-                                this.connect(connect.clone(), w, cx);
-                            }
-                        })),
-                )
-                .child(div().flex_1())
-                .when(!config, |d| {
-                    d.child(
-                        Button::new(("favorite", index))
-                            .ghost()
-                            .icon(IconName::Star)
-                            .selected(profile.favorite)
-                            .tooltip(tr(if profile.favorite {
-                                "unfavorite-server"
-                            } else {
-                                "favorite-server"
-                            }))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let old = this.store.clone();
-                                if let Some(p) =
-                                    this.store.servers.iter_mut().find(|p| p.id == favorite.id)
-                                {
-                                    p.favorite = !p.favorite;
-                                }
-                                if !this.persist() {
-                                    this.store = old;
-                                }
-                                cx.notify();
-                            })),
+            .child(identity)
+            .child(div().when(list, |d| d.w(px(270.))).child(details))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .when(!list, |d| d.mt_auto())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_sm()
+                            .text_color(rgb(p.muted))
+                            .child(div().size(px(6.)).rounded_full().bg(state_color))
+                            .child(div().truncate().child(status_text)),
                     )
-                })
-                .child(menu),
-        );
-        card.child(
-            div()
-                .text_xs()
-                .text_color(rgb(p.muted))
-                .max_w(px(if list { 120. } else { 1000. }))
-                .truncate()
-                .child(last),
-        )
-        .on_hover(cx.listener(move |this, hovered, _, cx| {
-            this.hovered_card = if *hovered { Some(index) } else { None };
-            cx.notify();
-        }))
-        .with_spring(
-            ("server-motion", index),
-            SpringAnimation::new(SpringConfig::new(180., 27., 1.))
-                .to(if self.hovered_card == Some(index) {
-                    -2.
-                } else {
-                    0.
-                })
-                .from(0.),
-            |d, offset| d.relative().top(px(offset)),
-        )
-        .into_any_element()
+                    .child(action),
+            )
+            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                this.hovered_card = if *hovered { Some(index) } else { None };
+                cx.notify();
+            }))
+            .with_spring(
+                ("server-motion", index),
+                SpringAnimation::new(SpringConfig::new(180., 27., 1.))
+                    .to(if self.hovered_card == Some(index) {
+                        -2.
+                    } else {
+                        0.
+                    })
+                    .from(0.),
+                |d, offset| d.relative().top(px(offset)),
+            )
+            .into_any_element()
     }
     fn servers(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = design::palette(cx);
@@ -726,7 +767,7 @@ impl Workspace {
             } else {
                 228.
             };
-        let available = f32::from(window.viewport_size().width) - sidebar_width - 64.;
+        let available = f32::from(window.viewport_size().width) - sidebar_width - 80.;
         let columns = if list {
             1
         } else {
@@ -750,6 +791,7 @@ impl Workspace {
             .collect::<std::collections::BTreeSet<_>>();
         let workspace = cx.entity().downgrade();
         let environment_menu = Button::new("environment-filter")
+            .icon(gpui_kit_assets::IconName::ListFilter)
             .label(if self.environment_filter.is_empty() {
                 tr("all-environments")
             } else {
@@ -783,7 +825,7 @@ impl Workspace {
             });
         let mut page = div()
             .size_full()
-            .p_6()
+            .p_8()
             .flex()
             .flex_col()
             .gap_4()
@@ -792,6 +834,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .justify_between()
+                    .pb_4()
                     .gap_3()
                     .child(
                         div()
@@ -802,7 +845,7 @@ impl Workspace {
                                 div()
                                     .text_xs()
                                     .text_color(rgb(p.muted))
-                                    .child(tr("workspace-breadcrumb")),
+                                    .child(format!("Workspace / {}", title)),
                             )
                             .child(
                                 div()
@@ -845,9 +888,14 @@ impl Workspace {
                     .items_center()
                     .gap_2()
                     .flex_wrap()
+                    .py_3()
+                    .border_t_1()
+                    .border_b_1()
+                    .border_color(rgb(p.border))
                     .child(
                         div().flex_1().min_w(px(220.)).child(
                             Input::new(&self.search)
+                                .prefix(Icon::new(IconName::Search).text_color(rgb(p.muted)))
                                 .cleanable(true)
                                 .aria_label(tr("search-servers")),
                         ),
@@ -901,21 +949,39 @@ impl Workspace {
                             } else {
                                 "sort-name"
                             }))
-                            .on_click(cx.listener(|this, _, w, cx| {
-                                this.change_settings(
-                                    |s| {
-                                        s.sort = if s.sort == "last_connected" {
-                                            "name"
-                                        } else {
-                                            "last_connected"
-                                        }
-                                        .into()
-                                    },
-                                    w,
-                                    cx,
-                                )
-                            })),
+                            .dropdown_menu({
+                                let weak = cx.entity().downgrade();
+                                move |mut menu, _, _| {
+                                    for (value, label) in
+                                        [("name", "sort-name"), ("last_connected", "sort-recent")]
+                                    {
+                                        let weak = weak.clone();
+                                        menu = menu.item(PopupMenuItem::new(tr(label)).on_click(
+                                            move |_, window, cx| {
+                                                let _ = weak.update(cx, |this, cx| {
+                                                    this.change_settings(
+                                                        |settings| settings.sort = value.into(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            },
+                                        ));
+                                    }
+                                    menu
+                                }
+                            }),
                     ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(rgb(p.muted))
+                    .child(tr("card-collection"))
+                    .child(format!("{} {}", profiles.len(), tr("card-shown"))),
             );
         if rows == 0 {
             let first =
@@ -978,7 +1044,7 @@ impl Workspace {
                         range
                             .map(|row| {
                                 div()
-                                    .h(px(if list { 144. } else { 244. }))
+                                    .h(px(if list { 144. } else { 256. }))
                                     .pb_4()
                                     .flex()
                                     .gap_4()
@@ -1800,53 +1866,6 @@ impl Workspace {
             )
             .child(
                 div()
-                    .id("workspace-tabs")
-                    .h(px(54.))
-                    .px_2()
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .gap_0()
-                    .bg(rgb(p.sidebar))
-                    .border_b_1()
-                    .border_color(rgb(p.border))
-                    .child(
-                        Button::new("home-tab")
-                            .h_full()
-                            .w(px(140.))
-                            .rounded_none()
-                            .border_r_1()
-                            .border_color(rgb(p.border))
-                            .ghost()
-                            .selected(home)
-                            .icon(gpui_kit_assets::IconName::House)
-                            .label(tr("home-title"))
-                            .on_click(cx.listener(|this, _, w, cx| this.home(&GoHome, w, cx))),
-                    )
-                    .child(
-                        div()
-                            .id("open-tabs")
-                            .h_full()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_x_scroll()
-                            .flex()
-                            .gap_0()
-                            .children(tabs),
-                    )
-                    .child(
-                        Button::new("new-local")
-                            .ghost()
-                            .icon(IconName::Plus)
-                            .tooltip(tr("open-local"))
-                            .accessibility_label(tr("open-local"))
-                            .on_click(cx.listener(|this, _, w, cx| {
-                                this.open_local(&OpenLocalTerminal, w, cx)
-                            })),
-                    ),
-            )
-            .child(
-                div()
                     .flex_1()
                     .min_h_0()
                     .flex()
@@ -1873,6 +1892,55 @@ impl Workspace {
                             .min_w_0()
                             .flex()
                             .flex_col()
+                            .child(
+                                div()
+                                    .id("workspace-tabs")
+                                    .h(px(54.))
+                                    .px_2()
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap_0()
+                                    .bg(rgb(p.sidebar))
+                                    .border_b_1()
+                                    .border_color(rgb(p.border))
+                                    .child(
+                                        Button::new("home-tab")
+                                            .h_full()
+                                            .w(px(140.))
+                                            .rounded_none()
+                                            .border_r_1()
+                                            .border_color(rgb(p.border))
+                                            .ghost()
+                                            .selected(home)
+                                            .icon(gpui_kit_assets::IconName::Server)
+                                            .label(tr("nav-servers"))
+                                            .on_click(cx.listener(|this, _, w, cx| {
+                                                this.home(&GoHome, w, cx)
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("open-tabs")
+                                            .h_full()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_x_scroll()
+                                            .flex()
+                                            .gap_0()
+                                            .children(tabs),
+                                    )
+                                    .child(
+                                        Button::new("new-local")
+                                            .ghost()
+                                            .icon(IconName::Plus)
+                                            .tooltip(tr("open-local"))
+                                            .accessibility_label(tr("open-local"))
+                                            .on_click(cx.listener(|this, _, w, cx| {
+                                                this.open_local(&OpenLocalTerminal, w, cx)
+                                            })),
+                                    ),
+                            )
                             .when(!self.message.is_empty(), |d| {
                                 d.child(
                                     div()
