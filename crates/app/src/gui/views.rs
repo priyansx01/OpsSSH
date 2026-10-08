@@ -126,6 +126,8 @@ impl Workspace {
                             ))
                         })
                         .w_full()
+                        .h(px(36.))
+                        .px_3()
                         .justify_start()
                         .when(collapsed, |b| b.justify_center())
                         .on_click(cx.listener(|this, _, w, cx| this.home(&GoHome, w, cx))),
@@ -179,6 +181,8 @@ impl Workspace {
                             b.child(sidebar_label(key, self.store.settings.reduced_motion))
                         })
                         .w_full()
+                        .h(px(36.))
+                        .px_3()
                         .justify_start()
                         .when(collapsed, |b| b.justify_center())
                         .on_click(
@@ -226,39 +230,57 @@ impl Workspace {
             .p_3()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_1()
             .bg(rgb(p.sidebar))
             .border_r_1()
             .border_color(rgb(p.border))
             .child(
                 div()
-                    .h(px(48.))
+                    .h(px(54.))
+                    .flex_shrink_0()
+                    .mx(-px(12.))
+                    .mt(-px(12.))
+                    .mb_2()
+                    .px(px(if collapsed { 0. } else { 24. }))
+                    .border_b_1()
+                    .border_color(rgb(p.border))
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap(px(10.))
+                    .when(collapsed, |d| d.justify_center())
                     .child(
                         div()
-                            .rounded_md()
-                            .p_2()
-                            .bg(rgb(p.ruby))
-                            .text_color(rgb(p.on_ruby))
-                            .text_lg()
-                            .child(">_"),
+                            .size(px(32.))
+                            .flex_shrink_0()
+                            .rounded(px(8.))
+                            .bg(design::action_gradient(false))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                Icon::new(gpui_kit_assets::IconName::Terminal)
+                                    .size(px(19.))
+                                    .text_color(rgb(p.on_ruby)),
+                            ),
                     )
                     .when(!collapsed, |d| {
                         d.child(
                             div()
+                                .flex_1()
+                                .min_w_0()
                                 .flex()
                                 .flex_col()
-                                .gap_1()
+                                .gap(px(2.))
                                 .child(
                                     div()
+                                        .text_size(px(15.))
                                         .font_weight(gpui::FontWeight::SEMIBOLD)
                                         .child("OpsSSH"),
                                 )
                                 .child(
                                     div()
-                                        .text_xs()
+                                        .text_size(px(10.))
+                                        .truncate()
                                         .text_color(rgb(p.muted))
                                         .child(tr("workspace-subtitle")),
                                 ),
@@ -279,7 +301,7 @@ impl Workspace {
             (
                 "From SSH config",
                 "nav-config",
-                gpui_kit_assets::IconName::File,
+                gpui_kit_assets::IconName::KeyRound,
             ),
         ]
         .into_iter()
@@ -300,6 +322,8 @@ impl Workspace {
                         b.child(sidebar_label(key, self.store.settings.reduced_motion))
                     })
                     .w_full()
+                    .h(px(36.))
+                    .px_3()
                     .justify_start()
                     .when(collapsed, |b| b.justify_center())
                     .on_click(cx.listener(move |this, _, w, cx| {
@@ -321,8 +345,9 @@ impl Workspace {
                 .collect::<std::collections::BTreeSet<_>>();
             sidebar = sidebar.child(
                 div()
-                    .pt_4()
+                    .pt_5()
                     .pb_1()
+                    .px_3()
                     .text_xs()
                     .text_color(rgb(p.muted))
                     .child(tr("nav-environments")),
@@ -331,6 +356,7 @@ impl Workspace {
                 sidebar = sidebar.child(
                     Button::new(("environment", i))
                         .ghost()
+                        .icon(gpui_kit_assets::IconName::Box)
                         .selected(
                             self.filter == environment
                                 && !self.settings_page
@@ -340,6 +366,8 @@ impl Workspace {
                         .accessibility_label(environment.clone())
                         .child(div().flex_1().min_w_0().child(environment.clone()))
                         .w_full()
+                        .h(px(36.))
+                        .px_3()
                         .justify_start()
                         .when(collapsed, |b| b.justify_center())
                         .on_click(cx.listener(move |this, _, w, cx| {
@@ -352,7 +380,8 @@ impl Workspace {
             }
         }
         sidebar
-            .child(div().flex_1())
+            .child(div().flex_1().min_h_0())
+            .child(div().h(px(1.)).flex_shrink_0().bg(rgb(p.border)).mb_2())
             .child(
                 Button::new("settings-nav")
                     .ghost()
@@ -367,6 +396,8 @@ impl Workspace {
                         ))
                     })
                     .w_full()
+                    .h(px(36.))
+                    .px_3()
                     .justify_start()
                     .when(collapsed, |b| b.justify_center())
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -388,6 +419,8 @@ impl Workspace {
                         b.child(sidebar_label("help", self.store.settings.reduced_motion))
                     })
                     .w_full()
+                    .h(px(36.))
+                    .px_3()
                     .justify_start()
                     .when(collapsed, |b| b.justify_center())
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -415,6 +448,8 @@ impl Workspace {
                         ))
                     })
                     .w_full()
+                    .h(px(36.))
+                    .px_3()
                     .justify_start()
                     .when(collapsed, |b| b.justify_center())
                     .on_click(cx.listener(|this, _, w, cx| {
@@ -1860,7 +1895,11 @@ impl Workspace {
                             .items_center()
                             .gap_2()
                             .text_xs()
-                            .child(div().text_color(rgb(p.ruby)).child(">_"))
+                            .child(
+                                Icon::new(gpui_kit_assets::IconName::Terminal)
+                                    .size(px(14.))
+                                    .text_color(rgb(p.ruby)),
+                            )
                             .child("OpsSSH"),
                     ),
             )
