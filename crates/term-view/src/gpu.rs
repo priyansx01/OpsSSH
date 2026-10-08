@@ -85,7 +85,7 @@ pub struct TerminalView {
     connection_generation: u64,
     at_prompt: bool,
     paste_preview: Option<String>,
-    #[cfg(all(test, feature = "test-support"))]
+    #[cfg(feature = "test-support")]
     sent_input: Vec<Vec<u8>>,
     error: Option<String>,
     title: String,
@@ -221,12 +221,36 @@ impl TerminalView {
         self.paste_text(text, cx);
     }
 
+    /// A completed upload inserts a literal path as one paste transaction, without Enter.
+    pub fn insert_uploaded_path(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        if !self.accepts_terminal_input() || text.contains(['\n', '\r']) {
+            return false;
+        }
+        let Some(session) = &self.session else {
+            return false;
+        };
+        let Ok(bytes) = encode_paste(session.state(), session.modes(), text) else {
+            return false;
+        };
+        self.selection = None;
+        self.anchor = None;
+        session.scroll_to_bottom();
+        let sent = self.send_checked(bytes, cx);
+        cx.notify();
+        sent
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn preview_sent_input(&self) -> Vec<u8> {
+        self.sent_input.concat()
+    }
+
+    pub fn accepts_terminal_input(&self) -> bool {
+        self.state().accepts_input() && self.prompt.is_none() && self.paste_preview.is_none()
+    }
+
     pub fn accepts_terminal_keys(&self, window: &Window) -> bool {
-        window.is_window_active()
-            && self.focus.is_focused(window)
-            && self.state().accepts_input()
-            && self.prompt.is_none()
-            && self.paste_preview.is_none()
+        window.is_window_active() && self.focus.is_focused(window) && self.accepts_terminal_input()
     }
 
     /// Native system keys are already suppressed by the platform hook, so use the
@@ -395,7 +419,7 @@ impl TerminalView {
             connection_generation: 0,
             at_prompt: false,
             paste_preview: None,
-            #[cfg(all(test, feature = "test-support"))]
+            #[cfg(feature = "test-support")]
             sent_input: Vec::new(),
             error: None,
             title: "Local terminal".into(),
@@ -922,13 +946,26 @@ impl TerminalView {
     }
 
     fn send(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
-        #[cfg(all(test, feature = "test-support"))]
+        self.send_checked(bytes, cx);
+    }
+
+    fn send_checked(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) -> bool {
+        #[cfg(feature = "test-support")]
+        if self.sent_input.len() >= 512 {
+            self.sent_input.clear();
+        }
+        #[cfg(feature = "test-support")]
         self.sent_input.push(bytes.clone());
-        if let Some(session) = &self.session
-            && let Err(error) = session.write(bytes)
-        {
-            self.error = Some(error.to_string());
-            cx.notify();
+        let Some(session) = &self.session else {
+            return false;
+        };
+        match session.write(bytes) {
+            Ok(()) => true,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                cx.notify();
+                false
+            }
         }
     }
 
@@ -1447,11 +1484,12 @@ impl Render for TerminalView {
             .bg(rgb(0x12141a))
             .text_color(colors.foreground)
             .track_focus(&self.focus)
-            .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| {
+            .on_drop(cx.listener(|view, paths: &ExternalPaths, window, cx| {
                 if view.state().accepts_input()
                     && view.prompt.is_none()
                     && view.paste_preview.is_none()
                 {
+                    view.focus(window, cx);
                     cx.emit(TerminalViewEvent::UploadFiles(
                         paths.0.iter().cloned().collect(),
                     ));
@@ -1908,6 +1946,13 @@ mod clipboard_tests {
             ("tab", b"\t".as_slice()),
             ("left", b"\x1b[D".as_slice()),
             ("ctrl-c", b"\x03".as_slice()),
+            ("ctrl-v", b"\x16".as_slice()),
+            ("ctrl-n", b"\x0e".as_slice()),
+            ("ctrl-k", b"\x0b".as_slice()),
+            ("ctrl-w", b"\x17".as_slice()),
+            ("ctrl-shift-v", b"\x16".as_slice()),
+            ("alt-left", b"\x1b[1;3D".as_slice()),
+            ("shift-left", b"\x1b[1;2D".as_slice()),
         ] {
             cx.update(|_, cx| view.update(cx, |view, _| view.sent_input.clear()));
             cx.simulate_keystrokes(keys);
@@ -1937,6 +1982,40 @@ mod clipboard_tests {
             b"\x1b[9;2u"
         );
         cx.update(|_, cx| view.update(cx, |view, cx| view.disconnect(cx)));
+    }
+
+    #[gpui::test]
+    fn uploaded_file_paths_use_one_paste_transaction_without_enter(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let session = Session::local(LocalShellOptions::default()).unwrap();
+        let (view, cx) = cx.add_window_view(fixture);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.stopped = false;
+                view.session = Some(session);
+                view.session
+                    .as_ref()
+                    .unwrap()
+                    .backend()
+                    .lock()
+                    .unwrap()
+                    .ingest(b"\x1b[?2004h")
+                    .unwrap();
+                assert!(view.insert_uploaded_path("'/home/backend/image.png' ", cx));
+                assert_eq!(
+                    view.sent_input.concat(),
+                    b"\x1b[200~'/home/backend/image.png' \x1b[201~"
+                );
+                let count = view.sent_input.len();
+                view.paste_preview = Some("review".into());
+                assert!(!view.insert_uploaded_path("'/ignored.png' ", cx));
+                view.paste_preview = None;
+                assert!(!view.insert_uploaded_path("bad\npath", cx));
+                view.disconnect(cx);
+                assert!(!view.insert_uploaded_path("'/disconnected.png' ", cx));
+                assert_eq!(view.sent_input.len(), count);
+            })
+        });
     }
 
     #[gpui::test]

@@ -195,6 +195,7 @@ upload-remember = Remember for this server
 upload-browse = Browse this path
 upload-ssh-home = Use SSH home
 upload-change-folder = Change folder
+upload-dismiss = Dismiss upload notice
 upload-use-folder = Use this folder
 upload-checking = Checking folder…
 upload-invalid-directory = Enter a valid remote folder path.

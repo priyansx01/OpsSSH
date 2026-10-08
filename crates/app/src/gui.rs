@@ -148,6 +148,7 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
                     let files=cx.new(|cx|if screen.contains("files-list") {FilePane::preview_list(window,cx)}else{FilePane::preview(window,cx)});
                     let tab=workspace.sessions.last_mut().unwrap();tab.files=Some(files);tab.files_visible=screen.contains("files");
                     if screen.contains("upload-progress") || screen.contains("upload-failed") {tab.files.as_ref().unwrap().update(cx,|files,_|files.preview_transfer(screen.contains("failed")));}
+                    if screen.contains("upload-complete") {tab.files.as_ref().unwrap().update(cx,|files,cx|files.preview_completed_upload("'/srv/uploads/screenshot.png' ".into(),cx));}
                     if screen.contains("session") && screen.contains("files") {tab.page=SessionPage::Files;tab.files.as_ref().unwrap().update(cx,|f,cx|f.set_full_page(true,cx));}
                 }
                 if screen.contains("session") || screen.contains("close") || screen.contains("background") {
@@ -301,6 +302,89 @@ impl Workspace {
             self.sessions[index]
                 .terminal
                 .update(cx, |terminal, cx| terminal.focus(window, cx));
+        }
+    }
+
+    fn uploaded_path_terminal(
+        &self,
+        pane: &Entity<FilePane>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<TerminalView>> {
+        if !self.terminal_visible()
+            || !window.is_window_active()
+            || self.editor.is_some()
+            || self.pending_close.is_some()
+            || self.quit_dialog
+            || self.upload_dialog.is_some()
+            || window.has_active_dialog(cx)
+        {
+            return None;
+        }
+        let tab = self.sessions.iter().find(|tab| {
+            tab.files.as_ref() == Some(pane) && self.navigation.active == Some(tab.id)
+        })?;
+        let terminal = tab.terminal.read(cx);
+        if tab.files_needs_rebind
+            || terminal.connection_generation() != tab.file_generation
+            || !terminal.accepts_terminal_input()
+        {
+            return None;
+        }
+        if !tab.files_visible
+            && (window.focused(cx).is_none() || self.home_focus.is_focused(window))
+        {
+            tab.terminal
+                .update(cx, |terminal, cx| terminal.focus(window, cx));
+        }
+        tab.terminal
+            .read(cx)
+            .accepts_terminal_keys(window)
+            .then(|| tab.terminal.clone())
+    }
+
+    fn deliver_uploaded_path(
+        &self,
+        pane: &Entity<FilePane>,
+        id: u64,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(terminal) = self.uploaded_path_terminal(pane, window, cx) {
+            if terminal.update(cx, |terminal, cx| terminal.insert_uploaded_path(text, cx)) {
+                pane.update(cx, |pane, cx| pane.path_inserted(id, cx));
+            } else {
+                // A failed write may have partially queued input; never replay it automatically.
+                pane.update(cx, |pane, cx| pane.require_manual_insert(id, cx));
+            }
+        } else {
+            pane.update(cx, |pane, cx| pane.defer_insert(id, cx));
+        }
+    }
+
+    fn flush_uploaded_paths(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pane) = self
+            .navigation
+            .active
+            .and_then(|id| self.session_index(id))
+            .and_then(|index| self.sessions[index].files.clone())
+        else {
+            return;
+        };
+        let pending = pane.read(cx).pending_upload_paths();
+        if pending.is_empty() {
+            return;
+        }
+        if let Some(terminal) = self.uploaded_path_terminal(&pane, window, cx) {
+            for (id, text) in pending {
+                if terminal.update(cx, |terminal, cx| terminal.insert_uploaded_path(&text, cx)) {
+                    pane.update(cx, |pane, cx| pane.path_inserted(id, cx));
+                } else {
+                    pane.update(cx, |pane, cx| pane.require_manual_insert(id, cx));
+                    break;
+                }
+            }
         }
     }
 
@@ -1084,31 +1168,7 @@ impl Workspace {
                     return;
                 }
             };
-            // FilePane discards old worker updates; also require this pane's current live transport.
-            if let Some(tab) = this
-                .sessions
-                .iter()
-                .find(|s| s.files.as_ref() == Some(pane))
-                && !tab.files_needs_rebind
-                && tab.terminal.read(cx).connection_generation() == tab.file_generation
-                && tab.terminal.read(cx).session_state()
-                    == opsssh_term_core::SessionState::Connected
-            {
-                if this.navigation.active == Some(tab.id)
-                    && this.terminal_visible()
-                    && this.editor.is_none()
-                    && this.pending_close.is_none()
-                    && !this.quit_dialog
-                    && this.upload_dialog.is_none()
-                    && !window.has_active_dialog(cx)
-                    && tab.terminal.read(cx).accepts_terminal_keys(window)
-                {
-                    tab.terminal
-                        .update(cx, |terminal, cx| terminal.insert_text(text, cx));
-                } else {
-                    pane.update(cx, |pane, cx| pane.defer_insert(*id, cx));
-                }
-            }
+            this.deliver_uploaded_path(pane, *id, text, window, cx);
         })
         .detach();
         self.sessions[index].files = Some(files.clone());
@@ -1212,6 +1272,73 @@ impl Render for Workspace {
 mod tests {
     use super::*;
     use gpui::{Focusable, TestAppContext, VisualTestContext};
+
+    #[gpui::test]
+    fn completed_upload_inserts_once_after_focus_returns_and_preserves_modal_guards(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            bind_workspace_keys(cx);
+        });
+        let mut workspace = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| fixture(window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        VisualTestContext::update(cx, |window, _| window.activate_window());
+        cx.run_until_parked();
+        VisualTestContext::update(cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                assert!(window.is_window_active());
+                let index = this.session_index(this.navigation.active.unwrap()).unwrap();
+                let terminal = cx.new(|cx| TerminalView::preview_connected_local(window, cx));
+                let pane = cx.new(|cx| FilePane::preview(window, cx));
+                this.sessions[index].terminal = terminal.clone();
+                this.sessions[index].files = Some(pane.clone());
+                this.sessions[index].file_generation = terminal.read(cx).connection_generation();
+                let text = "'/home/backend/screenshot.png' ";
+                let id = pane.update(cx, |pane, cx| {
+                    pane.preview_completed_upload(text.into(), cx)
+                });
+                this.quit_dialog = true;
+                this.deliver_uploaded_path(&pane, id, text, window, cx);
+                assert!(terminal.read(cx).preview_sent_input().is_empty());
+                this.quit_dialog = false;
+                this.sessions[index].files_visible = true;
+                this.home_focus.focus(window, cx);
+                this.flush_uploaded_paths(window, cx);
+                assert!(
+                    terminal.read(cx).preview_sent_input().is_empty(),
+                    "file-input focus must be retained"
+                );
+                this.sessions[index].files_visible = false;
+                this.flush_uploaded_paths(window, cx);
+                assert_eq!(terminal.read(cx).preview_sent_input(), text.as_bytes());
+                assert!(pane.read(cx).pending_upload_paths().is_empty());
+                this.flush_uploaded_paths(window, cx);
+                assert_eq!(
+                    terminal.read(cx).preview_sent_input(),
+                    text.as_bytes(),
+                    "path was inserted twice"
+                );
+                let stale = pane.update(cx, |pane, cx| {
+                    pane.preview_completed_upload("'/old/session.png' ".into(), cx)
+                });
+                pane.update(cx, |pane, cx| pane.suspend(cx));
+                this.flush_uploaded_paths(window, cx);
+                assert_eq!(
+                    terminal.read(cx).preview_sent_input(),
+                    text.as_bytes(),
+                    "stale path reached the terminal"
+                );
+                pane.update(cx, |pane, cx| pane.dismiss_transfer_notice(stale, cx));
+                terminal.update(cx, |terminal, cx| terminal.disconnect(cx));
+            })
+        });
+    }
 
     #[gpui::test]
     fn terminal_drops_keep_files_closed_and_remember_the_chosen_destination(

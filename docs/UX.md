@@ -191,9 +191,18 @@ keep their chosen destination, and Change destination updates explicit retries.
 Queued validation replies are tied to their dialog request and worker generation.
 
 Paths are inserted without Enter only into the active original terminal with its
-live connection generation, focus, and modal guards satisfied. Otherwise the
-tray keeps an Insert path action. Completed feedback disappears after four seconds
-unless insertion is pending; transfer history remains in Files.
+live connection generation, focus, and modal guards satisfied. Drops restore
+terminal focus. Successful paths use a single paste transaction, with bracketed
+paste framing when negotiated, so terminal applications such as Claude and Codex
+receive the reference immediately. No Enter is sent.
+If completion occurs while focus is elsewhere, delivery waits until the original
+terminal is ready again, then runs once. Reconnect generations cannot replay old
+paths automatically. A rejected transport write requires manual insertion.
+Insert path and Copy path remain available. Completed feedback disappears after
+four seconds unless insertion is pending; transfer history remains in Files.
+Every terminal notice has a dismiss ×. Dismissal preserves history and never
+cancels an active transfer or deletes a remote file. Dismissing completed pending
+feedback also discards its automatic insertion.
 
 GPUI springs animate card entrance/hover and tab indicators. Short underdamped
 sidebar/page and upload-card transitions add expressive motion. Terminal page
@@ -204,5 +213,7 @@ not schedule frames.
 
 Native previews: `snapshot-session-upload-progress`,
 `snapshot-session-upload-failed`, and `snapshot-session-upload-destination` with
-the `capture` feature. Windows physical-key and live VM/tmux acceptance should
+the `capture` feature; `snapshot-session-upload-complete` also demonstrates a
+completed path appearing in a real local PTY without submitting it.
+Windows physical-key and live VM/tmux acceptance should
 be exercised interactively; automated tests verify hook routing and encoder bytes.

@@ -1372,6 +1372,7 @@ impl Workspace {
         if terminal_open && (window.focused(cx).is_none() || self.home_focus.is_focused(window)) {
             self.restore_terminal_focus(window, cx);
         }
+        self.flush_uploaded_paths(window, cx);
         if self
             .capture
             .as_ref()

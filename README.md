@@ -52,8 +52,11 @@ folder picker checks write access before remembering a destination. Use SSH home
 selects the login user's home, avoiding unwritable parents such as `/home`.
 SFTP uses the SSH login's permissions even if the shell is running under sudo.
 A circular progress tray shows preparation, upload, cancellation, and failure. Successful
-uploads insert quoted remote paths without pressing Enter. If you move away from
-the original terminal, use Insert path or Copy path from its transfer feedback.
+uploads immediately paste quoted remote paths into the active terminal's prompt,
+including Claude and Codex, without pressing Enter. If you move away, delivery
+waits until the original terminal is focused again. Insert path and Copy path
+remain available. Each notice has an × to dismiss it; active transfers continue
+and history remains in Files.
 Files and folders never overwrite existing remote names automatically.
 
 Native spring motion animates server cards, tabs, navigation, dialogs, and upload

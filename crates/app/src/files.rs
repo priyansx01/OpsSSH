@@ -98,6 +98,8 @@ struct TransferTask {
     completed_at: Option<std::time::Instant>,
     remote_paths: Option<String>,
     pending_insert: bool,
+    insert_generation: Option<u64>,
+    dismissed: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FileSort {
@@ -244,6 +246,8 @@ impl FilePane {
                 completed_at: None,
                 remote_paths: None,
                 pending_insert: false,
+                insert_generation: None,
+                dismissed: false,
             }],
             progress_task: None,
             worker_generation: 0,
@@ -357,6 +361,22 @@ impl FilePane {
             task.failure = Some("Permission denied: choose another upload destination".into());
         }
     }
+
+    #[cfg(feature = "capture")]
+    pub fn preview_completed_upload(&mut self, text: String, cx: &mut Context<Self>) -> u64 {
+        self.preview_transfer(false);
+        let task = self.transfers.first_mut().expect("preview transfer");
+        task.state = TransferState::Completed;
+        task.bytes = task.control.total_bytes().unwrap_or(0);
+        task.retry = None;
+        task.remote_paths = Some(text);
+        task.pending_insert = true;
+        task.insert_generation = Some(self.worker_generation);
+        task.completed_at = Some(std::time::Instant::now());
+        let id = task.id;
+        cx.notify();
+        id
+    }
     #[cfg(feature = "capture")]
     pub fn preview_list(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut view = Self::preview(window, cx);
@@ -465,6 +485,8 @@ impl FilePane {
                                     this.transfers.iter_mut().find(|task| task.id == id)
                                 {
                                     task.remote_paths = Some(text.clone());
+                                    task.pending_insert = true;
+                                    task.insert_generation = Some(this.worker_generation);
                                 }
                                 cx.emit(FilePaneEvent::InsertText(id, text));
                             }
@@ -707,6 +729,8 @@ impl FilePane {
                         completed_at: None,
                         remote_paths: None,
                         pending_insert: false,
+                        insert_generation: None,
+                        dismissed: false,
                     });
                 }
                 self.message = format!("{}: {}", tr("file-pending-count"), self.pending);
@@ -884,6 +908,43 @@ impl FilePane {
     }
 }
 impl FilePane {
+    pub fn dismiss_transfer_notice(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(task) = self.transfers.iter_mut().find(|task| task.id == id) {
+            task.dismissed = true;
+            if !task.state.active() {
+                task.pending_insert = false;
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn pending_upload_paths(&self) -> Vec<(u64, String)> {
+        self.transfers
+            .iter()
+            .filter(|task| {
+                task.state == TransferState::Completed
+                    && task.pending_insert
+                    && task.insert_generation == Some(self.worker_generation)
+            })
+            .filter_map(|task| task.remote_paths.clone().map(|text| (task.id, text)))
+            .collect()
+    }
+
+    pub fn path_inserted(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(task) = self.transfers.iter_mut().find(|task| task.id == id) {
+            task.pending_insert = false;
+            cx.notify();
+        }
+    }
+
+    pub fn require_manual_insert(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(task) = self.transfers.iter_mut().find(|task| task.id == id) {
+            task.pending_insert = true;
+            task.insert_generation = None;
+            cx.notify();
+        }
+    }
+
     pub fn defer_insert(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(task) = self.transfers.iter_mut().find(|task| task.id == id) {
             task.pending_insert = true;
@@ -903,11 +964,12 @@ impl FilePane {
             .flex_col()
             .gap_2();
         for task in self.transfers.iter().rev().filter(|task| {
-            task.state != TransferState::Completed
-                || task.pending_insert
-                || task
-                    .completed_at
-                    .is_some_and(|at| at.elapsed() < Duration::from_secs(4))
+            !task.dismissed
+                && (task.state != TransferState::Completed
+                    || task.pending_insert
+                    || task
+                        .completed_at
+                        .is_some_and(|at| at.elapsed() < Duration::from_secs(4)))
         }) {
             let id = task.id;
             let total = task.control.total_bytes();
@@ -1052,7 +1114,19 @@ impl FilePane {
                                 cx.notify();
                             })),
                     )
-                });
+                })
+                .child(
+                    Button::new(("drop-dismiss", id))
+                        .small()
+                        .ghost()
+                        .icon(IconName::Close)
+                        .tooltip(tr("upload-dismiss"))
+                        .accessibility_label(tr("upload-dismiss"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.dismiss_transfer_notice(id, cx);
+                            cx.emit(FilePaneEvent::FocusTerminal);
+                        })),
+                );
             // Animate the feedback card, never the terminal grid or its input handler.
             card = card.opacity(1.);
             tray = tray.child(
@@ -2414,6 +2488,40 @@ async fn refresh_directory(client: &SftpClient, path: &str, updates: &Sender<Upd
 mod tests {
     use super::*;
 
+    #[cfg(feature = "capture")]
+    #[gpui::test]
+    fn dismissing_upload_notices_retains_history_and_does_not_cancel_work(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (pane, cx) = cx.add_window_view(FilePane::preview);
+        cx.update(|_, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.preview_transfer(false);
+                let id = pane.transfers[0].id;
+                let count = pane.transfers.len();
+                pane.dismiss_transfer_notice(id, cx);
+                assert!(pane.transfers[0].dismissed);
+                assert!(pane.transfers[0].control.ensure_active().is_ok());
+                assert_eq!(pane.active_transfers(), 1);
+                pane.preview_completed_upload("'/srv/upload.png' ".into(), cx);
+                assert_eq!(
+                    pane.pending_upload_paths().len(),
+                    1,
+                    "dismissed running uploads still complete"
+                );
+                pane.dismiss_transfer_notice(id, cx);
+                assert!(pane.pending_upload_paths().is_empty());
+                assert_eq!(pane.transfers.len(), count);
+                assert_eq!(
+                    pane.transfers[0].remote_paths.as_deref(),
+                    Some("'/srv/upload.png' ")
+                );
+                assert!(pane.transfers[0].dismissed);
+            })
+        });
+    }
+
     #[test]
     fn preparation_counts_nested_files_and_obeys_cancellation() {
         let root = tempfile::tempdir().unwrap();
@@ -2567,6 +2675,8 @@ mod tests {
                 completed_at: None,
                 remote_paths: None,
                 pending_insert: false,
+                insert_generation: None,
+                dismissed: false,
             },
             TransferTask {
                 id: 2,
@@ -2579,6 +2689,8 @@ mod tests {
                 completed_at: None,
                 remote_paths: None,
                 pending_insert: false,
+                insert_generation: None,
+                dismissed: false,
             },
         ];
         interrupt_transfers(&mut tasks);
