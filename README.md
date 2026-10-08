@@ -57,7 +57,11 @@ including Claude and Codex, without pressing Enter. If you move away, delivery
 waits until the original terminal is focused again. Insert path and Copy path
 remain available. Each notice has an × to dismiss it; active transfers continue
 and history remains in Files.
-Files and folders never overwrite existing remote names automatically.
+If an upload finds an existing filename, it pauses and shows the remote path with
+Replace and Cancel. Replace overwrites that file only; Cancel keeps it. Folder
+uploads merge existing folders and ask for each colliding file. Symbolic links
+and folders cannot be replaced with files. Dismissing a replacement prompt cancels
+the waiting upload; other active uploads keep running when their notice is dismissed.
 
 Native spring motion animates server cards, tabs, navigation, dialogs, and upload
 feedback. Terminal typing and output stay immediate. Reduced motion removes

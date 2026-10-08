@@ -149,6 +149,7 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
                     let tab=workspace.sessions.last_mut().unwrap();tab.files=Some(files);tab.files_visible=screen.contains("files");
                     if screen.contains("upload-progress") || screen.contains("upload-failed") {tab.files.as_ref().unwrap().update(cx,|files,_|files.preview_transfer(screen.contains("failed")));}
                     if screen.contains("upload-complete") {tab.files.as_ref().unwrap().update(cx,|files,cx|files.preview_completed_upload("'/srv/uploads/screenshot.png' ".into(),cx));}
+                    if screen.contains("upload-replace") {tab.files.as_ref().unwrap().update(cx,|files,cx|files.preview_upload_replacement(cx));}
                     if screen.contains("session") && screen.contains("files") {tab.page=SessionPage::Files;tab.files.as_ref().unwrap().update(cx,|f,cx|f.set_full_page(true,cx));}
                 }
                 if screen.contains("session") || screen.contains("close") || screen.contains("background") {

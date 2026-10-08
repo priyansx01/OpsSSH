@@ -54,6 +54,7 @@ enum Update {
     Message(String),
     Unavailable(String),
     Insert(u64, String),
+    Replace(u64, String, Sender<bool>),
     DestinationValidated(u64, String),
     DestinationFailed(u64, String),
     Started(u64),
@@ -67,6 +68,7 @@ struct QueuedJob {
 enum TransferState {
     Queued,
     Running,
+    AwaitingReplace,
     Cancelling,
     Completed,
     Cancelled,
@@ -74,12 +76,16 @@ enum TransferState {
 }
 impl TransferState {
     fn active(self) -> bool {
-        matches!(self, Self::Queued | Self::Running | Self::Cancelling)
+        matches!(
+            self,
+            Self::Queued | Self::Running | Self::AwaitingReplace | Self::Cancelling
+        )
     }
     fn label(self) -> String {
         tr(match self {
             Self::Queued => "file-task-queued",
             Self::Running => "file-task-running",
+            Self::AwaitingReplace => "upload-awaiting-replace",
             Self::Cancelling => "file-task-cancelling",
             Self::Completed => "file-task-completed",
             Self::Cancelled => "file-task-cancelled",
@@ -100,6 +106,7 @@ struct TransferTask {
     pending_insert: bool,
     insert_generation: Option<u64>,
     dismissed: bool,
+    replacement: Option<(String, Sender<bool>)>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FileSort {
@@ -248,6 +255,7 @@ impl FilePane {
                 pending_insert: false,
                 insert_generation: None,
                 dismissed: false,
+                replacement: None,
             }],
             progress_task: None,
             worker_generation: 0,
@@ -377,6 +385,20 @@ impl FilePane {
         cx.notify();
         id
     }
+
+    #[cfg(feature = "capture")]
+    pub fn preview_upload_replacement(&mut self, cx: &mut Context<Self>) {
+        self.preview_transfer(false);
+        let id = self.transfers[0].id;
+        self.transfers[0].label = format!("{}: test.txt", tr("file-upload"));
+        self.transfers[0].bytes = 0;
+        let (reply, receive) = async_channel::bounded(1);
+        cx.spawn(async move |_, _| {
+            let _ = receive.recv().await;
+        })
+        .detach();
+        self.request_replacement(id, "/opt/test.txt".into(), reply, cx);
+    }
     #[cfg(feature = "capture")]
     pub fn preview_list(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut view = Self::preview(window, cx);
@@ -472,6 +494,8 @@ impl FilePane {
                                 this.pending = 0;
                                 for task in &mut this.transfers {
                                     if task.state.active() {
+                                        task.control.cancel();
+                                        task.replacement = None;
                                         task.state = if task.state == TransferState::Cancelling {
                                             TransferState::Cancelled
                                         } else {
@@ -490,6 +514,9 @@ impl FilePane {
                                 }
                                 cx.emit(FilePaneEvent::InsertText(id, text));
                             }
+                            Update::Replace(id, path, reply) => {
+                                this.request_replacement(id, path, reply, cx);
+                            }
                             Update::Started(id) => {
                                 if let Some(task) =
                                     this.transfers.iter_mut().find(|task| task.id == id)
@@ -505,6 +532,7 @@ impl FilePane {
                                     this.transfers.iter_mut().find(|task| task.id == id)
                                 {
                                     task.bytes = task.control.batch_transferred();
+                                    task.replacement = None;
                                     task.failure = result.err();
                                     task.state = if success {
                                         TransferState::Completed
@@ -731,6 +759,7 @@ impl FilePane {
                         pending_insert: false,
                         insert_generation: None,
                         dismissed: false,
+                        replacement: None,
                     });
                 }
                 self.message = format!("{}: {}", tr("file-pending-count"), self.pending);
@@ -750,10 +779,14 @@ impl FilePane {
     }
     fn watch_progress(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.progress_task.is_some()
-            || !self
-                .transfers
-                .iter()
-                .any(|t| matches!(t.state, TransferState::Running | TransferState::Cancelling))
+            || !self.transfers.iter().any(|t| {
+                matches!(
+                    t.state,
+                    TransferState::Running
+                        | TransferState::AwaitingReplace
+                        | TransferState::Cancelling
+                )
+            })
         {
             return;
         }
@@ -784,6 +817,7 @@ impl FilePane {
             .find(|task| task.id == id && task.state.active())
         {
             task.control.cancel();
+            task.replacement = None;
             task.state = TransferState::Cancelling;
             self.message = tr("file-cancel-requested");
             cx.notify();
@@ -908,8 +942,45 @@ impl FilePane {
     }
 }
 impl FilePane {
+    fn request_replacement(
+        &mut self,
+        id: u64,
+        path: String,
+        reply: Sender<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(task) = self.transfers.iter_mut().find(|task| task.id == id)
+            && task.state != TransferState::Cancelling
+            && task.control.ensure_active().is_ok()
+        {
+            task.state = TransferState::AwaitingReplace;
+            task.replacement = Some((path, reply));
+            // A dismissed active upload must become visible when it requires a decision.
+            task.dismissed = false;
+            cx.notify();
+        }
+    }
+
+    fn replace_transfer(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(task) = self.transfers.iter_mut().find(|task| task.id == id)
+            && task.state == TransferState::AwaitingReplace
+            && task.control.ensure_active().is_ok()
+            && let Some((_, reply)) = task.replacement.take()
+        {
+            if reply.try_send(true).is_ok() {
+                task.state = TransferState::Running;
+            }
+            cx.notify();
+        }
+    }
+
     pub fn dismiss_transfer_notice(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(task) = self.transfers.iter_mut().find(|task| task.id == id) {
+            if task.state == TransferState::AwaitingReplace {
+                task.control.cancel();
+                task.replacement = None;
+                task.state = TransferState::Cancelling;
+            }
             task.dismissed = true;
             if !task.state.active() {
                 task.pending_insert = false;
@@ -1025,7 +1096,9 @@ impl FilePane {
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(if let Some(error) = &task.failure {
+                                .child(if let Some((path, _)) = &task.replacement {
+                                    format!("{} {path}", tr("upload-file-exists"))
+                                } else if let Some(error) = &task.failure {
                                     error.clone()
                                 } else {
                                     format!(
@@ -1050,6 +1123,18 @@ impl FilePane {
                             .label(tr("file-cancel-transfer"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.cancel_transfer(id, cx);
+                                cx.emit(FilePaneEvent::FocusTerminal);
+                            })),
+                    )
+                })
+                .when_some(task.replacement.as_ref(), |d, _| {
+                    d.child(
+                        Button::new(("drop-replace", id))
+                            .small()
+                            .primary()
+                            .label(tr("upload-replace"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.replace_transfer(id, cx);
                                 cx.emit(FilePaneEvent::FocusTerminal);
                             })),
                     )
@@ -2054,6 +2139,21 @@ impl FilePane {
                     ),
             );
         }
+        if let Some((path, _)) = &task.replacement {
+            card = card
+                .child(
+                    div()
+                        .text_xs()
+                        .child(format!("{} {path}", tr("upload-file-exists"))),
+                )
+                .child(
+                    Button::new(("transfer-replace", id))
+                        .small()
+                        .primary()
+                        .label(tr("upload-replace"))
+                        .on_click(cx.listener(move |this, _, _, cx| this.replace_transfer(id, cx))),
+                );
+        }
         if let Some(failure) = &task.failure {
             card = card.child(div().text_xs().text_color(muted).child(failure.clone()));
         }
@@ -2200,6 +2300,7 @@ fn interrupt_transfers(transfers: &mut [TransferTask]) {
         if task.state.active() {
             task.bytes = task.control.batch_transferred();
             task.control.cancel();
+            task.replacement = None;
             task.state = TransferState::Failed;
             task.failure = Some(tr("file-interrupted-transfer"));
         }
@@ -2400,7 +2501,11 @@ async fn execute(
                     .and_then(|name| name.to_str())
                     .ok_or_else(|| tr("file-invalid-name"))?;
                 let remote = opsssh_drop::join_remote(&directory, name)?;
-                client.upload_tree(&path, &remote, &control).await?;
+                client
+                    .upload_tree_with_confirmation(&path, &remote, &control, |remote| {
+                        request_upload_replacement(updates, id, remote, &control)
+                    })
+                    .await?;
                 inserted.push(opsssh_drop::quote(&remote, opsssh_drop::Shell::Posix)?);
             }
             if insert {
@@ -2470,6 +2575,33 @@ async fn execute(
     }
     Ok(())
 }
+async fn request_upload_replacement(
+    updates: &Sender<Update>,
+    id: u64,
+    path: String,
+    control: &TransferControl,
+) -> opsssh_sftp::Result<()> {
+    control.ensure_active()?;
+    let (reply, receive) = async_channel::bounded(1);
+    updates.send(Update::Replace(id, path, reply)).await?;
+    loop {
+        tokio::select! {
+            decision = receive.recv() => {
+                if decision? {
+                    control.ensure_active()?;
+                    return Ok(());
+                }
+                return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "upload cancelled; existing file kept").into());
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                control.ensure_active()?;
+                if updates.is_closed() {
+                    return Err("upload pane closed; existing file kept".into());
+                }
+            }
+        }
+    }
+}
 async fn refresh_parent(client: &SftpClient, path: &str, updates: &Sender<Update>) {
     let parent = path
         .rsplit_once('/')
@@ -2487,6 +2619,75 @@ async fn refresh_directory(client: &SftpClient, path: &str, updates: &Sender<Upd
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "capture")]
+    #[gpui::test]
+    fn upload_collision_waits_for_explicit_replace_and_cancel_keeps_the_file(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (pane, cx) = cx.add_window_view(FilePane::preview);
+        cx.update(|_, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.preview_transfer(false);
+                let id = pane.transfers[0].id;
+                pane.dismiss_transfer_notice(id, cx);
+                let (reply, receive) = async_channel::bounded(1);
+                pane.request_replacement(id, "/opt/test.txt".into(), reply, cx);
+                assert!(!pane.transfers[0].dismissed);
+                assert!(pane.transfers[0].state == TransferState::AwaitingReplace);
+                assert!(receive.try_recv().is_err(), "replace must not be automatic");
+                pane.replace_transfer(id, cx);
+                assert_eq!(receive.try_recv(), Ok(true));
+                assert!(pane.transfers[0].state == TransferState::Running);
+                pane.replace_transfer(id, cx);
+                assert!(
+                    receive.try_recv().is_err(),
+                    "replace must only be sent once"
+                );
+                let (reply, receive) = async_channel::bounded(1);
+                pane.request_replacement(id, "/opt/test.txt".into(), reply, cx);
+                pane.dismiss_transfer_notice(id, cx);
+                assert!(pane.transfers[0].state == TransferState::Cancelling);
+                assert!(receive.try_recv().is_err());
+                assert!(pane.transfers[0].control.ensure_active().is_err());
+            })
+        });
+    }
+
+    #[test]
+    fn replacement_worker_waits_for_decision_and_honors_cancellation() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (updates, receive) = async_channel::bounded(1);
+            let control = TransferControl::default();
+            let (result, ()) = tokio::join!(
+                request_upload_replacement(&updates, 42, "/opt/test.txt".into(), &control),
+                async {
+                    let Update::Replace(id, path, reply) = receive.recv().await.unwrap() else {
+                        panic!("expected collision");
+                    };
+                    assert_eq!((id, path.as_str()), (42, "/opt/test.txt"));
+                    reply.send(true).await.unwrap();
+                }
+            );
+            result.unwrap();
+            let (result, ()) = tokio::join!(
+                request_upload_replacement(&updates, 43, "/opt/test.txt".into(), &control),
+                async {
+                    let Update::Replace(_, _, _reply) = receive.recv().await.unwrap() else {
+                        panic!("expected collision");
+                    };
+                    control.cancel();
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                }
+            );
+            assert!(result.is_err());
+        });
+    }
 
     #[cfg(feature = "capture")]
     #[gpui::test]
@@ -2677,6 +2878,7 @@ mod tests {
                 pending_insert: false,
                 insert_generation: None,
                 dismissed: false,
+                replacement: None,
             },
             TransferTask {
                 id: 2,
@@ -2691,6 +2893,7 @@ mod tests {
                 pending_insert: false,
                 insert_generation: None,
                 dismissed: false,
+                replacement: None,
             },
         ];
         interrupt_transfers(&mut tasks);

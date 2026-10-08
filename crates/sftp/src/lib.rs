@@ -1,10 +1,12 @@
 //! Real SFTP over an already authenticated SSH channel. No credentials are owned here.
 use russh_sftp::{
-    client::SftpSession,
-    protocol::{FileAttributes, OpenFlags},
+    client::{SftpSession, error::Error as SftpError},
+    protocol::{FileAttributes, OpenFlags, StatusCode},
 };
 use std::{
-    fmt, io,
+    fmt,
+    future::Future,
+    io,
     path::Path,
     sync::{
         Arc,
@@ -14,6 +16,14 @@ use std::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+#[derive(Debug)]
+struct UploadCollision(FileAttributes);
+impl fmt::Display for UploadCollision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("destination exists; replacement requires confirmation")
+    }
+}
+impl std::error::Error for UploadCollision {}
 #[derive(Debug, Clone, Default)]
 pub struct TransferControl {
     cancelled: Arc<AtomicBool>,
@@ -233,6 +243,51 @@ impl SftpClient {
         remote: &str,
         control: &TransferControl,
     ) -> Result<u64> {
+        self.upload_tree_inner(local, remote, control, false, |_| async {
+            Err("destination exists; replacement requires confirmation".into())
+        })
+        .await
+    }
+
+    /// Merge folders without removing anything; confirm every colliding regular file.
+    /// New files still use exclusive creation, including after a concurrent collision.
+    pub async fn upload_tree_with_confirmation<F, Fut>(
+        &self,
+        local: &Path,
+        remote: &str,
+        control: &TransferControl,
+        confirm: F,
+    ) -> Result<u64>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        self.upload_tree_inner(local, remote, control, true, confirm)
+            .await
+    }
+
+    async fn existing_metadata(&self, path: &str) -> Result<Option<FileAttributes>> {
+        match self.session.symlink_metadata(path).await {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(SftpError::Status(status)) if status.status_code == StatusCode::NoSuchFile => {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn upload_tree_inner<F, Fut>(
+        &self,
+        local: &Path,
+        remote: &str,
+        control: &TransferControl,
+        merge_directories: bool,
+        mut confirm: F,
+    ) -> Result<u64>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
         let mut pending = vec![(local.to_path_buf(), remote.to_string())];
         let mut total = 0;
         while let Some((source, destination)) = pending.pop() {
@@ -242,7 +297,19 @@ impl SftpClient {
                 return Err("recursive upload does not follow symbolic links".into());
             }
             if metadata.is_dir() {
-                self.create_directory(&destination).await?;
+                match self.create_directory(&destination).await {
+                    Ok(()) => {}
+                    Err(error) => {
+                        if !merge_directories
+                            || !self
+                                .existing_metadata(&destination)
+                                .await?
+                                .is_some_and(|metadata| metadata.is_dir() && !metadata.is_symlink())
+                        {
+                            return Err(error);
+                        }
+                    }
+                }
                 let mut entries = tokio::fs::read_dir(&source).await?;
                 while let Some(entry) = entries.next_entry().await? {
                     let name = entry
@@ -252,9 +319,46 @@ impl SftpClient {
                     pending.push((entry.path(), opsssh_drop::join_remote(&destination, &name)?));
                 }
             } else if metadata.is_file() {
-                total += self
+                // SFTP v3 often reports a generic Failure for an exclusive-open collision.
+                // Inspect the path instead of interpreting a failure message as permission.
+                let result = self
                     .upload(&source, &destination, WriteMode::CreateNew, control)
-                    .await?;
+                    .await;
+                match result {
+                    Ok(bytes) => total += bytes,
+                    Err(error) => {
+                        control.check()?;
+                        let Some(UploadCollision(existing)) =
+                            error.downcast_ref::<UploadCollision>()
+                        else {
+                            return Err(error);
+                        };
+                        if !existing.is_regular() || existing.is_symlink() {
+                            return Err("cannot replace a folder, symbolic link, or special file with an upload".into());
+                        }
+                        confirm(destination.clone()).await?;
+                        control.check()?;
+                        let current = self.existing_metadata(&destination).await?.ok_or(
+                            "destination changed while waiting for replacement confirmation",
+                        )?;
+                        if !current.is_regular()
+                            || current.is_symlink()
+                            || current.size != existing.size
+                            || current.mtime != existing.mtime
+                            || current.permissions != existing.permissions
+                        {
+                            return Err("destination changed while waiting for replacement confirmation; upload again to review it".into());
+                        }
+                        total += self
+                            .upload(
+                                &source,
+                                &destination,
+                                WriteMode::OverwriteConfirmed,
+                                control,
+                            )
+                            .await?;
+                    }
+                }
             } else {
                 return Err("only regular files and folders can be uploaded".into());
             }
@@ -278,6 +382,7 @@ impl SftpClient {
         control.check()?;
         let mut source = tokio::fs::File::open(local).await?;
         let local_size = source.metadata().await?.len();
+        let create_new = matches!(mode, WriteMode::CreateNew);
         let (flags, offset) = match mode {
             WriteMode::CreateNew => (OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE, 0),
             WriteMode::OverwriteConfirmed => (
@@ -295,7 +400,7 @@ impl SftpClient {
                 (OpenFlags::WRITE, actual.size)
             }
         };
-        let mut destination = self
+        let destination = self
             .session
             .open_with_flags_and_attributes(
                 remote,
@@ -305,7 +410,16 @@ impl SftpClient {
                     ..FileAttributes::empty()
                 },
             )
-            .await?;
+            .await;
+        let mut destination = match destination {
+            Ok(file) => file,
+            Err(error) => {
+                if create_new && let Some(metadata) = self.existing_metadata(remote).await? {
+                    return Err(Box::new(UploadCollision(metadata)));
+                }
+                return Err(error.into());
+            }
+        };
         source.seek(io::SeekFrom::Start(offset)).await?;
         destination.seek(io::SeekFrom::Start(offset)).await?;
         let result = copy(&mut source, &mut destination, offset, control).await;

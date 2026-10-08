@@ -201,8 +201,17 @@ paths automatically. A rejected transport write requires manual insertion.
 Insert path and Copy path remain available. Completed feedback disappears after
 four seconds unless insertion is pending; transfer history remains in Files.
 Every terminal notice has a dismiss ×. Dismissal preserves history and never
-cancels an active transfer or deletes a remote file. Dismissing completed pending
+cancels a running transfer or deletes a remote file. Dismissing completed pending
 feedback also discards its automatic insertion.
+
+An existing upload filename pauses the transfer with its exact remote path and
+Replace / Cancel actions in both the terminal notice and Files transfer history.
+Replace authorizes only the current colliding file and resumes the original job;
+it is never remembered as a blanket overwrite preference. Cancellation or dismissing
+the waiting prompt keeps the existing file. Folder uploads merge directories without
+removing unrelated files and ask separately for each colliding regular file. Links,
+special files, and folders cannot be overwritten as files. Changed destination metadata
+while waiting requires a new review; write failures remain failures, not collisions.
 
 GPUI springs animate card entrance/hover and tab indicators. Short underdamped
 sidebar/page and upload-card transitions add expressive motion. Terminal page
@@ -215,5 +224,6 @@ Native previews: `snapshot-session-upload-progress`,
 `snapshot-session-upload-failed`, and `snapshot-session-upload-destination` with
 the `capture` feature; `snapshot-session-upload-complete` also demonstrates a
 completed path appearing in a real local PTY without submitting it.
+`snapshot-session-upload-replace` previews the repeated `/opt/test.txt` upload prompt.
 Windows physical-key and live VM/tmux acceptance should
 be exercised interactively; automated tests verify hook routing and encoder bytes.
