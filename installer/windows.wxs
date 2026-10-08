@@ -8,18 +8,18 @@
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/priyansx01/OpsSSH" />
     <StandardDirectory Id="LocalAppDataFolder">
         <Directory Id="INSTALLFOLDER" Name="OpsSSH">
-          <Component Id="Application">
+          <Component Id="Application" Guid="4C7D0474-1A27-42F8-A140-11D9C017F36C">
             <File Id="OpsSSHExe" Source="$(var.Stage)/opsssh.exe" />
             <RegistryValue Root="HKCU" Key="Software\OpsSSH\Installer" Name="Application" Type="integer" Value="1" KeyPath="yes" />
             <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
           </Component>
-          <Component Id="Branding">
+          <Component Id="Branding" Guid="1636DAF6-2A87-42C0-9E73-68E4C7B0AB01">
             <RegistryValue Root="HKCU" Key="Software\OpsSSH\Installer" Name="Branding" Type="integer" Value="1" KeyPath="yes" />
             <File Source="$(var.Stage)/opsssh.ico" />
             <File Source="$(var.Stage)/opsssh.png" />
             <File Source="$(var.Stage)/opsssh-mascot.svg" />
           </Component>
-          <Component Id="Documentation">
+          <Component Id="Documentation" Guid="BBCB5B76-60F1-43CA-8EED-4A726230F17A">
             <RegistryValue Root="HKCU" Key="Software\OpsSSH\Installer" Name="Documentation" Type="integer" Value="1" KeyPath="yes" />
             <File Source="$(var.Stage)/LICENSE-MIT" />
             <File Source="$(var.Stage)/LICENSE-APACHE" />
@@ -31,7 +31,7 @@
         </Directory>
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder">
-      <Directory Id="StartMenuFolder" Name="OpsSSH">
+      <Directory Id="OpsSSHMenuFolder" Name="OpsSSH">
         <Component Id="StartMenuShortcut">
           <Shortcut Id="LaunchOpsSSH" Name="OpsSSH" Target="[#OpsSSHExe]"
                     WorkingDirectory="INSTALLFOLDER" Icon="opsssh.exe" />
