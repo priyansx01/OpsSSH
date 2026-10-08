@@ -1,5 +1,6 @@
 use crate::connection_form::{ConnectionForm, FormEvent};
 use crate::files::{FilePane, FilePaneEvent};
+mod branding;
 mod session_tabs;
 mod terminal_uploads;
 mod views;
@@ -114,7 +115,7 @@ fn bind_workspace_keys(cx: &mut App) {
 fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
     let launched = Instant::now();
     let enable_native_capture = capture_path.is_none();
-    opsssh_platform::application().with_assets(gpui_kit_assets::AllAssets).run(move|cx:&mut App|{
+    opsssh_platform::application().with_assets(branding::AppAssets).run(move|cx:&mut App|{
     gpui_component::init(cx);Theme::change(ThemeMode::Dark,None,cx);
     bind_workspace_keys(cx);
     cx.on_window_closed(|cx,_|{if cx.windows().is_empty(){cx.quit();}}).detach();

@@ -272,19 +272,9 @@ impl Workspace {
                     .gap(px(10.))
                     .when(collapsed, |d| d.justify_center())
                     .child(
-                        div()
-                            .size(px(32.))
-                            .flex_shrink_0()
-                            .rounded(px(8.))
-                            .bg(design::action_gradient(false))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                Icon::new(gpui_kit_assets::IconName::Terminal)
-                                    .size(px(19.))
-                                    .text_color(rgb(p.on_ruby)),
-                            ),
+                        gpui::img("branding/opsssh.png")
+                            .size(px(38.))
+                            .flex_shrink_0(),
                     )
                     .when(!collapsed, |d| {
                         d.child(

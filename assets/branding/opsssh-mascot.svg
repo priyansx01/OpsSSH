@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="shell" x1="109" y1="55" x2="401" y2="445" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FF6B8A"/><stop offset="1" stop-color="#C51650"/>
+    </linearGradient>
+    <linearGradient id="face" x1="157" y1="211" x2="353" y2="365" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFF2E9"/><stop offset="1" stop-color="#F1CDBE"/>
+    </linearGradient>
+  </defs>
+  <!-- A friendly little terminal badger: built for OpsSSH, not based on another product mascot. -->
+  <path d="M143 94 103 45c-7-9-21-4-21 7v88c-27 31-43 73-43 119 0 96 75 174 168 174h105c85 0 154-69 154-154 0-42-17-80-44-107V53c0-12-15-17-22-7l-37 52c-24-11-50-17-78-17h-63c-28 0-55 5-79 13Z" fill="url(#shell)"/>
+  <path d="m111 103-1-27 24 30c-8 4-16 9-23 14Z" fill="#8C173A"/>
+  <path d="m394 106 1-27-23 31c8 4 15 9 22 14Z" fill="#8C173A"/>
+  <path d="M121 247c0-47 38-85 85-85h91c49 0 89 40 89 89v48c0 42-34 76-76 76h-98c-50 0-91-41-91-91v-37Z" fill="url(#face)"/>
+  <path d="M151 249c0-26 21-47 47-47h18v45c0 20-16 36-36 36h-29v-34Z" fill="#293042"/>
+  <path d="M361 249c0-26-21-47-47-47h-18v45c0 20 16 36 36 36h29v-34Z" fill="#293042"/>
+  <circle cx="190" cy="250" r="9" fill="#FFF"/><circle cx="322" cy="250" r="9" fill="#FFF"/>
+  <path d="M240 287c0-10 8-18 18-18h9c11 0 20 9 20 20v8c0 14-11 25-25 25h-2c-11 0-20-9-20-20v-15Z" fill="#C51650"/>
+  <path d="M257 322c-13 13-31 20-51 20m51-20c13 13 31 20 51 20" stroke="#293042" stroke-width="9" stroke-linecap="round"/>
+  <path d="M168 129h176" stroke="#FFD4DD" stroke-width="8" stroke-linecap="round" opacity=".7"/>
+  <path d="m186 112 12-15m116 15-12-15" stroke="#FFF0F3" stroke-width="8" stroke-linecap="round"/>
+  <!-- Tiny terminal badge -->
+  <rect x="201" y="389" width="110" height="58" rx="18" fill="#212638" stroke="#FFB0C1" stroke-width="5"/>
+  <path d="m222 407 12 10-12 10m25 0h21" stroke="#FFF2E9" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -5357,6 +5357,7 @@ name = "opsssh"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "embed-resource",
  "gpui-component",
  "gpui-kit-assets",
  "gpui-pre",
