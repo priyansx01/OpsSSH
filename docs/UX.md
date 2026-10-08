@@ -10,7 +10,7 @@ groups, favorites, and name/recent sorting. Recency is recorded only after a
 saved connection reaches Connected; exported profiles omit local timestamps.
 There are no synthetic reachability indicators in the application.
 
-Connection setup starts with host, username, and authentication. Details and
+Connection setup starts with host and port side by side, username, and authentication. Details and
 advanced routing/security/session settings are collapsed. Existing advanced
 values survive editing while collapsed. Passwords and encrypted-key passphrases
 are requested during authentication. Unsupported SSH options require explicit

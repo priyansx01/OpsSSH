@@ -57,7 +57,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn invalid_port_keeps_values_and_opens_its_section(cx: &mut TestAppContext) {
+    fn invalid_port_keeps_values_without_opening_extra_sections(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
         let (form, cx) = cx.add_window_view(|window, cx| {
             ConnectionForm::new(
@@ -77,7 +77,7 @@ mod tests {
                     .port
                     .update(cx, |input, cx| input.set_value("99999", window, cx));
                 assert!(form.profile(cx).is_none());
-                assert!(form.errors.contains_key("form-port") && form.details);
+                assert!(form.errors.contains_key("form-port") && !form.details);
                 assert_eq!(form.fields.host.read(cx).value(), "server.example.test");
                 assert_eq!(form.fields.port.read(cx).value(), "99999");
             })
@@ -341,7 +341,6 @@ impl ConnectionForm {
             self.message = error.to_string();
         }
         if !self.errors.is_empty() {
-            self.details |= self.errors.contains_key("form-port");
             self.session |= self.errors.contains_key("form-keepalive");
             self.advanced |= self.session;
         }
@@ -450,7 +449,23 @@ impl Render for ConnectionForm {
                         .child(self.message.clone()),
                 )
             })
-            .child(self.row("form-host", &self.fields.host, cx))
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_3()
+                    .w_full()
+                    .child(div().flex_1().min_w_0().child(self.row(
+                        "form-host",
+                        &self.fields.host,
+                        cx,
+                    )))
+                    .child(div().w(px(112.)).flex_shrink_0().child(self.row(
+                        "form-port",
+                        &self.fields.port,
+                        cx,
+                    ))),
+            )
             .child(self.row("form-user", &self.fields.user, cx))
             .child(
                 div()
@@ -530,7 +545,6 @@ impl Render for ConnectionForm {
             .child(self.heading("form-details", self.details, cx))
             .when(self.details, |d| {
                 d.child(self.row("form-name", &self.fields.name, cx))
-                    .child(self.row("form-port", &self.fields.port, cx))
                     .child(self.row("form-environment", &self.fields.environment, cx))
                     .child(self.row("form-tags", &self.fields.tags, cx))
             })
