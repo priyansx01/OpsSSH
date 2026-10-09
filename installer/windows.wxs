@@ -8,6 +8,8 @@
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/priyansx01/OpsSSH" />
     <ui:WixUI Id="WixUI_Minimal" />
     <WixVariable Id="WixUILicenseRtf" Value="$(var.Stage)/license.rtf" />
+    <WixVariable Id="WixUIDialogBmp" Value="$(var.Stage)/installer-dialog.bmp" />
+    <WixVariable Id="WixUIBannerBmp" Value="$(var.Stage)/installer-banner.bmp" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch OpsSSH" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
     <Property Id="WixShellExecTarget" Value="[#OpsSSHExe]" />

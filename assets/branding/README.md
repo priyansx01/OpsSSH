@@ -5,6 +5,9 @@ The ruby terminal badger is the OpsSSH application mark. The editable source is
 contains 16, 24, 32, 48, 64, 128 and 256 pixel Windows icons. The Windows
 executable embeds icon resource 1, which GPUI uses for the window and taskbar.
 The MSI uses the same icon for its Start menu shortcut and installed-app entry.
+Its welcome and completion artwork and progress banner use the mascot instead
+of WiX's generic graphics. The generator also updates `installer-dialog.bmp`
+(493 by 312) and `installer-banner.bmp` (493 by 58).
 
 Regenerate the committed PNG and ICO after changing the SVG:
 

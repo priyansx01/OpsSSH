@@ -22,7 +22,7 @@ foreach ($file in @('LICENSE-MIT', 'LICENSE-APACHE', 'README.md', 'CHANGELOG.md'
 $licenseText = "OpsSSH is available under MIT OR Apache-2.0. Both license texts and third-party notices are included in the installation.`r`n`r`n" + (Get-Content -LiteralPath (Join-Path $repo 'LICENSE-MIT') -Raw)
 $licenseText = $licenseText.Replace('\', '\\').Replace('{', '\{').Replace('}', '\}').Replace("`r`n", '\par ').Replace("`n", '\par ')
 ('{\rtf1\ansi\deff0{\fonttbl{\f0 Segoe UI;}}\f0\fs20 ' + $licenseText + '}') | Set-Content -Encoding ascii (Join-Path $stage 'license.rtf')
-foreach ($file in @('opsssh.ico', 'opsssh.png', 'opsssh-mascot.svg')) {
+foreach ($file in @('opsssh.ico', 'opsssh.png', 'opsssh-mascot.svg', 'installer-dialog.bmp', 'installer-banner.bmp')) {
     Copy-Item -LiteralPath (Join-Path $repo "assets/branding/$file") -Destination $stage
 }
 & cargo about generate --locked --all-features --target x86_64-pc-windows-msvc -o (Join-Path $stage 'THIRD-PARTY-LICENSES.html') scripts/licenses.hbs
