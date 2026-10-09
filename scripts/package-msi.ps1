@@ -9,6 +9,21 @@ $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 if (-not $Binary) { $Binary = Join-Path $repo 'target/x86_64-pc-windows-msvc/release/opsssh.exe' }
 $Binary = (Resolve-Path -LiteralPath $Binary).Path
+$binaryReader = [IO.BinaryReader]::new([IO.File]::OpenRead($Binary))
+try {
+    $binaryReader.BaseStream.Position = 0x3c
+    $peOffset = $binaryReader.ReadUInt32()
+    $binaryReader.BaseStream.Position = $peOffset
+    if ($binaryReader.ReadUInt32() -ne 0x4550 -or $binaryReader.ReadUInt16() -ne 0x8664) {
+        throw 'The MSI requires an x64 Windows executable'
+    }
+    $binaryReader.BaseStream.Position = $peOffset + 24 + 68
+    if ($binaryReader.ReadUInt16() -ne 2) {
+        throw 'The MSI requires a Windows GUI release build; console builds open an extra terminal window'
+    }
+} finally {
+    $binaryReader.Dispose()
+}
 $versionParts = $Version.Split('.')
 if ([int]$versionParts[0] -gt 255 -or [int]$versionParts[1] -gt 255 -or [int]$versionParts[2] -gt 65535) { throw 'Version exceeds MSI limits' }
 $null = Get-Command $Wix -ErrorAction Stop

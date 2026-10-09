@@ -1,4 +1,8 @@
 //! GPU workspace and headless development tools for the local renderer spike.
+#![cfg_attr(
+    all(target_os = "windows", feature = "gui", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 #[cfg(feature = "gui")]
 mod connection_form;

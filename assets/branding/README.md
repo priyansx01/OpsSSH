@@ -32,5 +32,8 @@ to specify a local WiX executable. The MSI installs for the current user in
 `%LOCALAPPDATA%\OpsSSH`, includes license notices and a Start menu shortcut,
 and leaves application settings and connection data intact on uninstall.
 The visible setup wizard offers a checked Launch OpsSSH option on completion.
+Windows GUI release builds launch without a separate console window. Debug
+builds and builds using `--no-default-features` keep console output for the
+development commands.
 Artifacts and SHA-256 checksums are written to `artifacts/packages`. They are
 unsigned until a release signing process is configured.
