@@ -18,6 +18,8 @@ Normal builds use the committed images and do not require Python.
 Build the Windows MSI with WiX 4.0.6 and cargo-about 0.9.2 installed:
 
 ```powershell
+wix extension add WixToolset.UI.wixext/4.0.6
+wix extension add WixToolset.Util.wixext/4.0.6
 cargo build -p opsssh --release --locked --target x86_64-pc-windows-msvc
 ./scripts/package-msi.ps1
 ```
@@ -26,5 +28,6 @@ For a host release build, pass `-Binary target/release/opsssh.exe`. Use `-Wix`
 to specify a local WiX executable. The MSI installs for the current user in
 `%LOCALAPPDATA%\OpsSSH`, includes license notices and a Start menu shortcut,
 and leaves application settings and connection data intact on uninstall.
+The visible setup wizard offers a checked Launch OpsSSH option on completion.
 Artifacts and SHA-256 checksums are written to `artifacts/packages`. They are
 unsigned until a release signing process is configured.

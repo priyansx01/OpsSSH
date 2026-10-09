@@ -1,11 +1,22 @@
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package Name="OpsSSH" Manufacturer="OpsSSH" Version="$(var.Version)" Language="1033"
            UpgradeCode="8F2BC548-64B5-41DE-9F46-EB0902D4DAF2" Scope="perUser">
-    <MajorUpgrade DowngradeErrorMessage="A newer version of OpsSSH is already installed." />
+    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of OpsSSH is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <Icon Id="opsssh.exe" SourceFile="$(var.Stage)/opsssh.ico" />
     <Property Id="ARPPRODUCTICON" Value="opsssh.exe" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/priyansx01/OpsSSH" />
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.Stage)/license.rtf" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch OpsSSH" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WixShellExecTarget" Value="[#OpsSSHExe]" />
+    <CustomAction Id="LaunchApplication" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixShellExec" Impersonate="yes" />
+    <UI>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication"
+               Order="1" Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed" />
+    </UI>
     <StandardDirectory Id="LocalAppDataFolder">
         <Directory Id="INSTALLFOLDER" Name="OpsSSH">
           <Component Id="Application" Guid="4C7D0474-1A27-42F8-A140-11D9C017F36C">

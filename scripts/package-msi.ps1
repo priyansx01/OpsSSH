@@ -19,6 +19,9 @@ Copy-Item -LiteralPath $Binary -Destination (Join-Path $stage 'opsssh.exe')
 foreach ($file in @('LICENSE-MIT', 'LICENSE-APACHE', 'README.md', 'CHANGELOG.md')) {
     Copy-Item -LiteralPath (Join-Path $repo $file) -Destination $stage
 }
+$licenseText = "OpsSSH is available under MIT OR Apache-2.0. Both license texts and third-party notices are included in the installation.`r`n`r`n" + (Get-Content -LiteralPath (Join-Path $repo 'LICENSE-MIT') -Raw)
+$licenseText = $licenseText.Replace('\', '\\').Replace('{', '\{').Replace('}', '\}').Replace("`r`n", '\par ').Replace("`n", '\par ')
+('{\rtf1\ansi\deff0{\fonttbl{\f0 Segoe UI;}}\f0\fs20 ' + $licenseText + '}') | Set-Content -Encoding ascii (Join-Path $stage 'license.rtf')
 foreach ($file in @('opsssh.ico', 'opsssh.png', 'opsssh-mascot.svg')) {
     Copy-Item -LiteralPath (Join-Path $repo "assets/branding/$file") -Destination $stage
 }
@@ -29,8 +32,10 @@ $dirty = [bool](& git status --porcelain)
 @{ version=$Version; target='x86_64-pc-windows-msvc'; signing='unsigned'; source_commit=$commit; source_dirty=$dirty; binary_sha256=(Get-FileHash -LiteralPath $Binary).Hash.ToLowerInvariant() } |
     ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $stage 'build-info.json')
 $output = Join-Path $repo "artifacts/packages/opsssh-$Version-windows-x64.msi"
-& $Wix build (Join-Path $repo 'installer/windows.wxs') -arch x64 -d "Version=$Version" -d "Stage=$stage" -o $output
+$buildOutput = Join-Path $stage 'opsssh.msi'
+& $Wix build (Join-Path $repo 'installer/windows.wxs') -arch x64 -ext WixToolset.UI.wixext/4.0.6 -ext WixToolset.Util.wixext/4.0.6 -d "Version=$Version" -d "Stage=$stage" -o $buildOutput
 if ($LASTEXITCODE -ne 0) { throw 'MSI build or validation failed' }
+Copy-Item -LiteralPath $buildOutput -Destination $output -Force
 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $output).Hash.ToLowerInvariant()
 "$hash  $(Split-Path -Leaf $output)" | Set-Content -Encoding ascii "$output.sha256"
 Write-Host "Created unsigned MSI: $output"
