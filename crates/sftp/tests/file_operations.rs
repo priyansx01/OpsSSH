@@ -669,7 +669,95 @@ async fn collisions_and_descendant_aliases_keep_existing_data() {
         .download_tree("/tree", local.path(), &TransferControl::default())
         .await
         .unwrap();
-    assert_eq!(report.changed, 0);
-    assert_eq!(report.failures.len(), 1);
-    assert!(!local.path().join("sub").exists());
+    assert_eq!(report.changed, 3);
+    assert!(report.failures.is_empty());
+    assert!(local.path().join("sub").is_dir());
+    assert_eq!(std::fs::read(local.path().join("keep")).unwrap(), b"old");
+}
+
+#[tokio::test]
+async fn local_download_replace_skip_cancel_and_failed_transfer_keep_originals() {
+    use opsssh_sftp::DownloadDecision;
+    let (client, remote) = fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("test.txt");
+    std::fs::write(&target, b"original").unwrap();
+    for (decision, expected, cancelled) in [
+        (DownloadDecision::Skip, b"original".as_slice(), false),
+        (DownloadDecision::Cancel, b"original".as_slice(), true),
+        (DownloadDecision::Replace, b"keep me".as_slice(), false),
+    ] {
+        let report = client
+            .download_tree_with_confirmation(
+                "/outside",
+                &target,
+                &TransferControl::default(),
+                |path| {
+                    assert_eq!(path, target);
+                    async move { Ok(decision) }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), expected);
+        assert_eq!(report.cancelled, cancelled);
+        if !cancelled {
+            assert!(report.failures.is_empty(), "{report}");
+        }
+    }
+    std::fs::write(&target, b"original").unwrap();
+    // Change the remote size after the review. A short download must not publish.
+    let report = client
+        .download_tree_with_confirmation("/outside", &target, &TransferControl::default(), |_| {
+            remote
+                .lock()
+                .unwrap()
+                .nodes
+                .get_mut("/outside")
+                .unwrap()
+                .bytes
+                .clear();
+            async { Ok(DownloadDecision::Replace) }
+        })
+        .await
+        .unwrap();
+    assert!(!report.failures.is_empty());
+    assert_eq!(std::fs::read(&target).unwrap(), b"original");
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "temporary download leaked"
+    );
+}
+
+#[tokio::test]
+async fn repeated_folder_download_merges_directories_and_applies_replace_remaining() {
+    use opsssh_sftp::DownloadDecision;
+    let (client, remote) = fixture().await;
+    {
+        let mut remote = remote.lock().unwrap();
+        remote
+            .nodes
+            .insert("/tree/b.txt".into(), Node::new(0o100640, b"second", 100));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("tree");
+    let report = client
+        .download_tree("/tree", &target, &TransferControl::default())
+        .await
+        .unwrap();
+    assert!(report.failures.is_empty(), "{report}");
+    std::fs::write(target.join("b.txt"), b"local change").unwrap();
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let report = client
+        .download_tree_with_confirmation("/tree", &target, &TransferControl::default(), |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async { Ok(DownloadDecision::ReplaceRemaining) }
+        })
+        .await
+        .unwrap();
+    assert!(report.failures.is_empty(), "{report}");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(std::fs::read(target.join("b.txt")).unwrap(), b"second");
+    assert_eq!(std::fs::read_dir(target.join("sub")).unwrap().count(), 1);
 }

@@ -60,6 +60,7 @@ impl RemoteSession {
                             let next = match &event {
                                 SshEvent::Connected => Some(SessionState::Connected),
                                 SshEvent::Reconnecting { .. } => Some(SessionState::Reconnecting),
+                                SshEvent::Retrying => Some(SessionState::Connecting),
                                 SshEvent::Closed { .. } => Some(SessionState::Closed),
                                 SshEvent::Error(_) => Some(SessionState::NeedsUserAction),
                                 SshEvent::HostKeyPrompt { .. }

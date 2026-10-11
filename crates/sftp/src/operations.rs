@@ -2,6 +2,15 @@
 use super::*;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadDecision {
+    Replace,
+    Skip,
+    Cancel,
+    ReplaceRemaining,
+    SkipRemaining,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteAttributes {
     pub mode: Option<u32>,
@@ -516,6 +525,22 @@ impl SftpClient {
         local: &Path,
         control: &TransferControl,
     ) -> Result<OperationReport> {
+        self.download_tree_with_confirmation(source, local, control, |_| async {
+            Ok(DownloadDecision::Cancel)
+        })
+        .await
+    }
+    pub async fn download_tree_with_confirmation<F, Fut>(
+        &self,
+        source: &str,
+        local: &Path,
+        control: &TransferControl,
+        mut confirm: F,
+    ) -> Result<OperationReport>
+    where
+        F: FnMut(PathBuf) -> Fut,
+        Fut: Future<Output = Result<DownloadDecision>>,
+    {
         let items = self.tree(source, true, control).await?;
         control.set_total(
             items
@@ -524,6 +549,7 @@ impl SftpClient {
                 .sum(),
         );
         let mut report = OperationReport::default();
+        let mut remaining = None;
         for (path, attrs) in items {
             if control.check().is_err() {
                 report.cancelled = true;
@@ -548,19 +574,75 @@ impl SftpClient {
                 }
                 destination.push(part);
             }
-            let result: Result<()> = async {
+            let result: Result<bool> = async {
                 self.same_type(&path, &attrs).await?;
                 if attrs.is_directory {
-                    tokio::fs::create_dir(&destination).await?;
+                    match tokio::fs::symlink_metadata(&destination).await {
+                        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+                        Ok(_) => {
+                            return Err(
+                                "Destination is not a regular directory; kept unchanged".into()
+                            );
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                            tokio::fs::create_dir(&destination).await?
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
                 } else {
-                    self.download(&path, &destination, WriteMode::CreateNew, control)
+                    let expected = local_identity(&destination)?;
+                    if expected.is_some() {
+                        let decision = match remaining {
+                            Some(decision) => decision,
+                            None => confirm(destination.clone()).await?,
+                        };
+                        match decision {
+                            DownloadDecision::Cancel => {
+                                control.cancel();
+                                control.check()?;
+                            }
+                            DownloadDecision::Skip => return Ok(false),
+                            DownloadDecision::SkipRemaining => {
+                                remaining = Some(DownloadDecision::Skip);
+                                return Ok(false);
+                            }
+                            DownloadDecision::ReplaceRemaining => {
+                                remaining = Some(DownloadDecision::Replace)
+                            }
+                            DownloadDecision::Replace => {}
+                        }
+                    }
+                    control.check()?;
+                    let parent = destination
+                        .parent()
+                        .ok_or("Missing local parent directory")?;
+                    let temporary =
+                        parent.join(format!(".opsssh-download-{}.tmp", uuid::Uuid::new_v4()));
+                    let cleanup = LocalDownloadCleanup(temporary.clone());
+                    let bytes = self
+                        .download(&path, &temporary, WriteMode::CreateNew, control)
                         .await?;
+                    if attrs.size.is_some_and(|size| size != bytes) {
+                        return Err(
+                            "Remote file size changed during download; original kept".into()
+                        );
+                    }
+                    tokio::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&temporary)
+                        .await?
+                        .sync_all()
+                        .await?;
+                    control.check()?;
+                    commit_local_download(&temporary, &destination, expected.as_ref())?;
+                    drop(cleanup);
                 }
-                Ok(())
+                Ok(true)
             }
             .await;
             match result {
-                Ok(()) => report.changed += 1,
+                Ok(true) => report.changed += 1,
+                Ok(false) => report.skipped += 1,
                 Err(e) => {
                     report.failures.push(format!("{path}: {e}"));
                     report.cancelled = control.check().is_err();
@@ -570,6 +652,50 @@ impl SftpClient {
         }
         Ok(report)
     }
+}
+
+// A sibling temporary file keeps replacement on the destination filesystem.
+// Dropping a cancelled future also removes the incomplete download.
+struct LocalDownloadCleanup(PathBuf);
+impl Drop for LocalDownloadCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+#[derive(Debug, PartialEq, Eq)]
+struct LocalIdentity {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    created: Option<std::time::SystemTime>,
+}
+fn local_identity(path: &Path) -> Result<Option<LocalIdentity>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => Ok(Some(LocalIdentity {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            created: meta.created().ok(),
+        })),
+        Ok(_) => Err("Destination is not a regular file; kept unchanged".into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+fn commit_local_download(
+    temporary: &Path,
+    destination: &Path,
+    expected: Option<&LocalIdentity>,
+) -> Result<()> {
+    if local_identity(destination)?.as_ref() != expected {
+        return Err("Local destination changed during download; review replacement again".into());
+    }
+    if expected.is_some() {
+        tempfile::TempPath::try_from_path(temporary)?.persist(destination)?;
+    } else {
+        // The safe platform helper uses a no-replace rename on Windows,
+        // including filesystems without hard links. Refuse concurrent creations.
+        tempfile::TempPath::try_from_path(temporary)?.persist_noclobber(destination)?;
+    }
+    Ok(())
 }
 
 fn safe_local_component(part: &str) -> bool {

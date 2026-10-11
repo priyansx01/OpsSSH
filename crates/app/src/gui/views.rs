@@ -1418,11 +1418,13 @@ impl Workspace {
                     state,
                     opsssh_term_core::SessionState::Disconnected
                         | opsssh_term_core::SessionState::Closed
+                        | opsssh_term_core::SessionState::Reconnecting
                 ) && tab.endpoint.is_some(),
                 |d| {
                     d.child(
                         crate::design::PrimaryAction::new("reconnect-server")
                             .label(tr("reconnect-server"))
+                            .disabled(terminal.read(cx).retry_pending())
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 if let Some(i) = this.session_index(id) {
                                     this.sessions[i]

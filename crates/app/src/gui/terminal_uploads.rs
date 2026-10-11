@@ -15,6 +15,66 @@ pub(super) struct UploadDialog {
 }
 
 impl Workspace {
+    pub(super) fn terminal_clipboard(
+        &mut self,
+        terminal: &Entity<TerminalView>,
+        item: gpui::ClipboardItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(paths) = item.entries().iter().find_map(|entry| match entry {
+            gpui::ClipboardEntry::ExternalPaths(paths) => Some(paths.0.iter().cloned().collect()),
+            _ => None,
+        }) {
+            self.terminal_drop(terminal, paths, window, cx);
+            return;
+        }
+        let Some(image) = item.entries().iter().find_map(|entry| match entry {
+            gpui::ClipboardEntry::Image(image) => Some(image.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let generation = terminal.read(cx).connection_generation();
+        let terminal = terminal.clone();
+        let prepare = cx.background_spawn(async move {
+            use std::io::Write;
+            let bytes =
+                opsssh_drop::normalize_clipboard_image(&image.bytes).map_err(|e| e.to_string())?;
+            let mut file = tempfile::Builder::new()
+                .prefix("screenshot-")
+                .suffix(".png")
+                .tempfile()
+                .map_err(|e| e.to_string())?;
+            file.write_all(&bytes).map_err(|e| e.to_string())?;
+            file.flush().map_err(|e| e.to_string())?;
+            Ok::<_, String>(file)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = prepare.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if terminal.read(cx).connection_generation() != generation
+                    || !terminal.read(cx).accepts_terminal_input()
+                {
+                    return;
+                }
+                match result {
+                    Ok(file) => {
+                        let path = file.path().to_path_buf();
+                        // Keep source data alive for upload retries, remove it on app exit.
+                        this.clipboard_attachments.push(file);
+                        this.terminal_drop(&terminal, vec![path], window, cx);
+                    }
+                    Err(error) => {
+                        this.message = format!("Clipboard image: {error}");
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn terminal_drop(
         &mut self,
         terminal: &Entity<TerminalView>,
@@ -30,6 +90,28 @@ impl Workspace {
             return;
         };
         if paths.is_empty() || !terminal.read(cx).session_state().accepts_input() {
+            return;
+        }
+        if self.sessions[index].endpoint.is_none() {
+            #[cfg(target_os = "windows")]
+            let shell = opsssh_drop::Shell::PowerShell;
+            #[cfg(not(target_os = "windows"))]
+            let shell = opsssh_drop::Shell::Posix;
+            let quoted = paths
+                .iter()
+                .map(|path| opsssh_drop::quote(&path.to_string_lossy(), shell))
+                .collect::<Result<Vec<_>, _>>();
+            match quoted {
+                Ok(paths) => {
+                    terminal.update(cx, |terminal, cx| {
+                        terminal.insert_uploaded_path(&format!("{} ", paths.join(" ")), cx);
+                    });
+                }
+                Err(error) => {
+                    self.message = error.to_string();
+                    cx.notify();
+                }
+            }
             return;
         }
         let Some(pane) = self.background_files(terminal, window, cx) else {

@@ -944,3 +944,57 @@ async fn exec_stdin_eof_and_authentication_are_isolated_from_terminal() {
         }
     }
 }
+
+#[tokio::test]
+async fn manual_retry_interrupts_backoff_and_duplicate_requests_do_not_spawn_sessions() {
+    let fixture = Fixture::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = fixture.options(dir.path().join("known_hosts"));
+    options.tmux = Some(TmuxOptions {
+        session_name: "manual-retry".into(),
+    });
+    let session = SshSession::spawn(options, TerminalSize::new(80, 24).unwrap()).unwrap();
+    trust_and_connect(&session).await;
+    session
+        .commands()
+        .send(SshCommand::Write(b"close-without-status-fixture".to_vec()))
+        .await
+        .unwrap();
+    loop {
+        if let SshEvent::Reconnecting { delay, .. } = next(&session.events()).await {
+            assert!(delay >= Duration::from_secs(2));
+            break;
+        }
+    }
+    let start = std::time::Instant::now();
+    session.commands().send(SshCommand::RetryNow).await.unwrap();
+    session.commands().send(SshCommand::RetryNow).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match session.events().recv().await.unwrap() {
+                SshEvent::Retrying => assert!(start.elapsed() < Duration::from_secs(1)),
+                SshEvent::Connected => break,
+                SshEvent::Error(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("Manual retry waited for the backoff");
+    session
+        .commands()
+        .send(SshCommand::Write(b"manual-recovered".to_vec()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match session.events().recv().await.unwrap() {
+                SshEvent::Data(data) if data == b"manual-recovered" => break,
+                SshEvent::Connected => panic!("Duplicate retry opened another session"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+}

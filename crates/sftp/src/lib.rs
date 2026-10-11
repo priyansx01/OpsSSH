@@ -18,7 +18,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 mod operations;
 pub use operations::{
-    AtomicRenamer, OperationReport, PermissionChange, RemoteAttributes, parse_mode, symbolic_mode,
+    AtomicRenamer, DownloadDecision, OperationReport, PermissionChange, RemoteAttributes,
+    parse_mode, symbolic_mode,
 };
 #[derive(Debug)]
 struct UploadCollision(FileAttributes);

@@ -1,6 +1,23 @@
 //! Pure drop planning. Execution and privilege confirmation belong to the caller.
 use std::fmt;
 
+/// Decode common clipboard formats with bounded allocation and produce a PNG.
+pub fn normalize_clipboard_image(
+    bytes: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    if bytes.len() > 64 * 1024 * 1024 {
+        return Err("Clipboard image exceeds 64 MiB".into());
+    }
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    limits.max_image_width = Some(16384);
+    limits.max_image_height = Some(16384);
+    reader.limits(limits);
+    let image = reader.decode()?.into_rgba8();
+    screenshot_png(image.width(), image.height(), &image)
+}
+
 /// Encode bounded clipboard RGBA without retaining desktop image data on disk.
 pub fn screenshot_png(
     width: u32,
@@ -146,5 +163,26 @@ mod tests {
             .insert_text
             .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod clipboard_normalization_tests {
+    use super::*;
+    #[test]
+    fn converts_jpeg_and_png_to_png_and_rejects_invalid_data() {
+        let image = image::DynamicImage::new_rgb8(2, 2);
+        for format in [
+            image::ImageFormat::Jpeg,
+            image::ImageFormat::Png,
+            image::ImageFormat::Bmp,
+        ] {
+            let mut input = std::io::Cursor::new(Vec::new());
+            image.write_to(&mut input, format).unwrap();
+            let png = normalize_clipboard_image(input.get_ref()).unwrap();
+            assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+            assert_eq!(image::load_from_memory(&png).unwrap().width(), 2);
+        }
+        assert!(normalize_clipboard_image(b"invalid").is_err());
     }
 }

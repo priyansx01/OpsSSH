@@ -865,6 +865,7 @@ pub(crate) async fn run(
                  _=&mut sleep=>break,
                  command=commands.recv()=>match command {
                   Ok(SshCommand::Disconnect)|Err(_)=>return Ok(()),
+                  Ok(SshCommand::RetryNow)=>break,
                   Ok(SshCommand::Resize(new_size))=>size=new_size,
                   Ok(SshCommand::OpenSftp{reply})=>{let _=reply.send(Err("SSH connection is recovering".into())).await;},
                   Ok(SshCommand::Exec{reply,..})=>{let _=reply.try_send(Err("SSH connection is recovering".into()));},
@@ -873,6 +874,7 @@ pub(crate) async fn run(
                 }
             }
             // Proxy transports perform their own connectivity checks during handshake.
+            events.send(SshEvent::Retrying).await?;
             if options.proxy.is_some() {
                 break;
             }

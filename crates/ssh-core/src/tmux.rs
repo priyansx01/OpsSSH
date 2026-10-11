@@ -27,7 +27,7 @@ if [ ! -e "$cfg" ]; then
 (set -C; cat > "$cfg" <<'OPSSSH_TMUX_CONFIG'
 source-file -q ~/.tmux.conf
 set -g history-limit 50000
-set -g mouse off
+set -g mouse on
 set -g status off
 set -sg escape-time 0
 set -g focus-events on
@@ -39,6 +39,7 @@ set -qas terminal-features 'xterm*:RGB:clipboard:extkeys:focus:hyperlinks:sync'
 OPSSSH_TMUX_CONFIG
 ) || exit 1
 fi
+tmux -L opsssh set-option -g mouse on 2>/dev/null || :
 tmux -L opsssh capture-pane -p -e -S -50000 -t '{}' 2>/dev/null || :
 exec tmux -L opsssh -f "$cfg" new-session -A -s '{}'"#,
             self.session_name, self.session_name

@@ -11,6 +11,7 @@ russh-sftp = "=3.0.1"
 tokio = { version = "=1.53.2", features = ["fs", "io-util", "sync", "rt", "macros"] }
 opsssh-drop = { path = "../drop", version = "=0.1.0" }
 uuid = { version = "=1.27.0", features = ["v4"] }
+tempfile = "=3.27.0"
 [dev-dependencies]
 tempfile = "=3.27.0"
 [lints]

@@ -2,7 +2,7 @@
 use crate::localization::text as tr;
 use gpui::{App, Context, Entity, EventEmitter, Render, Window, div, prelude::*, px};
 use gpui_component::{
-    ActiveTheme, Icon, Selectable,
+    ActiveTheme, Disableable, Icon, Selectable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu, PopupMenuItem},
@@ -50,7 +50,6 @@ mod tests {
             cx.add_window_view(|window, cx| ConnectionForm::new(original, vec![], window, cx));
         VisualTestContext::update(cx, |_, cx| {
             form.update(cx, |form, cx| {
-                assert!(!form.details && !form.advanced);
                 assert!(form.protect_work);
                 assert_eq!(form.profile(cx), Some(expected));
             })
@@ -78,7 +77,7 @@ mod tests {
                     .port
                     .update(cx, |input, cx| input.set_value("99999", window, cx));
                 assert!(form.profile(cx).is_none());
-                assert!(form.errors.contains_key("form-port") && !form.details);
+                assert!(form.errors.contains_key("form-port"));
                 assert_eq!(form.fields.host.read(cx).value(), "server.example.test");
                 assert_eq!(form.fields.port.read(cx).value(), "99999");
             })
@@ -217,7 +216,6 @@ mod tests {
                     .update(cx, |input, cx| input.set_value("work;unsafe", window, cx));
                 assert!(form.profile(cx).is_none());
                 assert!(form.errors.contains_key("form-tmux-name"));
-                assert!(!form.advanced);
                 form.protect_work = false;
                 assert_eq!(form.profile(cx).unwrap().tmux_session, None);
                 assert_eq!(form.fields.tmux.read(cx).value(), "work;unsafe");
@@ -289,12 +287,8 @@ pub struct ConnectionForm {
     fields: Fields,
     quick: Entity<InputState>,
     warnings: Vec<String>,
-    advanced: bool,
-    details: bool,
-    routing: bool,
-    security: bool,
-    session: bool,
     protect_work: bool,
+    saving: bool,
     quick_generation: u64,
     quick_error: String,
     quick_applied: String,
@@ -346,12 +340,8 @@ impl ConnectionForm {
             fields,
             quick,
             warnings,
-            advanced: false,
-            details: false,
-            routing: false,
-            security: false,
-            session: false,
             protect_work,
+            saving: false,
             quick_generation: 0,
             quick_error: String::new(),
             quick_applied: String::new(),
@@ -385,6 +375,7 @@ impl ConnectionForm {
             .child(
                 crate::design::PrimaryAction::new("save-connect")
                     .label(tr("save-connect"))
+                    .disabled(form.read(cx).saving)
                     .on_click(move |_, window, cx| {
                         let _ = connect.update(cx, |form, cx| form.submit(true, window, cx));
                     }),
@@ -392,6 +383,7 @@ impl ConnectionForm {
             .child(
                 Button::new("save")
                     .label(tr("save-server"))
+                    .disabled(form.read(cx).saving)
                     .on_click(move |_, window, cx| {
                         let _ = save.update(cx, |form, cx| form.submit(false, window, cx));
                     }),
@@ -409,6 +401,7 @@ impl ConnectionForm {
         self.fields.host.update(cx, |s, cx| s.focus(window, cx));
     }
     pub fn error(&mut self, error: String, cx: &mut Context<Self>) {
+        self.saving = false;
         self.message = error;
         cx.notify();
     }
@@ -487,18 +480,18 @@ impl ConnectionForm {
         {
             self.message = error.to_string();
         }
-        if !self.errors.is_empty() {
-            self.session |= self.errors.contains_key("form-keepalive");
-            self.advanced |= self.session;
-        }
         (self.errors.is_empty() && self.message.is_empty()).then_some(p)
     }
     fn submit(&mut self, connect: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving {
+            return;
+        }
         self.apply_quick(window, cx, false);
         if !self.quick_error.is_empty() {
             return;
         }
         if let Some(p) = self.profile(cx) {
+            self.saving = true;
             cx.emit(FormEvent::Save(Box::new(p), connect));
         }
         cx.notify();
@@ -678,35 +671,12 @@ impl ConnectionForm {
                 )
             })
     }
-    fn heading(&self, id: &'static str, open: bool, cx: &mut Context<Self>) -> Button {
-        Button::new(id)
-            .ghost()
-            .accessibility_label(tr(id))
-            .w_full()
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(tr(id))
-                    .child(gpui_component::Icon::new(if open {
-                        gpui_component::IconName::ChevronDown
-                    } else {
-                        gpui_component::IconName::ChevronRight
-                    })),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                match id {
-                    "form-advanced" => this.advanced = !this.advanced,
-                    "form-details" => this.details = !this.details,
-                    "form-routing" => this.routing = !this.routing,
-                    "form-security" => this.security = !this.security,
-                    "form-session" => this.session = !this.session,
-                    _ => {}
-                }
-                cx.notify();
-            }))
+    fn heading(&self, id: &'static str, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .mt_2()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(tr(id))
     }
     fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let picker = cx.prompt_for_paths(gpui::PathPromptOptions {
@@ -795,6 +765,7 @@ impl Render for ConnectionForm {
                         .child(self.message.clone()),
                 )
             })
+            .child(self.row("form-name", &self.fields.name, cx))
             .child(
                 div()
                     .flex()
@@ -858,6 +829,7 @@ impl Render for ConnectionForm {
                     })),
             )
             .child(self.environment(cx))
+            .child(self.row("form-tags", &self.fields.tags, cx))
             .child(
                 div()
                     .flex()
@@ -889,11 +861,6 @@ impl Render for ConnectionForm {
                             )
                     }),
             )
-            .child(self.heading("form-details", self.details, cx))
-            .when(self.details, |d| {
-                d.child(self.row("form-name", &self.fields.name, cx))
-                    .child(self.row("form-tags", &self.fields.tags, cx))
-            })
             .when(!self.warnings.is_empty(), |d| {
                 d.child(
                     div()
@@ -912,65 +879,49 @@ impl Render for ConnectionForm {
                         })),
                 )
             })
-            .child(self.heading("form-advanced", self.advanced, cx))
-            .when(self.advanced, |d| {
-                d.child(self.heading("form-routing", self.routing, cx))
-                    .when(self.routing, |d| {
-                        d.child(self.row("form-jump", &self.fields.jump, cx))
-                            .child(self.row("form-proxy", &self.fields.proxy, cx))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(tr("form-proxy-help")),
-                            )
-                            .child(
-                                Button::new("approve-proxy")
-                                    .label(tr("form-approve-proxy"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.profile.proxy_command =
-                                            this.fields.proxy.read(cx).value().to_string();
-                                        this.profile.proxy_review_required = false;
-                                        cx.notify();
-                                    })),
-                            )
-                    })
-                    .child(self.heading("form-security", self.security, cx))
-                    .when(self.security, |d| {
-                        d.child(self.row("form-certificate", &self.fields.certificate, cx))
-                            .child(self.row("form-known-hosts", &self.fields.known_hosts, cx))
-                            .child(self.row("form-agent-socket", &self.fields.agent, cx))
-                            .child(
-                                Button::new("identities-only")
-                                    .selected(self.profile.identities_only)
-                                    .label(tr("form-identities-only"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.profile.identities_only =
-                                            !this.profile.identities_only;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("strict-hosts")
-                                    .selected(self.profile.strict_host_key)
-                                    .label(tr("form-strict-hosts"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.profile.strict_host_key =
-                                            !this.profile.strict_host_key;
-                                        cx.notify();
-                                    })),
-                            )
-                    })
-                    .child(self.heading("form-session", self.session, cx))
-                    .when(self.session, |d| {
-                        d.child(self.row("form-keepalive", &self.fields.keepalive, cx))
-                            .child(self.row(
-                                "form-upload-directory",
-                                &self.fields.upload_directory,
-                                cx,
-                            ))
-                    })
-            })
+            .child(self.heading("form-routing", cx))
+            .child(self.row("form-jump", &self.fields.jump, cx))
+            .child(self.row("form-proxy", &self.fields.proxy, cx))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(tr("form-proxy-help")),
+            )
+            .child(
+                Button::new("approve-proxy")
+                    .label(tr("form-approve-proxy"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.profile.proxy_command = this.fields.proxy.read(cx).value().to_string();
+                        this.profile.proxy_review_required = false;
+                        cx.notify();
+                    })),
+            )
+            .child(self.heading("form-security", cx))
+            .child(self.row("form-certificate", &self.fields.certificate, cx))
+            .child(self.row("form-known-hosts", &self.fields.known_hosts, cx))
+            .child(self.row("form-agent-socket", &self.fields.agent, cx))
+            .child(
+                Button::new("identities-only")
+                    .selected(self.profile.identities_only)
+                    .label(tr("form-identities-only"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.profile.identities_only = !this.profile.identities_only;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("strict-hosts")
+                    .selected(self.profile.strict_host_key)
+                    .label(tr("form-strict-hosts"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.profile.strict_host_key = !this.profile.strict_host_key;
+                        cx.notify();
+                    })),
+            )
+            .child(self.heading("form-session", cx))
+            .child(self.row("form-keepalive", &self.fields.keepalive, cx))
+            .child(self.row("form-upload-directory", &self.fields.upload_directory, cx))
             .max_w(px(620.))
     }
 }

@@ -150,6 +150,7 @@ pub enum SshEvent {
         attempt: u32,
         delay: Duration,
     },
+    Retrying,
     HostKeyPrompt {
         id: u64,
         host: String,
@@ -222,6 +223,7 @@ pub struct ExecOutput {
     pub exit_status: Option<u32>,
 }
 pub enum SshCommand {
+    RetryNow,
     Write(Vec<u8>),
     Resize(TerminalSize),
     TrustHost {
@@ -246,6 +248,7 @@ pub enum SshCommand {
 impl fmt::Debug for SshCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::RetryNow => "RetryNow",
             Self::Write(_) => "Write([REDACTED])",
             Self::Resize(_) => "Resize",
             Self::TrustHost { .. } => "TrustHost",

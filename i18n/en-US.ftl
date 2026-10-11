@@ -392,7 +392,7 @@ address-copied = Connection address copied
 
 ssh-command-copied = SSH command copied
 
-reconnect-server = Reconnect
+reconnect-server = Reconnect now
 
 config-alias = From SSH config
 
@@ -410,3 +410,9 @@ form-quick-help = Paste an SSH command to fill host, username, port, and key. Re
 form-select-environment = Select environment
 form-no-environment = No environment
 form-custom-environment = Custom environment...
+
+download-skip = Skip
+download-replace-remaining = Replace remaining
+download-skip-remaining = Skip remaining
+
+term-retrying-now = Reconnecting now…

@@ -2,8 +2,8 @@
 use crate::localization::text as tr;
 use async_channel::{Receiver, Sender};
 use gpui::{
-    ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, PathPromptOptions, Render, Task,
-    Window, div, prelude::*, px, uniform_list,
+    ClipboardItem, Context, Entity, EventEmitter, PathPromptOptions, Render, Task, Window, div,
+    prelude::*, px, uniform_list,
 };
 use gpui_component::{
     ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, WindowExt,
@@ -11,9 +11,11 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
 };
-use opsssh_sftp::{Entry, PermissionChange, RemoteAttributes, SftpClient, TransferControl};
+use opsssh_sftp::{
+    DownloadDecision, Entry, PermissionChange, RemoteAttributes, SftpClient, TransferControl,
+};
 use opsssh_ssh_core::{ExecRequest, SshCommand};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, time::Duration};
 mod actions;
 use actions::FileEditor;
 
@@ -42,11 +44,6 @@ enum Job {
     Download {
         remote: String,
         local: PathBuf,
-        control: TransferControl,
-    },
-    Attachment {
-        bytes: Arc<[u8]>,
-        name: String,
         control: TransferControl,
     },
     Mkdir(String),
@@ -81,6 +78,7 @@ enum Update {
     Unavailable(String),
     Insert(u64, String),
     Replace(u64, String, Sender<bool>),
+    DownloadReplace(u64, PathBuf, Sender<DownloadDecision>),
     DestinationValidated(u64, String),
     DestinationFailed(u64, String),
     Started(u64),
@@ -127,6 +125,10 @@ impl TransferState {
         })
     }
 }
+enum ReplacementReply {
+    Remote(Sender<bool>),
+    Local(Sender<DownloadDecision>),
+}
 struct TransferTask {
     id: u64,
     label: String,
@@ -140,7 +142,7 @@ struct TransferTask {
     pending_insert: bool,
     insert_generation: Option<u64>,
     dismissed: bool,
-    replacement: Option<(String, Sender<bool>)>,
+    replacement: Option<(String, ReplacementReply)>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FileSort {
@@ -560,6 +562,20 @@ impl FilePane {
                                 }
                                 cx.emit(FilePaneEvent::InsertText(id, text));
                             }
+                            Update::DownloadReplace(id, path, reply) => {
+                                if let Some(task) =
+                                    this.transfers.iter_mut().find(|task| task.id == id)
+                                    && task.control.ensure_active().is_ok()
+                                {
+                                    task.state = TransferState::AwaitingReplace;
+                                    task.replacement = Some((
+                                        path.display().to_string(),
+                                        ReplacementReply::Local(reply),
+                                    ));
+                                    task.dismissed = false;
+                                    cx.notify();
+                                }
+                            }
                             Update::Replace(id, path, reply) => {
                                 this.request_replacement(id, path, reply, cx);
                             }
@@ -726,7 +742,6 @@ impl FilePane {
                 .detach();
                 return;
             }
-            Job::Attachment { control, .. } => *control = TransferControl::default(),
             _ => return,
         }
         self.enqueue(job, cx);
@@ -780,10 +795,6 @@ impl FilePane {
                 ),
                 control.clone(),
             )),
-            Job::Attachment { name, control, .. } => Some((
-                format!("{} · {name}", tr("file-attachment")),
-                control.clone(),
-            )),
             Job::RemoteTransfer {
                 source,
                 copy,
@@ -805,7 +816,7 @@ impl FilePane {
         // Mutations need a fresh item review, rather than replaying old ownership
         // or a partially completed delete/copy against a changed remote tree.
         let retry = match &job {
-            Job::Upload { .. } | Job::Download { .. } | Job::Attachment { .. } => Some(job.clone()),
+            Job::Upload { .. } | Job::Download { .. } => Some(job.clone()),
             _ => None,
         };
         match self.jobs.try_send(QueuedJob { id, job }) {
@@ -918,34 +929,6 @@ impl FilePane {
             cx,
         );
     }
-    pub fn upload_clipboard(&mut self, item: ClipboardItem, cx: &mut Context<Self>) {
-        for entry in item.entries {
-            match entry {
-                ClipboardEntry::ExternalPaths(paths) => {
-                    self.upload_files(paths.0.iter().cloned().collect(), None, true, cx)
-                }
-                ClipboardEntry::Image(image) => {
-                    if image.format != gpui::ImageFormat::Png
-                        || image.bytes.len() > 64 * 1024 * 1024
-                    {
-                        self.message = tr("file-image-format-error");
-                        cx.notify();
-                        continue;
-                    }
-                    let control = TransferControl::default();
-                    self.enqueue(
-                        Job::Attachment {
-                            bytes: image.bytes.into(),
-                            name: "screenshot.png".into(),
-                            control,
-                        },
-                        cx,
-                    );
-                }
-                ClipboardEntry::String(_) => {}
-            }
-        }
-    }
     fn pick_upload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let picker = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -994,7 +977,7 @@ impl FilePane {
             && task.control.ensure_active().is_ok()
         {
             task.state = TransferState::AwaitingReplace;
-            task.replacement = Some((path, reply));
+            task.replacement = Some((path, ReplacementReply::Remote(reply)));
             // A dismissed active upload must become visible when it requires a decision.
             task.dismissed = false;
             cx.notify();
@@ -1007,7 +990,23 @@ impl FilePane {
             && task.control.ensure_active().is_ok()
             && let Some((_, reply)) = task.replacement.take()
         {
-            if reply.try_send(true).is_ok() {
+            let sent = match reply {
+                ReplacementReply::Remote(reply) => reply.try_send(true).is_ok(),
+                ReplacementReply::Local(reply) => reply.try_send(DownloadDecision::Replace).is_ok(),
+            };
+            if sent {
+                task.state = TransferState::Running;
+            }
+            cx.notify();
+        }
+    }
+
+    fn decide_download(&mut self, id: u64, decision: DownloadDecision, cx: &mut Context<Self>) {
+        if let Some(task) = self.transfers.iter_mut().find(|task| task.id == id)
+            && task.control.ensure_active().is_ok()
+            && let Some((_, ReplacementReply::Local(reply))) = task.replacement.take()
+        {
+            if reply.try_send(decision).is_ok() {
                 task.state = TransferState::Running;
             }
             cx.notify();
@@ -2243,6 +2242,34 @@ impl FilePane {
                         .on_click(cx.listener(move |this, _, _, cx| this.replace_transfer(id, cx))),
                 );
         }
+        if matches!(
+            task.replacement.as_ref(),
+            Some((_, ReplacementReply::Local(_)))
+        ) {
+            card = card.child(
+                div().flex().flex_wrap().gap_1().children(
+                    [
+                        (DownloadDecision::Skip, "download-skip"),
+                        (
+                            DownloadDecision::ReplaceRemaining,
+                            "download-replace-remaining",
+                        ),
+                        (DownloadDecision::SkipRemaining, "download-skip-remaining"),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (decision, label))| {
+                        Button::new(("download-conflict", id * 4 + index as u64))
+                            .xsmall()
+                            .ghost()
+                            .label(tr(label))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.decide_download(id, decision, cx)
+                            }))
+                    }),
+                ),
+            );
+        }
         if let Some(failure) = &task.failure {
             card = card.child(div().text_xs().text_color(muted).child(failure.clone()));
         }
@@ -2630,7 +2657,11 @@ async fn execute(
             local,
             control,
         } => {
-            let report = client.download_tree(&remote, &local, &control).await?;
+            let report = client
+                .download_tree_with_confirmation(&remote, &local, &control, |path| {
+                    request_download_replacement(updates, id, path, &control)
+                })
+                .await?;
             updates
                 .send(Update::Message(format!(
                     "{}: {report}",
@@ -2638,28 +2669,6 @@ async fn execute(
                 )))
                 .await?;
             actions::report_result(&report)?;
-        }
-        Job::Attachment {
-            bytes,
-            name,
-            control,
-        } => {
-            control.set_total(bytes.len() as u64);
-            let directory = client.private_staging(home).await?;
-            let path = opsssh_drop::join_remote(&directory, &name)?;
-            client.upload_bytes(&bytes, &path, &control).await?;
-            updates
-                .send(Update::Insert(
-                    id,
-                    format!("{} ", opsssh_drop::quote(&path, opsssh_drop::Shell::Posix)?),
-                ))
-                .await?;
-            updates
-                .send(Update::Message(format!(
-                    "{}: {path}",
-                    tr("file-attachment-complete")
-                )))
-                .await?;
         }
         Job::Mkdir(path) => {
             client.create_directory(&path).await?;
@@ -2784,6 +2793,27 @@ async fn execute(
         }
     }
     Ok(())
+}
+async fn request_download_replacement(
+    updates: &Sender<Update>,
+    id: u64,
+    path: PathBuf,
+    control: &TransferControl,
+) -> opsssh_sftp::Result<DownloadDecision> {
+    control.ensure_active()?;
+    let (reply, receive) = async_channel::bounded(1);
+    updates
+        .send(Update::DownloadReplace(id, path, reply))
+        .await?;
+    loop {
+        tokio::select! {
+            decision = receive.recv() => { control.ensure_active()?; return Ok(decision?); },
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                control.ensure_active()?;
+                if updates.is_closed() { return Err("Download pane closed; existing file kept".into()); }
+            }
+        }
+    }
 }
 async fn request_upload_replacement(
     updates: &Sender<Update>,

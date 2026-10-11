@@ -61,6 +61,7 @@ struct Workspace {
     home_focus: FocusHandle,
     capture: Option<opsssh_platform::keyboard_capture::KeyboardCapture>,
     upload_dialog: Option<terminal_uploads::UploadDialog>,
+    clipboard_attachments: Vec<tempfile::NamedTempFile>,
     _terminal_focus: Vec<gpui::Subscription>,
     search: Entity<InputState>,
     store: Store,
@@ -136,7 +137,7 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
             let (path,mut message)=match opsssh_platform::app_data_dir(){Ok(dir)=>(dir.join("servers.toml"),String::new()),Err(error)=>(PathBuf::new(),format!("Cannot locate settings folder: {error}"))};
             let mut load_failed=false;
             let store=if path.as_os_str().is_empty(){load_failed=true;Store::default()}else{match Store::load(&path){Ok(store)=>store,Err(error)=>{message=format!("Cannot load servers. Fix the settings file before saving: {error}");load_failed=true;Store::default()}}};
-            let mut workspace=Workspace{home_focus,capture:None,upload_dialog:None,_terminal_focus:terminal_focus,search,store,path,sessions:vec![],navigation:SessionTabs::default(),transition:0,pending_close:None,quit_dialog:false,uptime_timer:None,editor:None,settings_page:false,help_page:false,message,filter:"All servers".into(),hovered_card:None,launched,first_frame_recorded:false,load_failed,environment_filter:String::new(),terminal_focus_released:false,panel_drag:None};
+            let mut workspace=Workspace{home_focus,capture:None,upload_dialog:None,clipboard_attachments:vec![],_terminal_focus:terminal_focus,search,store,path,sessions:vec![],navigation:SessionTabs::default(),transition:0,pending_close:None,quit_dialog:false,uptime_timer:None,editor:None,settings_page:false,help_page:false,message,filter:"All servers".into(),hovered_card:None,launched,first_frame_recorded:false,load_failed,environment_filter:String::new(),terminal_focus_released:false,panel_drag:None};
             crate::design::apply(&workspace.store.settings.theme,window,cx);
             crate::design::set_reduced_motion(workspace.store.settings.reduced_motion,cx);
             crate::design::observe_system(window).detach();
@@ -166,6 +167,9 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
                     if workspace.sessions.is_empty(){workspace.open_local(&OpenLocalTerminal,window,cx);}
                     let tab=workspace.sessions.last_mut().unwrap();
                     tab.keyboard_capture=true;tab.name="Atlas development VM".into();tab.endpoint=Some("deploy@atlas.example.test:22".into());tab.environment="Development".into();tab.protected=true;tab.persistent_name=Some("harness".into());
+                    if screen.contains("unicode") {
+                        tab.terminal.update(cx, |terminal, cx| terminal.preview_unicode(cx));
+                    }
                     if screen.contains("clipboard") {
                         let terminal=tab.terminal.clone();
                         let timer=cx.background_executor().timer(std::time::Duration::from_millis(900));
@@ -462,6 +466,20 @@ impl Workspace {
             file_generation: 0,
             files_needs_rebind: false,
         });
+        let terminal = self.sessions.last().unwrap().terminal.clone();
+        cx.subscribe_in(
+            &terminal,
+            window,
+            |this, terminal, event, window, cx| match event {
+                TerminalViewEvent::UploadFiles(paths) => {
+                    this.terminal_drop(terminal, paths.clone(), window, cx)
+                }
+                TerminalViewEvent::UploadClipboard(item) => {
+                    this.terminal_clipboard(terminal, item.clone(), window, cx)
+                }
+            },
+        )
+        .detach();
         self.transition = self.transition.wrapping_add(1);
         self.sync_visibility(cx);
         self.editor = None;
@@ -848,13 +866,6 @@ impl Workspace {
                     window.close_dialog(cx);
                 }
                 FormEvent::Save(profile, connect) => {
-                    if *connect
-                        && let Err(error) = crate::connections::options(profile, &this.store)
-                    {
-                        form.update(cx, |f, cx| f.error(error, cx));
-                        cx.notify();
-                        return;
-                    }
                     let old = this.store.clone();
                     let mut profile = profile.as_ref().clone();
                     match this.store.upsert(profile.clone()) {
@@ -879,6 +890,16 @@ impl Workspace {
                                             tab.upload_directory = None;
                                         }
                                     }
+                                }
+                                if *connect
+                                    && let Err(error) =
+                                        crate::connections::options(&profile, &this.store)
+                                {
+                                    form.update(cx, |f, cx| {
+                                        f.error(format!("{} · {}", tr("server-saved"), error), cx)
+                                    });
+                                    cx.notify();
+                                    return;
                                 }
                                 this.editor = None;
                                 window.close_dialog(cx);
@@ -973,9 +994,7 @@ impl Workspace {
                             this.terminal_drop(terminal, paths.clone(), window, cx)
                         }
                         TerminalViewEvent::UploadClipboard(item) => {
-                            if let Some(pane) = this.background_files(terminal, window, cx) {
-                                pane.update(cx, |pane, cx| pane.upload_clipboard(item.clone(), cx));
-                            }
+                            this.terminal_clipboard(terminal, item.clone(), window, cx);
                         }
                     },
                 )
@@ -1887,6 +1906,7 @@ mod tests {
             home_focus,
             capture: None,
             upload_dialog: None,
+            clipboard_attachments: vec![],
             _terminal_focus: terminal_focus,
             search: cx.new(|cx| InputState::new(window, cx)),
             store: Store::default(),
@@ -1910,6 +1930,109 @@ mod tests {
             terminal_focus_released: false,
             panel_drag: None,
         }
+    }
+
+    #[gpui::test]
+    fn edit_save_and_connect_persists_before_connection_validation(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let mut workspace = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| fixture(window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        let form = VisualTestContext::update(cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.load_failed = false;
+                this.path = path.clone();
+                let original = Profile {
+                    name: "Original".into(),
+                    host: "fixture.invalid".into(),
+                    user: "deploy".into(),
+                    ..Profile::default()
+                };
+                let id = this.store.upsert(original).unwrap();
+                this.store.save(&path).unwrap();
+                this.edit(
+                    this.store
+                        .servers
+                        .iter()
+                        .find(|p| p.id == id)
+                        .unwrap()
+                        .clone(),
+                    window,
+                    cx,
+                );
+                this.editor.clone().unwrap()
+            })
+        });
+        VisualTestContext::update(cx, |_, cx| {
+            form.update(cx, |_, cx| {
+                let mut profile = Store::load(&path).unwrap().servers[0].clone();
+                profile.name = "Saved edit".into();
+                // A valid saved profile whose connection settings require correction.
+                profile.auth = opsssh_store::Auth::Password;
+                profile.identities_only = true;
+                cx.emit(FormEvent::Save(Box::new(profile), true));
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(Store::load(&path).unwrap().servers[0].name, "Saved edit");
+        assert_eq!(
+            Store::load(&path).unwrap().servers[0].auth,
+            opsssh_store::Auth::Password
+        );
+        workspace.read_with(cx, |this, _| {
+            assert!(
+                this.editor.is_some(),
+                "Connection error should remain reviewable"
+            )
+        });
+        assert_eq!(workspace.read_with(cx, |this, _| this.sessions.len()), 2);
+    }
+
+    #[gpui::test]
+    fn failed_profile_persistence_prevents_connecting(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        let mut workspace = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| fixture(window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        let form = VisualTestContext::update(cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.load_failed = false;
+                this.path = dir.path().to_path_buf(); // A directory cannot be the settings file.
+                this.edit(Profile::default(), window, cx);
+                this.editor.clone().unwrap()
+            })
+        });
+        VisualTestContext::update(cx, |_, cx| {
+            form.update(cx, |_, cx| {
+                cx.emit(FormEvent::Save(
+                    Box::new(Profile {
+                        name: "Unsaved".into(),
+                        host: "fixture.invalid".into(),
+                        user: "deploy".into(),
+                        ..Profile::default()
+                    }),
+                    true,
+                ));
+            })
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |this, _| {
+            assert!(this.store.servers.is_empty());
+            assert!(this.editor.is_some());
+            assert_eq!(this.sessions.len(), 2);
+            assert!(this.message.contains("Could not save"));
+        });
     }
 
     #[gpui::test]

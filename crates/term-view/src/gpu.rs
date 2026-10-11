@@ -66,6 +66,7 @@ pub struct TerminalView {
     focus: FocusHandle,
     connection_options: Option<ConnectionOptions>,
     stopped: bool,
+    retry_pending: bool,
     tmux_missing: bool,
     notice_task: Option<Task<()>>,
     session: Option<Session>,
@@ -74,6 +75,7 @@ pub struct TerminalView {
     bounds: Bounds<Pixels>,
     cell_width: Pixels,
     cell_height: Pixels,
+    wheel_remainder: f32,
     font_size: f32,
     dimensions: TerminalSize,
     last_resize: Option<Instant>,
@@ -89,6 +91,7 @@ pub struct TerminalView {
     connection_generation: u64,
     at_prompt: bool,
     paste_preview: Option<String>,
+    paste_key_down: bool,
     #[cfg(feature = "test-support")]
     sent_input: Vec<Vec<u8>>,
     error: Option<String>,
@@ -133,6 +136,34 @@ impl TerminalView {
         view
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn preview_unicode(&mut self, cx: &mut Context<Self>) {
+        use opsssh_term_core::TerminalBackend;
+        self.disconnect(cx);
+        let mut terminal =
+            opsssh_term_core::AlacrittyTerminal::new(TerminalSize::new(140, 32).unwrap());
+        terminal
+            .ingest(
+                concat!(
+                    "Unicode terminal rendering\r\n\r\n",
+                    "Gujarati  : તમારી શિફ્ટનો સમય પૂર્ણ થઈ રહ્યો છે. આજે સારી કામગીરી કરી.\r\n",
+                    "Gujarati  : પગારની માહિતી હજુ ઉપલબ્ધ નથી. થોડી વાર પછી ફરી જુઓ.\r\n",
+                    "Hindi     : आपकी शिफ्ट समाप्त हो रही है। कृपया अगले कदम की पुष्टि करें।\r\n",
+                    "Chinese   : 终端已连接，文件上传成功。\r\n",
+                    "Japanese  : ファイルのアップロードが完了しました。\r\n",
+                    "Latin     : café naïve résumé — combining: e\u{301}\r\n",
+                    "Emoji     : 🚀 ✅ 🔒 👩‍💻\r\n\r\n",
+                    "\x1b[41m- old: અંતિમ રીમાઇન્ડર\x1b[0m\r\n",
+                    "\x1b[42m+ new: તમારી શિફ્ટનો સમય પૂર્ણ થઈ રહ્યો છે.\x1b[0m\r\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        self.snapshot = terminal.snapshot();
+        self.shapes.clear();
+        cx.notify();
+    }
+
     pub fn connect(
         options: ConnectionOptions,
         window: &mut Window,
@@ -153,6 +184,8 @@ impl TerminalView {
         self.notice_task = None;
         self.session = None;
         self.stopped = true;
+        self.retry_pending = false;
+        self.paste_key_down = false;
         self.prompt = None;
         self.blink_task = None;
         self.sync_task = None;
@@ -165,6 +198,15 @@ impl TerminalView {
     }
     /// Explicit reconnect after a disconnect; retain the rendered buffer until new output arrives.
     pub fn reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state() == SessionState::Reconnecting {
+            if !self.retry_pending
+                && let Some(commands) = self.ssh_commands()
+            {
+                self.retry_pending = commands.try_send(SshCommand::RetryNow).is_ok();
+                cx.notify();
+            }
+            return;
+        }
         if !matches!(
             self.state(),
             SessionState::Disconnected | SessionState::Closed
@@ -190,6 +232,9 @@ impl TerminalView {
         self.connection_options
             .as_ref()
             .is_some_and(|o| o.tmux.is_some())
+    }
+    pub fn retry_pending(&self) -> bool {
+        self.retry_pending
     }
     /// Reuse this session's immutable endpoint/auth configuration for a new shell.
     pub fn fresh_shell_options(&self) -> Option<ConnectionOptions> {
@@ -443,6 +488,7 @@ impl TerminalView {
             focus,
             connection_options,
             stopped: false,
+            retry_pending: false,
             tmux_missing: false,
             notice_task: Some(notice_task),
             session: None,
@@ -451,6 +497,7 @@ impl TerminalView {
             bounds: Bounds::default(),
             cell_width: px(9.6),
             cell_height: px(22.),
+            wheel_remainder: 0.,
             font_size: 16.0,
             dimensions,
             last_resize: None,
@@ -466,6 +513,7 @@ impl TerminalView {
             connection_generation: 0,
             at_prompt: false,
             paste_preview: None,
+            paste_key_down: false,
             #[cfg(feature = "test-support")]
             sent_input: Vec::new(),
             error: None,
@@ -498,6 +546,7 @@ impl TerminalView {
         match event {
             SshEvent::Authenticated(info) => self.authentication = Some(info),
             SshEvent::Connected => {
+                self.retry_pending = false;
                 self.error = None;
                 self.prompt = None;
                 if let Some(session) = &self.session {
@@ -511,6 +560,7 @@ impl TerminalView {
                 self.verified_host_key = Some(fingerprint)
             }
             SshEvent::Reconnecting { attempt, delay } => {
+                self.retry_pending = false;
                 self.authentication = None;
                 self.connection_generation = self.connection_generation.wrapping_add(1);
                 self.error = Some(format!(
@@ -519,13 +569,22 @@ impl TerminalView {
                 ));
                 self.prompt = None;
             }
-            SshEvent::Error(error) => self.error = Some(error),
+            SshEvent::Retrying => {
+                self.retry_pending = true;
+                self.error = Some(tr("term-retrying-now"));
+            }
+            SshEvent::Error(error) => {
+                self.retry_pending = false;
+                self.error = Some(error);
+            }
             SshEvent::Closed {
                 exit_status: Some(127),
             } if self.is_tmux_protected() => {
+                self.retry_pending = false;
                 self.tmux_missing = true;
                 self.error = Some(tr("term-tmux-missing"));
             }
+            SshEvent::Closed { .. } => self.retry_pending = false,
             SshEvent::HostKeyPrompt {
                 id,
                 host,
@@ -1128,15 +1187,15 @@ impl TerminalView {
         if !self.state().accepts_input() {
             return;
         }
-        if item.entries().iter().any(|entry| {
+        if let Some(text) = item.text().filter(|text| !text.is_empty()) {
+            self.paste_text(&text, cx);
+        } else if item.entries().iter().any(|entry| {
             matches!(
                 entry,
                 ClipboardEntry::Image(_) | ClipboardEntry::ExternalPaths(_)
             )
         }) {
             cx.emit(TerminalViewEvent::UploadClipboard(item));
-        } else if let Some(text) = item.text() {
-            self.paste_text(&text, cx);
         }
     }
 
@@ -1145,6 +1204,14 @@ impl TerminalView {
             return;
         }
         let key = &event.keystroke;
+        if is_clipboard_paste(key) {
+            self.paste_key_down = true;
+            if let Some(item) = cx.read_from_clipboard() {
+                self.paste_item(item, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         let Some(session) = &self.session else {
             return;
         };
@@ -1183,6 +1250,13 @@ impl TerminalView {
     }
 
     fn key_up(&mut self, event: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if (self.paste_key_down && event.keystroke.key.eq_ignore_ascii_case("v"))
+            || is_clipboard_paste(&event.keystroke)
+        {
+            self.paste_key_down = false;
+            cx.stop_propagation();
+            return;
+        }
         if self.prompt.is_some() || self.paste_preview.is_some() {
             return;
         }
@@ -1347,8 +1421,15 @@ impl TerminalView {
             ScrollDelta::Lines(point) => point.y,
             ScrollDelta::Pixels(point) => f32::from(point.y) / f32::from(self.cell_height),
         };
-        let count = lines.abs().ceil().min(20.) as usize;
+        if self.wheel_remainder.signum() != lines.signum() {
+            self.wheel_remainder = 0.;
+        }
+        self.wheel_remainder += lines;
+        let whole = self.wheel_remainder.trunc().clamp(-100., 100.);
+        self.wheel_remainder -= whole;
+        let count = whole.abs() as usize;
         if count == 0 {
+            cx.stop_propagation();
             return;
         }
         let code = if lines > 0. { 64 } else { 65 };
@@ -1384,7 +1465,15 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) -> Vec<ShapedLine> {
         self.bounds = bounds;
-        let terminal_font = font(terminal_font_family());
+        let mut terminal_font = font(terminal_font_family());
+        #[cfg(target_os = "windows")]
+        {
+            terminal_font.fallbacks = Some(gpui::FontFallbacks(Arc::new(vec![
+                "Nirmala UI".into(),
+                "Segoe UI".into(),
+                "Segoe UI Emoji".into(),
+            ])));
+        }
         let sample = TextRun {
             len: 1,
             font: terminal_font.clone(),
@@ -1439,10 +1528,12 @@ impl TerminalView {
             }
             let mut text = String::new();
             let mut runs = Vec::new();
-            for cell in &row.cells {
+            let mut cell_indices = Vec::new();
+            for (column, cell) in row.cells.iter().enumerate() {
                 if cell.wide_continuation {
                     continue;
                 }
+                cell_indices.push((text.len(), column));
                 text.push_str(&cell.text);
                 let mut font = terminal_font.clone();
                 if cell.style.bold {
@@ -1469,12 +1560,16 @@ impl TerminalView {
                     strikethrough: None,
                 });
             }
-            let line = window.text_system().shape_line(
+            let ascii = text.is_ascii();
+            let mut line = window.text_system().shape_line(
                 text.into(),
                 px(self.font_size),
                 &runs,
-                Some(self.cell_width),
+                ascii.then_some(self.cell_width),
             );
+            if !ascii {
+                fit_clusters_to_cells(&mut line, &cell_indices, row.cells.len(), self.cell_width);
+            }
             let shaped = ShapedRow {
                 source: row.clone(),
                 line,
@@ -2074,16 +2169,17 @@ mod clipboard_tests {
         });
         let view = view.unwrap();
         draw(cx);
+        cx.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string("from web".into())));
         for (keys, expected) in [
             ("shift-tab", b"\x1b[Z".as_slice()),
             ("tab", b"\t".as_slice()),
             ("left", b"\x1b[D".as_slice()),
             ("ctrl-c", b"\x03".as_slice()),
-            ("ctrl-v", b"\x16".as_slice()),
+            ("ctrl-v", b"from web".as_slice()),
             ("ctrl-n", b"\x0e".as_slice()),
             ("ctrl-k", b"\x0b".as_slice()),
             ("ctrl-w", b"\x17".as_slice()),
-            ("ctrl-shift-v", b"\x16".as_slice()),
+            ("ctrl-shift-v", b"from web".as_slice()),
             ("alt-left", b"\x1b[1;3D".as_slice()),
             ("shift-left", b"\x1b[1;2D".as_slice()),
         ] {
@@ -2203,6 +2299,122 @@ mod clipboard_tests {
                 view.disconnect(cx);
                 view.captured_key(event, cx);
                 assert!(view.sent_input.is_empty());
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn paste_keys_prioritize_text_and_consume_kitty_release(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let session = Session::local(LocalShellOptions::default()).unwrap();
+        let (view, cx) = cx.add_window_view(fixture);
+        let uploads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.stopped = false;
+                view.session = Some(session);
+                view.focus.focus(window, cx);
+                view.session
+                    .as_ref()
+                    .unwrap()
+                    .backend()
+                    .lock()
+                    .unwrap()
+                    .ingest(b"\x1b[>11u\x1b[?2004h")
+                    .unwrap();
+                let uploads = uploads.clone();
+                cx.subscribe(&cx.entity(), move |_, _, event, _| {
+                    if matches!(event, TerminalViewEvent::UploadClipboard(_)) {
+                        uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                })
+                .detach();
+            });
+        });
+        draw(cx);
+        for keys in ["ctrl-v", "ctrl-shift-v", "cmd-v"] {
+            cx.update(|_, cx| {
+                view.update(cx, |view, _| view.sent_input.clear());
+                let mut item = ClipboardItem::new_string("from web\nગુજરાતી".into());
+                item.entries
+                    .push(ClipboardEntry::Image(gpui::Image::empty()));
+                cx.write_to_clipboard(item);
+            });
+            cx.simulate_keystrokes(keys);
+            cx.simulate_event(KeyUpEvent {
+                keystroke: gpui::Keystroke::parse(keys).unwrap(),
+            });
+            assert_eq!(
+                view.read_with(cx, |view, _| view.sent_input.concat()),
+                "\x1b[200~from web\nગુજરાતી\x1b[201~".as_bytes()
+            );
+            assert_eq!(uploads.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| view.sent_input.clear());
+            cx.write_to_clipboard(ClipboardItem::new_string("modifier release".into()));
+        });
+        cx.simulate_keystrokes("ctrl-v");
+        cx.simulate_event(KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("v").unwrap(),
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sent_input.concat()),
+            b"\x1b[200~modifier release\x1b[201~"
+        );
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| view.sent_input.clear());
+            cx.write_to_clipboard(ClipboardItem::new_image(&gpui::Image::empty()));
+        });
+        cx.simulate_keystrokes("ctrl-v");
+        assert_eq!(uploads.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(view.read_with(cx, |view, _| view.sent_input.is_empty()));
+        cx.update(|_, cx| view.update(cx, |view, cx| view.disconnect(cx)));
+    }
+
+    #[gpui::test]
+    fn fractional_wheel_accumulates_and_shift_bypasses_remote_mouse(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let session = Session::local(LocalShellOptions::default()).unwrap();
+        let (view, cx) = cx.add_window_view(fixture);
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.stopped = false;
+                view.session = Some(session);
+                view.session
+                    .as_ref()
+                    .unwrap()
+                    .backend()
+                    .lock()
+                    .unwrap()
+                    .ingest(b"\x1b[?1000h\x1b[?1006h")
+                    .unwrap();
+            })
+        });
+        draw(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let mut event = ScrollWheelEvent {
+                    position: view.bounds.origin + point(px(2.), px(2.)),
+                    delta: ScrollDelta::Pixels(point(px(0.), view.cell_height * 0.25)),
+                    modifiers: Default::default(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                };
+                for _ in 0..3 {
+                    view.scroll(&event, window, cx);
+                }
+                assert!(view.sent_input.is_empty());
+                view.scroll(&event, window, cx);
+                assert_eq!(view.sent_input.concat(), b"\x1b[<64;1;1M");
+                view.sent_input.clear();
+                event.modifiers.shift = true;
+                event.delta = ScrollDelta::Lines(point(0., 3.));
+                view.scroll(&event, window, cx);
+                assert!(
+                    view.sent_input.is_empty(),
+                    "Shift wheel was forwarded remotely"
+                );
+                view.disconnect(cx);
             })
         });
     }
@@ -2351,9 +2563,7 @@ mod clipboard_tests {
             ("ctrl-shift-q", b"\x11".as_slice()),
             ("shift-tab", b"\x1b[Z".as_slice()),
             ("alt-tab", b"\x1b\t".as_slice()),
-            ("ctrl-v", b"\x16".as_slice()),
             ("ctrl-shift-c", b"\x03".as_slice()),
-            ("ctrl-shift-v", b"\x16".as_slice()),
             ("shift-insert", b"\x1b[2;2~".as_slice()),
             ("alt-p", b"\x1bp".as_slice()),
             ("alt-enter", b"\x1b\r".as_slice()),
@@ -2392,9 +2602,7 @@ mod clipboard_tests {
     }
 
     #[gpui::test]
-    fn all_terminal_shortcuts_forward_press_and_release_without_clipboard_actions(
-        cx: &mut TestAppContext,
-    ) {
+    fn non_paste_shortcuts_forward_press_and_release(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
         let session = Session::local(LocalShellOptions::default()).unwrap();
         let (view, cx) = cx.add_window_view(fixture);
@@ -2417,11 +2625,8 @@ mod clipboard_tests {
         draw(cx);
         for (keys, press, release) in [
             ("ctrl-c", "\x1b[99;5:1u", "\x1b[99;5:3u"),
-            ("ctrl-v", "\x1b[118;5:1u", "\x1b[118;5:3u"),
             ("ctrl-shift-c", "\x1b[99;6:1u", "\x1b[99;6:3u"),
-            ("ctrl-shift-v", "\x1b[118;6:1u", "\x1b[118;6:3u"),
             ("cmd-c", "\x1b[99;9:1u", "\x1b[99;9:3u"),
-            ("cmd-v", "\x1b[118;9:1u", "\x1b[118;9:3u"),
             ("shift-insert", "\x1b[2;2:1~", "\x1b[2;2:3~"),
             ("alt-tab", "\x1b[9;3:1u", "\x1b[9;3:3u"),
         ] {
@@ -2677,5 +2882,84 @@ mod clipboard_tests {
         }
         cx.update(|_, cx| view.update(cx, |view, cx| view.disconnect(cx)));
         assert!(found, "right-click paste did not reach the interactive PTY");
+    }
+}
+
+fn is_clipboard_paste(key: &gpui::Keystroke) -> bool {
+    key.key.eq_ignore_ascii_case("v")
+        && (key.modifiers.control || key.modifiers.platform)
+        && !key.modifiers.alt
+}
+
+/// Keep the shaper's offsets inside each cluster (Indic vowel signs, ligatures,
+/// combining accents and emoji), positioning clusters by their source cells.
+fn fit_clusters_to_cells(
+    line: &mut ShapedLine,
+    cells: &[(usize, usize)],
+    columns: usize,
+    width: Pixels,
+) {
+    let mut origins = std::collections::BTreeMap::<usize, Pixels>::new();
+    for glyph in line.runs.iter().flat_map(|run| &run.glyphs) {
+        origins.entry(glyph.index).or_insert(glyph.position.x);
+    }
+    let mut runs = line.runs.clone();
+    for glyph in runs.iter_mut().flat_map(|run| &mut run.glyphs) {
+        let cell = cells.partition_point(|(offset, _)| *offset <= glyph.index);
+        if let Some((_, column)) = cell.checked_sub(1).and_then(|i| cells.get(i)) {
+            glyph.position.x += width * *column as f32 - origins[&glyph.index];
+        }
+    }
+    *std::ops::DerefMut::deref_mut(line) = Arc::new(gpui::LineLayout {
+        font_size: line.font_size,
+        width: width * columns as f32,
+        ascent: line.ascent,
+        descent: line.descent,
+        runs,
+        len: line.len,
+    });
+}
+
+#[cfg(test)]
+mod cluster_layout_tests {
+    use super::*;
+    #[test]
+    fn indic_cluster_offsets_and_wide_character_columns_are_preserved() {
+        let mut line = ShapedLine::default();
+        line.text = "કિx😃z".into();
+        *std::ops::DerefMut::deref_mut(&mut line) = Arc::new(gpui::LineLayout {
+            len: "કિx😃z".len(),
+            width: px(37.),
+            runs: vec![gpui::ShapedRun {
+                font_id: gpui::FontId(0),
+                glyphs: [
+                    (0, 0., 0.),
+                    (0, 4., -2.),
+                    (6, 13., 0.),
+                    (7, 20., 0.),
+                    (11, 37., 0.),
+                ]
+                .into_iter()
+                .map(|(index, x, y)| gpui::ShapedGlyph {
+                    id: gpui::GlyphId(0),
+                    position: point(px(x), px(y)),
+                    index,
+                    is_emoji: index == 7,
+                })
+                .collect(),
+            }],
+            ..gpui::LineLayout::default()
+        });
+        fit_clusters_to_cells(&mut line, &[(0, 0), (6, 1), (7, 2), (11, 4)], 5, px(10.));
+        let glyphs = &line.runs[0].glyphs;
+        assert_eq!(
+            glyphs[1].position - glyphs[0].position,
+            point(px(4.), px(-2.))
+        );
+        assert_eq!(glyphs[2].position.x, px(10.));
+        assert_eq!(glyphs[3].position.x, px(20.));
+        assert_eq!(glyphs[4].position.x, px(40.));
+        assert_eq!(line.width, px(50.));
+        assert_eq!(line.text.as_ref(), "કિx😃z");
     }
 }
