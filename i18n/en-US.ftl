@@ -491,3 +491,4 @@ file-drag-out-cancelled = Drag to the desktop cancelled
 file-drag-out-downloading = Downloading
 file-drag-out-other-app = Other apps need the file prepared first: wait for “Ready to drop”, or drop into a File Explorer folder or the desktop.
 file-drag-out-unsupported-name = These names cannot be used on Windows; use Download instead.
+infra-measuring = Measuring…

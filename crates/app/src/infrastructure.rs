@@ -232,6 +232,9 @@ pub struct InfrastructureView {
     request_serial: u64,
     operation: Option<ExecControl>,
     poll: Option<Task<()>>,
+    /// CPU usage needs two samples; the second is taken one second after the first
+    /// instead of waiting for the regular poll.
+    warmup: Option<Task<()>>,
     sort: Sort,
     descending: bool,
 }
@@ -260,6 +263,7 @@ impl InfrastructureView {
             request_serial: 0,
             operation: None,
             poll: None,
+            warmup: None,
             sort: Sort::Cpu,
             descending: true,
         }
@@ -317,6 +321,7 @@ impl InfrastructureView {
         }
         self.visible = visible;
         self.poll = None;
+        self.warmup = None;
         if !self.collect_enabled {
             cx.notify();
             return;
@@ -388,12 +393,24 @@ impl InfrastructureView {
                         if let Some(previous) = &this.snapshot {
                             sample_delta(&mut snapshot, previous);
                         }
+                        let measuring = snapshot.cpu_percent.is_none();
                         this.snapshot = Some(snapshot);
+                        this.warmup = None;
+                        if measuring {
+                            this.warmup = Some(cx.spawn(async move |this, cx| {
+                                cx.background_executor().timer(Duration::from_secs(1)).await;
+                                let _ = this.update(cx, |this, cx| {
+                                    this.warmup = None;
+                                    this.refresh(cx);
+                                });
+                            }));
+                        }
                         this.sort_processes();
                         this.message = tr("infra-refresh-help");
                     }
                     Err(error) => {
                         this.snapshot = None;
+                        this.warmup = None;
                         this.message = format!("{}: {error}", tr("infra-metrics-unavailable"));
                     }
                 }
@@ -604,6 +621,8 @@ impl Render for InfrastructureView {
             })
             .unwrap_or_else(|| tr("infra-unavailable"));
         let cpu = snapshot.cpu_percent;
+        // Between the first and second sample, CPU values are being measured, not missing.
+        let measuring = self.snapshot.is_some() && cpu.is_none() && self.warmup.is_some();
         let memory = percent(memory_used, snapshot.memory_total);
         let disk = percent(snapshot.disk_used, snapshot.disk_total);
         let mut header = div()
@@ -708,7 +727,11 @@ impl Render for InfrastructureView {
                     .gap_3()
                     .child(card(
                         &tr("infra-processor"),
-                        percent_label(cpu),
+                        if measuring {
+                            tr("infra-measuring")
+                        } else {
+                            percent_label(cpu)
+                        },
                         format!(
                             "{} {} · {} {uptime}",
                             snapshot
@@ -831,7 +854,15 @@ impl Render for InfrastructureView {
                                                         .w(px(cpu_width))
                                                         .flex_shrink_0()
                                                         .text_sm()
-                                                        .child(percent_label(process.cpu)),
+                                                        .child(
+                                                            if process.cpu.is_none()
+                                                                && this.warmup.is_some()
+                                                            {
+                                                                "…".into()
+                                                            } else {
+                                                                percent_label(process.cpu)
+                                                            },
+                                                        ),
                                                 )
                                                 .child(
                                                     div()
