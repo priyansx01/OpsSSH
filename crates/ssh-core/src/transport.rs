@@ -774,10 +774,33 @@ async fn run_once(
     let mut lost = false;
     let mut executions = tokio::task::JoinSet::new();
     let mut shells = tokio::task::JoinSet::new();
+    // After the computer sleeps, the TCP connection is usually dead but silent; keepalives
+    // alone would take minutes to notice. A clock gap triggers an immediate round trip.
+    let mut wake_check = tokio::time::interval(WAKE_CHECK_INTERVAL);
+    wake_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_tick = (std::time::SystemTime::now(), std::time::Instant::now());
+    let mut probe = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
          _=executions.join_next(),if !executions.is_empty()=>{},
          _=shells.join_next(),if !shells.is_empty()=>{},
+         _=wake_check.tick()=>{
+            let now = (std::time::SystemTime::now(), std::time::Instant::now());
+            if probe.is_empty() && resumed_from_sleep(last_tick, now) {
+                let connection = connection.clone();
+                probe.spawn(async move {
+                    tokio::time::timeout(WAKE_PROBE_TIMEOUT, connection.handle.send_ping()).await
+                });
+            }
+            last_tick = now;
+         },
+         answered=probe.join_next(),if !probe.is_empty()=>{
+            // No reply after waking: the link is gone, so recover now (tmux keeps the work).
+            if !matches!(answered, Some(Ok(Ok(Ok(()))))) {
+                lost = true;
+                break;
+            }
+         },
          message=channel.wait()=>match message {
           Some(ChannelMsg::Data{data})|Some(ChannelMsg::ExtendedData{data,..})=>{events.send(SshEvent::Data(data.to_vec())).await?;},
           Some(ChannelMsg::ExitStatus{exit_status})=>status=Some(exit_status),
@@ -823,6 +846,7 @@ async fn run_once(
     // Shell channels share this transport; dropping their event senders closes their panes.
     shells.abort_all();
     executions.abort_all();
+    probe.abort_all();
     let _ = connection.disconnect().await;
     if !lost {
         events
@@ -835,6 +859,19 @@ async fn run_once(
 }
 
 const MAX_SHELL_CHANNELS: usize = 8;
+const WAKE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+const WAKE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A tick that arrives far later than scheduled means the computer slept or the process
+/// was suspended. Either clock may show the gap, depending on the platform.
+fn resumed_from_sleep(
+    previous: (std::time::SystemTime, std::time::Instant),
+    now: (std::time::SystemTime, std::time::Instant),
+) -> bool {
+    let wall = now.0.duration_since(previous.0).unwrap_or_default();
+    let monotonic = now.1.saturating_duration_since(previous.1);
+    wall.max(monotonic) > WAKE_CHECK_INTERVAL * 4
+}
 
 /// Serve one extra interactive shell on an authenticated connection until either side closes it.
 async fn run_shell_channel(
@@ -1017,6 +1054,11 @@ fn recoverable_network_error(error: &anyhow::Error) -> bool {
                 | std::io::ErrorKind::NotConnected
                 | std::io::ErrorKind::TimedOut
                 | std::io::ErrorKind::UnexpectedEof
+                // Common while Wi-Fi or a VPN comes back after waking.
+                | std::io::ErrorKind::NetworkUnreachable
+                | std::io::ErrorKind::HostUnreachable
+                | std::io::ErrorKind::NetworkDown
+                | std::io::ErrorKind::AddrNotAvailable
         )
     }
     error.chain().any(|source| {
@@ -1095,4 +1137,49 @@ fn load_private_key(
     }
     let secret = Zeroizing::new(std::fs::read_to_string(path)?);
     russh::keys::decode_secret_key(&secret, passphrase)
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+    use std::time::{Instant, SystemTime};
+
+    #[test]
+    fn long_clock_gaps_count_as_waking_from_sleep() {
+        let then = (SystemTime::now(), Instant::now());
+        let normal = (
+            then.0 + Duration::from_secs(5),
+            then.1 + Duration::from_secs(5),
+        );
+        assert!(!resumed_from_sleep(then, normal));
+        // Only the wall clock jumped (monotonic time paused during sleep).
+        let wall = (
+            then.0 + Duration::from_secs(600),
+            then.1 + Duration::from_secs(5),
+        );
+        assert!(resumed_from_sleep(then, wall));
+        // Only the monotonic clock jumped (wall clock adjusted backwards meanwhile).
+        let monotonic = (then.0, then.1 + Duration::from_secs(120));
+        assert!(resumed_from_sleep(then, monotonic));
+        let backwards = (
+            then.0 - Duration::from_secs(3600),
+            then.1 + Duration::from_secs(5),
+        );
+        assert!(!resumed_from_sleep(then, backwards));
+    }
+
+    #[test]
+    fn network_errors_after_waking_are_retried() {
+        for kind in [
+            std::io::ErrorKind::NetworkUnreachable,
+            std::io::ErrorKind::HostUnreachable,
+            std::io::ErrorKind::NetworkDown,
+            std::io::ErrorKind::ConnectionReset,
+        ] {
+            let error = anyhow::Error::from(std::io::Error::from(kind)).context("reconnecting");
+            assert!(recoverable_network_error(&error), "{kind:?}");
+        }
+        let denied = anyhow::anyhow!("Authentication rejected");
+        assert!(!recoverable_network_error(&denied));
+    }
 }
