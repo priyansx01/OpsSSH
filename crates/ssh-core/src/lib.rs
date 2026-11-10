@@ -243,6 +243,11 @@ pub enum SshCommand {
         request: ExecRequest,
         reply: Sender<std::result::Result<ExecOutput, String>>,
     },
+    /// Open another interactive shell channel on this authenticated connection.
+    OpenShell {
+        size: TerminalSize,
+        reply: Sender<std::result::Result<SshSession, String>>,
+    },
     Disconnect,
 }
 impl fmt::Debug for SshCommand {
@@ -255,6 +260,7 @@ impl fmt::Debug for SshCommand {
             Self::AuthResponse { .. } => "AuthResponse([REDACTED])",
             Self::OpenSftp { .. } => "OpenSftp",
             Self::Exec { .. } => "Exec([REDACTED])",
+            Self::OpenShell { .. } => "OpenShell",
             Self::Disconnect => "Disconnect",
         })
     }
@@ -287,6 +293,26 @@ impl SshSession {
                 let _ = sender.send_blocking(SshEvent::Closed { exit_status: None });
             })?;
         Ok(Self { commands, events })
+    }
+    /// A shell channel driven by its parent connection's transport task.
+    pub(crate) fn from_channels(commands: Sender<SshCommand>, events: Receiver<SshEvent>) -> Self {
+        Self { commands, events }
+    }
+    /// Request another shell channel from a connected session's command sender.
+    /// It shares authentication and transport, and closes when the connection ends.
+    pub async fn open_shell(
+        parent: &Sender<SshCommand>,
+        size: TerminalSize,
+    ) -> std::result::Result<Self, String> {
+        let (reply, receive) = async_channel::bounded(1);
+        parent
+            .send(SshCommand::OpenShell { size, reply })
+            .await
+            .map_err(|_| "SSH session closed".to_string())?;
+        receive
+            .recv()
+            .await
+            .map_err(|_| "SSH session closed".to_string())?
     }
     pub fn commands(&self) -> Sender<SshCommand> {
         self.commands.clone()

@@ -998,3 +998,121 @@ async fn manual_retry_interrupts_backoff_and_duplicate_requests_do_not_spawn_ses
     .await
     .unwrap();
 }
+async fn data_until(events: &async_channel::Receiver<SshEvent>, marker: &[u8]) -> Vec<u8> {
+    let mut received = Vec::new();
+    loop {
+        match next(events).await {
+            SshEvent::Data(data) => {
+                received.extend_from_slice(&data);
+                if received.windows(marker.len()).any(|w| w == marker) {
+                    return received;
+                }
+            }
+            SshEvent::Closed { .. } => panic!("Channel closed before {marker:?}"),
+            _ => {}
+        }
+    }
+}
+async fn closed(events: &async_channel::Receiver<SshEvent>) {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), events.recv())
+            .await
+            .expect("SSH event timeout")
+        {
+            Ok(SshEvent::Closed { .. }) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
+}
+#[tokio::test]
+async fn shell_channels_share_the_connection_and_close_independently() {
+    let fixture = Fixture::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let session = SshSession::spawn(
+        fixture.options(dir.path().join("known_hosts")),
+        TerminalSize::new(80, 24).unwrap(),
+    )
+    .unwrap();
+    trust_and_connect(&session).await;
+    let child = SshSession::open_shell(&session.commands(), TerminalSize::new(60, 20).unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(next(&child.events()).await, SshEvent::Connected));
+    data_until(&child.events(), b"fixture-ready").await;
+    child
+        .commands()
+        .send(SshCommand::Write(b"child-marker".to_vec()))
+        .await
+        .unwrap();
+    data_until(&child.events(), b"child-marker").await;
+    session
+        .commands()
+        .send(SshCommand::Write(b"parent-marker".to_vec()))
+        .await
+        .unwrap();
+    let parent = data_until(&session.events(), b"parent-marker").await;
+    assert!(!parent.windows(12).any(|w| w == b"child-marker"));
+    child
+        .commands()
+        .send(SshCommand::Resize(TerminalSize::new(70, 30).unwrap()))
+        .await
+        .unwrap();
+    // A child exec uses the shared connection without involving the primary shell.
+    let output = exec_reply(start_exec(&child, ExecRequest::new("exec-fixture")).await)
+        .await
+        .unwrap();
+    assert_eq!(output.exit_status, Some(7));
+    child.commands().send(SshCommand::Disconnect).await.unwrap();
+    closed(&child.events()).await;
+    session
+        .commands()
+        .send(SshCommand::Write(b"still-alive".to_vec()))
+        .await
+        .unwrap();
+    data_until(&session.events(), b"still-alive").await;
+    let sizes = fixture.sizes.lock().unwrap().clone();
+    assert!(sizes.contains(&(60, 20)) && sizes.contains(&(70, 30)));
+}
+#[tokio::test]
+async fn shell_channels_close_with_their_connection_and_wait_for_authentication() {
+    let fixture = Fixture::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let session = SshSession::spawn(
+        fixture.options(dir.path().join("known_hosts")),
+        TerminalSize::new(80, 24).unwrap(),
+    )
+    .unwrap();
+    let events = session.events();
+    let prompt = loop {
+        if let SshEvent::HostKeyPrompt { id, .. } = next(&events).await {
+            break id;
+        }
+    };
+    let early = SshSession::open_shell(&session.commands(), TerminalSize::new(80, 24).unwrap())
+        .await
+        .unwrap_err();
+    assert!(early.contains("authentication is not complete"), "{early}");
+    session
+        .commands()
+        .send(SshCommand::TrustHost {
+            id: prompt,
+            trust: true,
+            persist: true,
+        })
+        .await
+        .unwrap();
+    while !matches!(next(&events).await, SshEvent::Connected) {}
+    let child = SshSession::open_shell(&session.commands(), TerminalSize::new(80, 24).unwrap())
+        .await
+        .unwrap();
+    let nested = SshSession::open_shell(&child.commands(), TerminalSize::new(80, 24).unwrap())
+        .await
+        .unwrap_err();
+    assert!(nested.contains("primary"), "{nested}");
+    session
+        .commands()
+        .send(SshCommand::Disconnect)
+        .await
+        .unwrap();
+    closed(&child.events()).await;
+}

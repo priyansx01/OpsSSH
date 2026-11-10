@@ -104,6 +104,10 @@ impl client::Handler for HostHandler {
                             let _ =
                                 reply.try_send(Err("SSH authentication is not complete".into()));
                         }
+                        SshCommand::OpenShell { reply, .. } => {
+                            let _ =
+                                reply.try_send(Err("SSH authentication is not complete".into()));
+                        }
                         _ => {}
                     }
                 }
@@ -468,6 +472,9 @@ async fn ask(
             SshCommand::Exec { reply, .. } => {
                 let _ = reply.try_send(Err("SSH authentication is not complete".into()));
             }
+            SshCommand::OpenShell { reply, .. } => {
+                let _ = reply.try_send(Err("SSH authentication is not complete".into()));
+            }
             _ => {}
         }
     }
@@ -766,9 +773,11 @@ async fn run_once(
     let mut status = None;
     let mut lost = false;
     let mut executions = tokio::task::JoinSet::new();
+    let mut shells = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
          _=executions.join_next(),if !executions.is_empty()=>{},
+         _=shells.join_next(),if !shells.is_empty()=>{},
          message=channel.wait()=>match message {
           Some(ChannelMsg::Data{data})|Some(ChannelMsg::ExtendedData{data,..})=>{events.send(SshEvent::Data(data.to_vec())).await?;},
           Some(ChannelMsg::ExitStatus{exit_status})=>status=Some(exit_status),
@@ -800,10 +809,19 @@ async fn run_once(
                 });
             }
           },
+          Ok(SshCommand::OpenShell{size,reply})=>{
+            if shells.len() >= MAX_SHELL_CHANNELS {
+                let _=reply.try_send(Err("Too many terminal panes are open on this connection".into()));
+            } else {
+                shells.spawn(run_shell_channel(connection.clone(), size, reply));
+            }
+          },
           Ok(SshCommand::Disconnect)|Err(_)=>{let _=channel.close().await;break;},_=>{}
          }
         }
     }
+    // Shell channels share this transport; dropping their event senders closes their panes.
+    shells.abort_all();
     executions.abort_all();
     let _ = connection.disconnect().await;
     if !lost {
@@ -814,6 +832,101 @@ async fn run_once(
             .await?;
     }
     Ok(lost)
+}
+
+const MAX_SHELL_CHANNELS: usize = 8;
+
+/// Serve one extra interactive shell on an authenticated connection until either side closes it.
+async fn run_shell_channel(
+    connection: Arc<AuthenticatedConnection>,
+    size: TerminalSize,
+    reply: Sender<std::result::Result<SshSession, String>>,
+) {
+    let opening = async {
+        let mut channel = connection.handle.channel_open_session().await?;
+        channel
+            .request_pty(
+                true,
+                "xterm-256color",
+                size.columns().into(),
+                size.rows().into(),
+                0,
+                0,
+                &[],
+            )
+            .await?;
+        wait_success(&mut channel).await?;
+        channel.request_shell(true).await?;
+        wait_success(&mut channel).await?;
+        anyhow::Ok(channel)
+    };
+    let mut channel = match opening.await {
+        Ok(channel) => channel,
+        Err(error) => {
+            let _ = reply.try_send(Err(format!("{error:#}")));
+            return;
+        }
+    };
+    let (commands, receiver) = async_channel::bounded(128);
+    let (events, session_events) = async_channel::bounded(128);
+    if reply
+        .try_send(Ok(SshSession::from_channels(commands, session_events)))
+        .is_err()
+    {
+        let _ = channel.close().await;
+        return;
+    }
+    if events.send(SshEvent::Connected).await.is_err() {
+        let _ = channel.close().await;
+        return;
+    }
+    let mut status = None;
+    let mut executions = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+         _=executions.join_next(),if !executions.is_empty()=>{},
+         message=channel.wait()=>match message {
+          Some(ChannelMsg::Data{data})|Some(ChannelMsg::ExtendedData{data,..})=>{if events.send(SshEvent::Data(data.to_vec())).await.is_err(){break;}},
+          Some(ChannelMsg::ExitStatus{exit_status})=>status=Some(exit_status),
+          Some(ChannelMsg::Close)|None=>break,
+          _=>{}
+         },
+         command=receiver.recv()=>match command {
+          Ok(SshCommand::Write(data))=>if channel.data(data.as_slice()).await.is_err(){break;},
+          Ok(SshCommand::Resize(size))=>if channel.window_change(size.columns().into(),size.rows().into(),0,0).await.is_err(){break;},
+          Ok(SshCommand::OpenSftp{reply})=>{
+            if executions.len() >= 4 {
+                let _=reply.try_send(Err("Too many remote operations are running".into()));
+            } else {
+                let connection=connection.clone();
+                executions.spawn(async move {
+                    let result=connection.open_sftp_requested(&reply).await.map_err(|error|format!("{error:#}"));
+                    let _=reply.try_send(result);
+                });
+            }
+          },
+          Ok(SshCommand::Exec{request,reply})=>{
+            if executions.len() >= 4 {
+                let _=reply.try_send(Err("Too many remote operations are running".into()));
+            } else {
+                let connection=connection.clone();
+                executions.spawn(async move {
+                    let result=connection.exec_bounded(request).await.map_err(|error|format!("{error:#}"));
+                    let _=reply.try_send(result);
+                });
+            }
+          },
+          // Nested panes are opened through the connection owner, never from a child shell.
+          Ok(SshCommand::OpenShell{reply,..})=>{let _=reply.try_send(Err("Open panes from the connection's primary terminal".into()));},
+          Ok(SshCommand::Disconnect)|Err(_)=>{let _=channel.close().await;break;},
+          _=>{}
+         }
+        }
+    }
+    executions.abort_all();
+    let _ = events.try_send(SshEvent::Closed {
+        exit_status: status,
+    });
 }
 
 /// Only a lost persistent session reconnects. Authentication and trust failures stop
@@ -869,6 +982,7 @@ pub(crate) async fn run(
                   Ok(SshCommand::Resize(new_size))=>size=new_size,
                   Ok(SshCommand::OpenSftp{reply})=>{let _=reply.send(Err("SSH connection is recovering".into())).await;},
                   Ok(SshCommand::Exec{reply,..})=>{let _=reply.try_send(Err("SSH connection is recovering".into()));},
+                  Ok(SshCommand::OpenShell{reply,..})=>{let _=reply.try_send(Err("SSH connection is recovering".into()));},
                   _=>{} // Never replay keys or stale authentication replies.
                  }
                 }
