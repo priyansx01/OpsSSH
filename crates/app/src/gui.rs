@@ -1,6 +1,7 @@
 use crate::connection_form::{ConnectionForm, FormEvent};
 use crate::files::{FilePane, FilePaneEvent};
 mod branding;
+mod panes;
 mod session_tabs;
 mod terminal_uploads;
 mod views;
@@ -18,8 +19,9 @@ use gpui_component::{
 };
 use opsssh_store::{Profile, Store};
 use opsssh_term_view::{TerminalView, TerminalViewEvent};
+use panes::{Axis, PaneId, PaneLayout};
 use session_tabs::{SessionId, SessionTabs};
-use std::{path::PathBuf, time::Instant};
+use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc, time::Instant};
 actions!(
     opsssh,
     [OpenLocalTerminal, GoHome, NewServer, CloseTab, Quit]
@@ -45,7 +47,11 @@ struct Tab {
     infrastructure: Option<Entity<InfrastructureView>>,
     ssh_management: Option<Entity<SshManagementView>>,
     name: String,
+    /// The primary pane: it owns the tab's connection and every non-terminal page.
     terminal: Entity<TerminalView>,
+    layout: PaneLayout,
+    extra_panes: Vec<(PaneId, Entity<TerminalView>)>,
+    active_pane: PaneId,
     color: u32,
     environment: String,
     files: Option<Entity<FilePane>>,
@@ -57,6 +63,47 @@ struct Tab {
     file_generation: u64,
     files_needs_rebind: bool,
 }
+impl Tab {
+    fn pane(&self, pane: PaneId) -> Option<&Entity<TerminalView>> {
+        if pane == PaneId::PRIMARY {
+            return Some(&self.terminal);
+        }
+        self.extra_panes
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, terminal)| terminal)
+    }
+    /// The pane that receives keyboard focus, uploads and inserted paths.
+    fn active_terminal(&self) -> &Entity<TerminalView> {
+        self.pane(self.active_pane).unwrap_or(&self.terminal)
+    }
+    fn pane_of(&self, terminal: &Entity<TerminalView>) -> Option<PaneId> {
+        if &self.terminal == terminal {
+            return Some(PaneId::PRIMARY);
+        }
+        self.extra_panes
+            .iter()
+            .find(|(_, view)| view == terminal)
+            .map(|(id, _)| *id)
+    }
+    fn terminals(&self) -> impl Iterator<Item = &Entity<TerminalView>> {
+        std::iter::once(&self.terminal).chain(self.extra_panes.iter().map(|(_, view)| view))
+    }
+}
+
+/// Painted width and height of each split, keyed by tab and split.
+type SplitSizes = Rc<RefCell<HashMap<(SessionId, u64), (f32, f32)>>>;
+
+/// A divider being dragged: tab, split, axis, pointer start and ratio start.
+#[derive(Clone, Copy, Debug)]
+struct PaneDrag {
+    session: SessionId,
+    split: u64,
+    axis: Axis,
+    start: f32,
+    ratio: f32,
+}
+
 struct Workspace {
     home_focus: FocusHandle,
     capture: Option<opsssh_platform::keyboard_capture::KeyboardCapture>,
@@ -84,6 +131,9 @@ struct Workspace {
     environment_filter: String,
     terminal_focus_released: bool,
     panel_drag: Option<(SessionId, f32, f32)>,
+    pane_drag: Option<PaneDrag>,
+    /// Last painted size of each split, used to convert divider drags to ratios.
+    split_sizes: SplitSizes,
 }
 pub fn run(open_terminal: bool) {
     run_internal(open_terminal, None);
@@ -137,7 +187,7 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
             let (path,mut message)=match opsssh_platform::app_data_dir(){Ok(dir)=>(dir.join("servers.toml"),String::new()),Err(error)=>(PathBuf::new(),format!("Cannot locate settings folder: {error}"))};
             let mut load_failed=false;
             let store=if path.as_os_str().is_empty(){load_failed=true;Store::default()}else{match Store::load(&path){Ok(store)=>store,Err(error)=>{message=format!("Cannot load servers. Fix the settings file before saving: {error}");load_failed=true;Store::default()}}};
-            let mut workspace=Workspace{home_focus,capture:None,upload_dialog:None,clipboard_attachments:vec![],_terminal_focus:terminal_focus,search,store,path,sessions:vec![],navigation:SessionTabs::default(),transition:0,pending_close:None,quit_dialog:false,uptime_timer:None,editor:None,settings_page:false,help_page:false,message,filter:"All servers".into(),hovered_card:None,launched,first_frame_recorded:false,load_failed,environment_filter:String::new(),terminal_focus_released:false,panel_drag:None};
+            let mut workspace=Workspace{home_focus,capture:None,upload_dialog:None,clipboard_attachments:vec![],_terminal_focus:terminal_focus,search,store,path,sessions:vec![],navigation:SessionTabs::default(),transition:0,pending_close:None,quit_dialog:false,uptime_timer:None,editor:None,settings_page:false,help_page:false,message,filter:"All servers".into(),hovered_card:None,launched,first_frame_recorded:false,load_failed,environment_filter:String::new(),terminal_focus_released:false,panel_drag:None,pane_drag:None,split_sizes:Rc::default()};
             crate::design::apply(&workspace.store.settings.theme,window,cx);
             crate::design::set_reduced_motion(workspace.store.settings.reduced_motion,cx);
             crate::design::observe_system(window).detach();
@@ -184,6 +234,11 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
                     if screen.contains("infra") {tab.page=SessionPage::Infrastructure;tab.infrastructure=Some(cx.new(|cx|InfrastructureView::preview(window,cx)));}
                     if screen.contains("background") {workspace.navigation.hide(tab.id);}
                     if screen.contains("close") {let id=tab.id;let this=cx.entity().downgrade();window.on_next_frame(move|window,cx|{let _=this.update(cx,|this,cx|this.request_close(id,window,cx));});}
+                }
+                if screen.contains("split") {
+                    if workspace.sessions.is_empty(){workspace.open_local(&OpenLocalTerminal,window,cx);}
+                    let id=workspace.sessions.last().unwrap().id;let this=cx.entity().downgrade();
+                    window.on_next_frame(move|window,cx|{let _=this.update(cx,|this,cx|{this.split_pane(id,Axis::Horizontal,window,cx);this.split_pane(id,Axis::Vertical,window,cx);});});
                 }
                 if screen.contains("upload-destination") {
                     let id=workspace.sessions.last().unwrap().id;let this=cx.entity().downgrade();
@@ -242,11 +297,12 @@ impl Workspace {
                                     && this.terminal_visible()
                                     && !window.has_active_dialog(cx)
                                     && this.sessions[index]
-                                        .terminal
+                                        .active_terminal()
                                         .read(cx)
                                         .accepts_terminal_keys(window)
                                 {
-                                    this.sessions[index].terminal.update(cx, |terminal, cx| {
+                                    let terminal = this.sessions[index].active_terminal().clone();
+                                    terminal.update(cx, |terminal, cx| {
                                         terminal.captured_key(event, cx)
                                     });
                                 }
@@ -280,7 +336,7 @@ impl Workspace {
                 .and_then(|id| self.session_index(id))
                 .and_then(|index| {
                     let tab = &self.sessions[index];
-                    let terminal = tab.terminal.read(cx);
+                    let terminal = tab.active_terminal().read(cx);
                     (tab.keyboard_capture
                         && tab.endpoint.is_some()
                         && terminal.accepts_terminal_keys(window))
@@ -331,7 +387,7 @@ impl Workspace {
         }
         if let Some(index) = self.navigation.active.and_then(|id| self.session_index(id)) {
             self.sessions[index]
-                .terminal
+                .active_terminal()
                 .update(cx, |terminal, cx| terminal.focus(window, cx));
         }
     }
@@ -355,23 +411,23 @@ impl Workspace {
         let tab = self.sessions.iter().find(|tab| {
             tab.files.as_ref() == Some(pane) && self.navigation.active == Some(tab.id)
         })?;
-        let terminal = tab.terminal.read(cx);
+        // Files belong to the primary connection; the path goes to the pane in use.
+        let target = tab.active_terminal();
         if tab.files_needs_rebind
-            || terminal.connection_generation() != tab.file_generation
-            || !terminal.accepts_terminal_input()
+            || tab.terminal.read(cx).connection_generation() != tab.file_generation
+            || !target.read(cx).accepts_terminal_input()
         {
             return None;
         }
         if !tab.files_visible
             && (window.focused(cx).is_none() || self.home_focus.is_focused(window))
         {
-            tab.terminal
-                .update(cx, |terminal, cx| terminal.focus(window, cx));
+            target.update(cx, |terminal, cx| terminal.focus(window, cx));
         }
-        tab.terminal
+        target
             .read(cx)
             .accepts_terminal_keys(window)
-            .then(|| tab.terminal.clone())
+            .then(|| target.clone())
     }
 
     fn deliver_uploaded_path(
@@ -455,6 +511,9 @@ impl Workspace {
                 terminal.set_font_size(self.store.settings.font_size as f32, cx);
                 terminal
             }),
+            layout: PaneLayout::default(),
+            extra_panes: vec![],
+            active_pane: PaneId::PRIMARY,
             color: 0x8abdaf,
             environment: tr("local-session"),
             files: None,
@@ -467,8 +526,19 @@ impl Workspace {
             files_needs_rebind: false,
         });
         let terminal = self.sessions.last().unwrap().terminal.clone();
+        Self::subscribe_uploads(&terminal, window, cx);
+        self.transition = self.transition.wrapping_add(1);
+        self.sync_visibility(cx);
+        self.editor = None;
+        cx.notify();
+    }
+    fn subscribe_uploads(
+        terminal: &Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         cx.subscribe_in(
-            &terminal,
+            terminal,
             window,
             |this, terminal, event, window, cx| match event {
                 TerminalViewEvent::UploadFiles(paths) => {
@@ -480,10 +550,101 @@ impl Workspace {
             },
         )
         .detach();
-        self.transition = self.transition.wrapping_add(1);
-        self.sync_visibility(cx);
-        self.editor = None;
+    }
+    /// Open another shell beside the active pane: a local shell for local tabs, or a
+    /// channel on the tab's existing SSH connection so no new sign-in is needed.
+    fn split_pane(
+        &mut self,
+        id: SessionId,
+        axis: Axis,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.session_index(id) else {
+            return;
+        };
+        let tab = &self.sessions[index];
+        // Channels are always opened through the connection owner.
+        let source = if tab.endpoint.is_some() {
+            tab.terminal.clone()
+        } else {
+            tab.active_terminal().clone()
+        };
+        let Some(peer) = source.update(cx, |source, cx| source.split_peer(window, cx)) else {
+            self.message = tr("split-needs-connection");
+            cx.notify();
+            return;
+        };
+        let terminal = cx.new(|_| peer);
+        let tab = &mut self.sessions[index];
+        let Some(pane) = tab.layout.split(tab.active_pane, axis) else {
+            return;
+        };
+        tab.extra_panes.push((pane, terminal.clone()));
+        tab.active_pane = pane;
+        Self::subscribe_uploads(&terminal, window, cx);
+        cx.observe(&terminal, |_, _, cx| cx.notify()).detach();
+        self.terminal_focus_released = false;
+        terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+        self.update_keyboard_capture(window, cx);
         cx.notify();
+    }
+    /// Pointer input or a drop on a pane makes it the one that receives keys and paths.
+    fn activate_pane(
+        &mut self,
+        id: SessionId,
+        pane: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.session_index(id) else {
+            return;
+        };
+        let tab = &mut self.sessions[index];
+        if tab.active_pane != pane && tab.layout.contains(pane) {
+            tab.active_pane = pane;
+            self.terminal_focus_released = false;
+            self.update_keyboard_capture(window, cx);
+            cx.notify();
+        }
+    }
+    fn close_pane(
+        &mut self,
+        id: SessionId,
+        pane: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.session_index(id) else {
+            return;
+        };
+        let tab = &mut self.sessions[index];
+        let Some(next) = tab.layout.remove(pane) else {
+            return;
+        };
+        let Some(position) = tab.extra_panes.iter().position(|(p, _)| *p == pane) else {
+            return;
+        };
+        let (_, terminal) = tab.extra_panes.remove(position);
+        if tab.active_pane == pane || !tab.layout.contains(tab.active_pane) {
+            tab.active_pane = next;
+        }
+        self.split_sizes
+            .borrow_mut()
+            .retain(|(session, _), _| *session != id);
+        if self.pane_drag.is_some_and(|drag| drag.session == id) {
+            self.pane_drag = None;
+        }
+        terminal.update(cx, |terminal, cx| terminal.disconnect(cx));
+        self.terminal_focus_released = false;
+        self.restore_terminal_focus(window, cx);
+        self.update_keyboard_capture(window, cx);
+        cx.notify();
+    }
+    fn finish_pane_drag(&mut self, cx: &mut Context<Self>) {
+        if self.pane_drag.take().is_some() {
+            cx.notify();
+        }
     }
     fn home(&mut self, _: &GoHome, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_page = false;
@@ -567,7 +728,7 @@ impl Workspace {
         self.sync_visibility(cx);
         if self.sessions[index].page == SessionPage::Terminal {
             self.sessions[index]
-                .terminal
+                .active_terminal()
                 .update(cx, |t, cx| t.focus(window, cx));
         } else {
             self.home_focus.focus(window, cx);
@@ -639,6 +800,9 @@ impl Workspace {
             let session = self.sessions.remove(index);
             if let Some(files) = session.files {
                 files.update(cx, |files, cx| files.cancel_transfers(cx));
+            }
+            for (_, pane) in &session.extra_panes {
+                pane.update(cx, |terminal, cx| terminal.disconnect(cx));
             }
             session
                 .terminal
@@ -824,7 +988,10 @@ impl Workspace {
                                                             f.cancel_transfers(cx)
                                                         });
                                                     }
-                                                    s.terminal.update(cx, |t, cx| t.disconnect(cx));
+                                                    for terminal in s.terminals() {
+                                                        terminal
+                                                            .update(cx, |t, cx| t.disconnect(cx));
+                                                    }
                                                 }
                                                 cx.quit();
                                             });
@@ -986,19 +1153,7 @@ impl Workspace {
                 self.help_page = false;
                 let profile_id = profile.id;
                 let mut recorded = false;
-                cx.subscribe_in(
-                    &terminal,
-                    window,
-                    |this, terminal, event, window, cx| match event {
-                        TerminalViewEvent::UploadFiles(paths) => {
-                            this.terminal_drop(terminal, paths.clone(), window, cx)
-                        }
-                        TerminalViewEvent::UploadClipboard(item) => {
-                            this.terminal_clipboard(terminal, item.clone(), window, cx);
-                        }
-                    },
-                )
-                .detach();
+                Self::subscribe_uploads(&terminal, window, cx);
                 cx.observe_in(&terminal, window, move |this, terminal, window, cx| {
                     if !recorded
                         && terminal.read(cx).session_state()
@@ -1160,6 +1315,9 @@ impl Workspace {
                         profile.name.clone()
                     },
                     terminal,
+                    layout: PaneLayout::default(),
+                    extra_panes: vec![],
+                    active_pane: PaneId::PRIMARY,
                     color: environment_color(&profile.environment),
                     environment: profile.environment.clone(),
                     files: None,
@@ -1313,9 +1471,13 @@ impl Workspace {
                                         window.close_dialog(cx);
                                         let _ = weak.update(cx, |this, cx| {
                                             if let Some(i) = this.session_index(id) {
-                                                this.sessions[i]
-                                                    .terminal
-                                                    .update(cx, |t, cx| t.disconnect(cx));
+                                                let panes = this.sessions[i]
+                                                    .terminals()
+                                                    .cloned()
+                                                    .collect::<Vec<_>>();
+                                                for terminal in panes {
+                                                    terminal.update(cx, |t, cx| t.disconnect(cx));
+                                                }
                                             }
                                             this.sync_visibility(cx);
                                             cx.notify();
@@ -1343,7 +1505,7 @@ impl Workspace {
         if let Some(id) = self
             .sessions
             .iter()
-            .find(|tab| &tab.terminal == terminal)
+            .find(|tab| tab.pane_of(terminal).is_some())
             .map(|tab| tab.id)
         {
             if let Some(index) = self.session_index(id) {
@@ -1400,6 +1562,10 @@ impl Workspace {
             );
         } else {
             let id = self.sessions[index].id;
+            let terminal = self.sessions[index].active_terminal().clone();
+            if !terminal.read(cx).accepts_terminal_input() {
+                return;
+            }
             self.select_page(id, SessionPage::Terminal, window, cx);
             terminal.update(cx, |view, cx| {
                 view.insert_text(&format!("cd -- {quoted}"), cx);
@@ -1416,11 +1582,12 @@ impl Workspace {
         let index = self
             .sessions
             .iter()
-            .position(|tab| &tab.terminal == terminal)?;
+            .position(|tab| tab.pane_of(terminal).is_some())?;
         if let Some(files) = &self.sessions[index].files {
             return Some(files.clone());
         }
-        let view = terminal.read(cx);
+        let primary = self.sessions[index].terminal.clone();
+        let view = primary.read(cx);
         let (Some(commands), Some(fingerprint)) = (
             view.ssh_commands(),
             view.verified_host_key().map(str::to_owned),
@@ -1889,6 +2056,9 @@ mod tests {
                     ssh_management: None,
                     name: format!("Session {}", id.0),
                     terminal,
+                    layout: PaneLayout::default(),
+                    extra_panes: vec![],
+                    active_pane: PaneId::PRIMARY,
                     color: 0xbc3150,
                     environment: String::new(),
                     files: None,
@@ -1929,6 +2099,8 @@ mod tests {
             environment_filter: String::new(),
             terminal_focus_released: false,
             panel_drag: None,
+            pane_drag: None,
+            split_sizes: Rc::default(),
         }
     }
 
@@ -2032,6 +2204,79 @@ mod tests {
             assert!(this.editor.is_some());
             assert_eq!(this.sessions.len(), 2);
             assert!(this.message.contains("Could not save"));
+        });
+    }
+
+    #[gpui::test]
+    fn remote_split_waits_for_a_connected_primary(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let mut workspace = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| fixture(window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        VisualTestContext::update(cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                let id = this.sessions[0].id;
+                this.split_pane(id, Axis::Horizontal, window, cx);
+                assert!(this.sessions[0].extra_panes.is_empty());
+                assert!(!this.sessions[0].layout.is_split());
+                assert_eq!(this.message, tr("split-needs-connection"));
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn local_splits_nest_route_input_and_close_back_to_the_primary(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let mut workspace = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| fixture(window, cx));
+            workspace = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let workspace = workspace.unwrap();
+        VisualTestContext::update(cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.open_local(&OpenLocalTerminal, window, cx);
+                let index = this.sessions.len() - 1;
+                let id = this.sessions[index].id;
+                this.split_pane(id, Axis::Horizontal, window, cx);
+                let right = this.sessions[index].active_pane;
+                this.split_pane(id, Axis::Vertical, window, cx);
+                let below = this.sessions[index].active_pane;
+                let tab = &this.sessions[index];
+                assert_eq!(tab.layout.leaves(), vec![PaneId::PRIMARY, right, below]);
+                assert_eq!(tab.extra_panes.len(), 2);
+                assert_eq!(tab.terminals().count(), 3);
+                let below_terminal = tab.pane(below).unwrap().clone();
+                assert_eq!(tab.active_terminal(), &below_terminal);
+                assert_eq!(tab.pane_of(&below_terminal), Some(below));
+                assert!(below_terminal.read(cx).focus_handle(cx).is_focused(window));
+
+                this.activate_pane(id, PaneId::PRIMARY, window, cx);
+                assert_eq!(this.sessions[index].active_pane, PaneId::PRIMARY);
+                this.activate_pane(id, PaneId(99), window, cx);
+                assert_eq!(this.sessions[index].active_pane, PaneId::PRIMARY);
+
+                // The primary pane owns the tab and is closed only with it.
+                this.close_pane(id, PaneId::PRIMARY, window, cx);
+                assert_eq!(this.sessions[index].terminals().count(), 3);
+                this.activate_pane(id, right, window, cx);
+                this.close_pane(id, right, window, cx);
+                let tab = &this.sessions[index];
+                assert_eq!(tab.layout.leaves(), vec![PaneId::PRIMARY, below]);
+                assert_eq!(tab.active_pane, below);
+                assert!(tab.pane(right).is_none());
+                this.close_pane(id, below, window, cx);
+                let tab = &this.sessions[index];
+                assert!(!tab.layout.is_split() && tab.extra_panes.is_empty());
+                assert_eq!(tab.active_pane, PaneId::PRIMARY);
+                this.finish_close(id, true, window, cx);
+                assert!(this.session_index(id).is_none());
+            })
         });
     }
 

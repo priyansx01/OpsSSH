@@ -1,7 +1,11 @@
 //! Workspace presentation. SSH/session ownership stays in the parent controller.
+use super::panes::PaneNode;
 use super::*;
 use crate::design;
-use gpui::{Animation, AnimationExt, AnyElement, SpringAnimation, SpringConfig, uniform_list};
+use gpui::{
+    Animation, AnimationExt, AnyElement, SpringAnimation, SpringConfig, canvas, relative,
+    uniform_list,
+};
 use gpui_component::{
     ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, TitleBar,
     menu::{DropdownMenu, PopupMenuItem},
@@ -65,7 +69,9 @@ impl Workspace {
         design::set_reduced_motion(self.store.settings.reduced_motion, cx);
         let font = self.store.settings.font_size as f32;
         for tab in &self.sessions {
-            tab.terminal.update(cx, |t, cx| t.set_font_size(font, cx));
+            for terminal in tab.terminals() {
+                terminal.update(cx, |t, cx| t.set_font_size(font, cx));
+            }
         }
         cx.notify();
     }
@@ -1296,6 +1302,7 @@ impl Workspace {
         let tab = &self.sessions[index];
         let id = tab.id;
         let terminal = tab.terminal.clone();
+        let layout = tab.layout.root.clone();
         let files = tab.files.clone();
         let visible = tab.files_visible;
         let follow = tab.follow;
@@ -1505,6 +1512,28 @@ impl Workspace {
                                 .child(tr("nav-terminal")),
                         )
                         .child(div().flex_1())
+                        .child(
+                            Button::new("split-right")
+                                .ghost()
+                                .icon(IconName::PanelRight)
+                                .tooltip(tr("split-right"))
+                                .accessibility_label(tr("split-right"))
+                                .disabled(tab.endpoint.is_some() && !live)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.split_pane(id, Axis::Horizontal, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("split-down")
+                                .ghost()
+                                .icon(IconName::PanelBottom)
+                                .tooltip(tr("split-down"))
+                                .accessibility_label(tr("split-down"))
+                                .disabled(tab.endpoint.is_some() && !live)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.split_pane(id, Axis::Vertical, window, cx)
+                                })),
+                        )
                         .when(tab.endpoint.is_some(), |d| {
                             d.when(
                                 self.capture.is_some()
@@ -1623,7 +1652,14 @@ impl Workspace {
                         .border_1()
                         .border_color(rgb(p.border))
                         .flex()
-                        .child(div().flex_1().min_w(px(480.)).min_h_0().child(terminal))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(480.))
+                                .min_h_0()
+                                .flex()
+                                .child(self.render_panes(index, &layout, cx)),
+                        )
                         .when_some(files.clone(),|d,files| {
                             let available=f32::from(window.viewport_size().width)-if self.store.settings.sidebar_collapsed || window.viewport_size().width<px(1100.){68.}else{228.}-32.;
                             let dragging=self.panel_drag.is_some();
@@ -1648,6 +1684,170 @@ impl Workspace {
             .child(header)
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
+    }
+    /// Nested terminal splits; a single pane renders exactly as an unsplit terminal.
+    fn render_panes(&self, index: usize, node: &PaneNode, cx: &mut Context<Self>) -> AnyElement {
+        let p = design::palette(cx);
+        let tab = &self.sessions[index];
+        let id = tab.id;
+        match node {
+            PaneNode::Leaf(pane) => {
+                let pane = *pane;
+                let Some(terminal) = tab.pane(pane).cloned() else {
+                    return div().into_any_element();
+                };
+                if !tab.layout.is_split() {
+                    return div().size_full().child(terminal).into_any_element();
+                }
+                let active = tab.active_pane == pane;
+                let position = tab
+                    .layout
+                    .leaves()
+                    .iter()
+                    .position(|leaf| *leaf == pane)
+                    .unwrap_or_default();
+                div()
+                    .size_full()
+                    .min_w_0()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .border_1()
+                    .border_color(if active { rgb(p.ruby) } else { rgb(p.border) })
+                    .capture_any_mouse_down(cx.listener(move |this, _, window, cx| {
+                        this.activate_pane(id, pane, window, cx)
+                    }))
+                    .child(
+                        div()
+                            .h(px(24.))
+                            .flex_shrink_0()
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .bg(rgb(if active { p.ruby_tint } else { p.sidebar }))
+                            .text_xs()
+                            .text_color(rgb(p.muted))
+                            .child(div().flex_1().truncate().child(if pane == PaneId::PRIMARY {
+                                tr("pane-primary")
+                            } else {
+                                format!("{} {}", tr("pane-shell"), position + 1)
+                            }))
+                            .when(pane != PaneId::PRIMARY, |d| {
+                                d.child(
+                                    Button::new(("close-pane", pane.0 as usize))
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Close)
+                                        .tooltip(tr("close-pane"))
+                                        .accessibility_label(tr("close-pane"))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.close_pane(id, pane, window, cx)
+                                        })),
+                                )
+                            }),
+                    )
+                    .child(div().flex_1().min_h_0().child(terminal))
+                    .into_any_element()
+            }
+            PaneNode::Split {
+                id: split,
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                let (split, axis, ratio) = (*split, *axis, *ratio);
+                let horizontal = axis == Axis::Horizontal;
+                let sizes = self.split_sizes.clone();
+                let measure = canvas(
+                    move |bounds, _, _| {
+                        sizes.borrow_mut().insert(
+                            (id, split),
+                            (f32::from(bounds.size.width), f32::from(bounds.size.height)),
+                        );
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full();
+                let part = |child: AnyElement, grow: f32| {
+                    div()
+                        .flex_basis(relative(0.))
+                        .flex_grow(grow)
+                        .min_w_0()
+                        .min_h_0()
+                        .flex()
+                        .child(child)
+                };
+                let divider = Button::new(("pane-divider", split as usize))
+                    .ghost()
+                    .px_0()
+                    .flex_shrink_0()
+                    .map(|b| {
+                        if horizontal {
+                            b.w(px(6.))
+                                .h_full()
+                                .cursor(gpui::CursorStyle::ResizeLeftRight)
+                        } else {
+                            b.h(px(6.)).w_full().cursor(gpui::CursorStyle::ResizeUpDown)
+                        }
+                    })
+                    .tooltip(tr("resize-pane"))
+                    .accessibility_label(tr("resize-pane"))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                            this.pane_drag = Some(PaneDrag {
+                                session: id,
+                                split,
+                                axis,
+                                start: f32::from(if horizontal {
+                                    event.position.x
+                                } else {
+                                    event.position.y
+                                }),
+                                ratio,
+                            });
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_key_down(cx.listener(
+                        move |this, event: &gpui::KeyDownEvent, window, cx| {
+                            let delta = match (event.keystroke.key.as_str(), horizontal) {
+                                ("left", true) | ("up", false) => -0.05,
+                                ("right", true) | ("down", false) => 0.05,
+                                _ => return,
+                            };
+                            if let Some(i) = this.session_index(id) {
+                                let layout = &mut this.sessions[i].layout;
+                                let current = layout.ratio(split).unwrap_or(0.5);
+                                layout.set_ratio(split, current + delta);
+                                cx.notify();
+                            }
+                            window.prevent_default();
+                            cx.stop_propagation();
+                        },
+                    ))
+                    .child(if horizontal {
+                        div().w(px(1.)).h_full().mx_auto().bg(rgb(p.border))
+                    } else {
+                        div().h(px(1.)).w_full().my_auto().bg(rgb(p.border))
+                    });
+                div()
+                    .relative()
+                    .size_full()
+                    .min_w_0()
+                    .min_h_0()
+                    .flex()
+                    .when(!horizontal, |d| d.flex_col())
+                    .child(measure)
+                    .child(part(self.render_panes(index, first, cx), ratio))
+                    .child(divider)
+                    .child(part(self.render_panes(index, second, cx), 1. - ratio))
+                    .into_any_element()
+            }
+        }
     }
     fn background_sessions(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = design::palette(cx);
@@ -1873,15 +2073,41 @@ impl Workspace {
                         .clamp(280., (available - 480.).max(280.));
                         cx.notify();
                     }
+                    if let Some(drag) = this.pane_drag
+                        && let Some(i) = this.session_index(drag.session)
+                        && let Some((width, height)) = this
+                            .split_sizes
+                            .borrow()
+                            .get(&(drag.session, drag.split))
+                            .copied()
+                    {
+                        let (position, extent) = match drag.axis {
+                            Axis::Horizontal => (f32::from(event.position.x), width),
+                            Axis::Vertical => (f32::from(event.position.y), height),
+                        };
+                        if extent > 0. {
+                            this.sessions[i].layout.set_ratio(
+                                drag.split,
+                                drag.ratio + (position - drag.start) / extent,
+                            );
+                            cx.notify();
+                        }
+                    }
                 }),
             )
             .on_mouse_up(
                 gpui::MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.finish_panel_drag(cx)),
+                cx.listener(|this, _, _, cx| {
+                    this.finish_panel_drag(cx);
+                    this.finish_pane_drag(cx);
+                }),
             )
             .on_mouse_up_out(
                 gpui::MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.finish_panel_drag(cx)),
+                cx.listener(|this, _, _, cx| {
+                    this.finish_panel_drag(cx);
+                    this.finish_pane_drag(cx);
+                }),
             )
             .child(
                 TitleBar::new()

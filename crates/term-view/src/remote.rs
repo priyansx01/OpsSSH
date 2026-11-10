@@ -24,6 +24,24 @@ impl RemoteSession {
     fn spawn(options: ConnectionOptions, size: TerminalSize) -> io::Result<Self> {
         let ssh = SshSession::spawn(options, size)
             .map_err(|error| io::Error::other(error.to_string()))?;
+        Self::attach(ssh, size)
+    }
+
+    /// Open another shell channel on a connected session and parse it like any remote shell.
+    fn channel(parent: Sender<SshCommand>, size: TerminalSize) -> io::Result<Self> {
+        let closed = || io::Error::new(io::ErrorKind::NotConnected, "SSH session closed");
+        let (reply, receive) = async_channel::bounded(1);
+        parent
+            .send_blocking(SshCommand::OpenShell { size, reply })
+            .map_err(|_| closed())?;
+        let ssh = receive
+            .recv_blocking()
+            .map_err(|_| closed())?
+            .map_err(io::Error::other)?;
+        Self::attach(ssh, size)
+    }
+
+    fn attach(ssh: SshSession, size: TerminalSize) -> io::Result<Self> {
         let events = ssh.events();
         let commands = ssh.commands();
         let backend = Arc::new(Mutex::new(AlacrittyTerminal::new(size)));
@@ -112,6 +130,9 @@ impl Session {
     }
     pub fn remote(options: ConnectionOptions, size: TerminalSize) -> io::Result<Self> {
         RemoteSession::spawn(options, size).map(Self::Remote)
+    }
+    pub fn channel(parent: Sender<SshCommand>, size: TerminalSize) -> io::Result<Self> {
+        RemoteSession::channel(parent, size).map(Self::Remote)
     }
     pub fn backend(&self) -> &Arc<Mutex<AlacrittyTerminal>> {
         match self {

@@ -82,16 +82,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self
+        let Some((index, pane)) = self
             .sessions
             .iter()
-            .position(|tab| &tab.terminal == terminal)
+            .enumerate()
+            .find_map(|(index, tab)| tab.pane_of(terminal).map(|pane| (index, pane)))
         else {
             return;
         };
         if paths.is_empty() || !terminal.read(cx).session_state().accepts_input() {
             return;
         }
+        // Completed upload paths are inserted into the pane that received the drop.
+        let id = self.sessions[index].id;
+        self.activate_pane(id, pane, window, cx);
         if self.sessions[index].endpoint.is_none() {
             #[cfg(target_os = "windows")]
             let shell = opsssh_drop::Shell::PowerShell;

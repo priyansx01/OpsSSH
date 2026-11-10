@@ -60,11 +60,18 @@ struct ShapedRow {
     backgrounds: Vec<(Range<usize>, Rgb)>,
 }
 
+enum Startup {
+    Local,
+    Remote(Box<ConnectionOptions>),
+    Channel(async_channel::Sender<SshCommand>),
+}
+
 /// GPU-rendered terminal. Background workers own PTY and SSH I/O;
 /// GPUI's display callback coalesces snapshots at the native frame rate.
 pub struct TerminalView {
     focus: FocusHandle,
     connection_options: Option<ConnectionOptions>,
+    channel: bool,
     stopped: bool,
     retry_pending: bool,
     tmux_missing: bool,
@@ -121,7 +128,39 @@ impl TerminalView {
         );
     }
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::start(None, window, cx)
+        Self::start(Startup::Local, window, cx)
+    }
+
+    /// A shell channel on another terminal's connected SSH transport. It shares that
+    /// connection's authentication, ends with it, and never reconnects on its own.
+    pub fn open_channel(
+        parent: async_channel::Sender<SshCommand>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::start(Startup::Channel(parent), window, cx);
+        view.channel = true;
+        view.title = "Remote terminal".into();
+        view
+    }
+
+    /// Another terminal beside this one: a local shell, or a channel on this connection.
+    pub fn split_peer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Self> {
+        let mut peer = if self.connection_options.is_none() && !self.channel {
+            Self::new(window, cx)
+        } else {
+            if self.state() != SessionState::Connected {
+                return None;
+            }
+            Self::open_channel(self.ssh_commands()?, window, cx)
+        };
+        peer.set_font_size(self.font_size, cx);
+        Some(peer)
+    }
+
+    /// True for a shell opened on another terminal's SSH connection.
+    pub fn is_channel(&self) -> bool {
+        self.channel
     }
 
     /// Development fixture with a real local PTY, without asynchronous startup races.
@@ -169,7 +208,7 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::start(Some(options), window, cx)
+        Self::start(Startup::Remote(Box::new(options)), window, cx)
     }
 
     pub fn ssh_commands(&self) -> Option<async_channel::Sender<SshCommand>> {
@@ -220,7 +259,7 @@ impl TerminalView {
         let font_size = self.font_size;
         let snapshot = self.snapshot.clone();
         self.disconnect(cx);
-        let mut replacement = Self::start(Some(options), window, cx);
+        let mut replacement = Self::start(Startup::Remote(Box::new(options)), window, cx);
         replacement.connection_generation = generation;
         replacement.snapshot = snapshot;
         replacement.set_font_size(font_size, cx);
@@ -254,7 +293,7 @@ impl TerminalView {
         options.tmux = None;
         let generation = self.connection_generation.wrapping_add(1);
         let font_size = self.font_size;
-        let mut replacement = Self::start(Some(options), window, cx);
+        let mut replacement = Self::start(Startup::Remote(Box::new(options)), window, cx);
         replacement.connection_generation = generation;
         replacement.set_font_size(font_size, cx);
         *self = replacement;
@@ -427,11 +466,7 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn start(
-        remote: Option<ConnectionOptions>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    fn start(startup: Startup, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         let subscriptions = vec![
             cx.on_focus(&focus, window, |this, window, cx| {
@@ -445,11 +480,15 @@ impl TerminalView {
         focus.focus(window, cx);
         let options = LocalShellOptions::default();
         let dimensions = options.size;
-        let connection_options = remote.clone();
+        let connection_options = match &startup {
+            Startup::Remote(remote) => Some(remote.as_ref().clone()),
+            Startup::Local | Startup::Channel(_) => None,
+        };
         let startup = cx.background_executor().spawn(async move {
-            match remote {
-                Some(remote) => Session::remote(remote, dimensions),
-                None => Session::local(options),
+            match startup {
+                Startup::Remote(remote) => Session::remote(*remote, dimensions),
+                Startup::Channel(parent) => Session::channel(parent, dimensions),
+                Startup::Local => Session::local(options),
             }
         });
         let notice_task = cx.spawn_in(window, async move |this, cx| {
@@ -487,6 +526,7 @@ impl TerminalView {
         Self {
             focus,
             connection_options,
+            channel: false,
             stopped: false,
             retry_pending: false,
             tmux_missing: false,

@@ -25,6 +25,11 @@ switch preserves the name in the open form for convenience, but saves a profile
 without tmux protection. SSH keepalive remains configurable under **Advanced →
 Session**; keepalive detects connectivity problems and does not preserve work.
 
+Split panes share the tab's SSH connection. Only the main shell is protected by
+tmux and reconnects; additional panes are ordinary shells on that connection.
+They end when the connection drops or the tab disconnects, and are not reopened
+automatically. Close them and split again after reconnecting.
+
 File transfers are separate from the tmux terminal. Tmux protection does not
 resume an interrupted upload or download.
 
