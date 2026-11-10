@@ -16,14 +16,14 @@ opsssh-term-core.workspace = true
 portable-pty.workspace = true
 directories = "=6.0.0"
 russh = { version = "=0.64.1", default-features = false, features = ["ring"] }
-tokio = { version = "=1.53.2", features = ["net"] }
+tokio = { version = "=1.53.2", features = ["net", "rt", "io-util", "time"] }
 gpui = { workspace = true, optional = true }
 gpui-platform = { workspace = true, optional = true }
 raw-window-handle = { version = "=0.6.2", optional = true }
 async-channel = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Threading", "Win32_System_LibraryLoader"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_RemoteDesktop"] }
 # Same version GPUI already uses; only the shell drag APIs are added.
 windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_SystemServices", "Win32_System_Variant", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
 windows-core = "=0.62.2"

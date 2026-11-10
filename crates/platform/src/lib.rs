@@ -10,6 +10,8 @@ pub use pty::{NativeTerminal, NativeTerminalFactory, TerminalKiller};
 pub mod file_drag;
 #[cfg(feature = "gui")]
 pub mod keyboard_capture;
+#[cfg(feature = "gui")]
+pub mod single_instance;
 
 #[cfg(feature = "gui")]
 pub fn application() -> gpui::Application {
