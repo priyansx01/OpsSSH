@@ -14,11 +14,11 @@ anyhow = "=1.0.104"
 base64 = "=0.22.1"
 hmac = "=0.12.1"
 sha1 = "=0.10.6"
-opsssh-platform = { path = "../platform", version = "=0.1.0" }
-opsssh-term-core = { path = "../term-core", version = "=0.1.0" }
-opsssh-vault = { path = "../vault", version = "=0.1.0" }
+opsssh-platform = { path = "../platform", version = "=0.1.1" }
+opsssh-term-core = { path = "../term-core", version = "=0.1.1" }
+opsssh-vault = { path = "../vault", version = "=0.1.1" }
 [dev-dependencies]
-opsssh-sftp = { path = "../sftp", version = "=0.1.0" }
+opsssh-sftp = { path = "../sftp", version = "=0.1.1" }
 rand = "=0.10.3"
 tempfile = "=3.27.0"
 [lints]

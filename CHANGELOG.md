@@ -3,6 +3,11 @@
 All notable changes to OpsSSH are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## 0.1.1 (2026-11-10)
+
+### Fixed
+- Splitting a terminal on an SSH connection no longer disconnects the whole connection, and the new pane connects instead of staying on "Connecting".
+
 ## 0.1.0 (2026-11-10)
 
 First public release.

@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$Target, [string]$Version = '0.1.0')
+param([Parameter(Mandatory=$true)][string]$Target, [string]$Version = '0.1.1')
 $ErrorActionPreference = 'Stop'
 if ($Target -notmatch '^[a-z0-9_-]+$' -or $Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$') { throw 'Invalid package target or version' }
 $repo = Split-Path -Parent $PSScriptRoot

@@ -5354,7 +5354,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "opsssh"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-channel",
  "embed-resource",
@@ -5380,14 +5380,14 @@ dependencies = [
 
 [[package]]
 name = "opsssh-drop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "image",
 ]
 
 [[package]]
 name = "opsssh-i18n"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fluent-bundle",
  "unic-langid",
@@ -5395,7 +5395,7 @@ dependencies = [
 
 [[package]]
 name = "opsssh-net-watch"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5403,7 +5403,7 @@ dependencies = [
 
 [[package]]
 name = "opsssh-platform"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-channel",
  "directories",
@@ -5421,7 +5421,7 @@ dependencies = [
 
 [[package]]
 name = "opsssh-sftp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "opsssh-drop",
  "russh-sftp",
@@ -5432,7 +5432,7 @@ dependencies = [
 
 [[package]]
 name = "opsssh-ssh-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glob",
  "opsssh-store",
@@ -5442,7 +5442,7 @@ dependencies = [
 
 [[package]]
 name = "opsssh-ssh-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -5462,7 +5462,7 @@ dependencies = [
 
 [[package]]
 name = "opsssh-ssh-management"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "opsssh-ssh-core",
@@ -5473,7 +5473,7 @@ dependencies = [
 
 [[package]]
 name = "opsssh-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "tempfile",
@@ -5482,7 +5482,7 @@ dependencies = [
 
 [[package]]
 name = "opsssh-term-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alacritty_terminal",
  "memchr",
@@ -5492,7 +5492,7 @@ dependencies = [
 
 [[package]]
 name = "opsssh-term-view"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-channel",
  "gpui-component",
@@ -5505,7 +5505,7 @@ dependencies = [
 
 [[package]]
 name = "opsssh-vault"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "keyring",
  "zeroize",
