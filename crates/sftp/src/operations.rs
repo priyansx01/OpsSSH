@@ -223,7 +223,7 @@ impl SftpClient {
         *cached = Some(order);
         Ok(order)
     }
-    async fn copy_symlink(
+    pub(crate) async fn copy_symlink(
         &self,
         target: &str,
         destination: &str,
@@ -271,7 +271,7 @@ impl SftpClient {
             .await?;
         Ok(opsssh_drop::join_remote(&parent, leaf)?)
     }
-    async fn tree(
+    pub(crate) async fn tree(
         &self,
         root: &str,
         recursive: bool,
@@ -291,7 +291,20 @@ impl SftpClient {
         }
         Ok(found)
     }
-    async fn same_type(&self, path: &str, expected: &RemoteAttributes) -> Result<RemoteAttributes> {
+    /// Total bytes of the regular files in a tree, without following symbolic links.
+    pub async fn tree_size(&self, path: &str, control: &TransferControl) -> Result<u64> {
+        Ok(self
+            .tree(path, true, control)
+            .await?
+            .iter()
+            .filter_map(|(_, a)| a.size.filter(|_| a.is_regular))
+            .sum())
+    }
+    pub(crate) async fn same_type(
+        &self,
+        path: &str,
+        expected: &RemoteAttributes,
+    ) -> Result<RemoteAttributes> {
         let fresh = self.attributes(path).await?;
         if fresh.is_directory != expected.is_directory
             || fresh.is_symlink != expected.is_symlink
@@ -541,6 +554,38 @@ impl SftpClient {
         F: FnMut(PathBuf) -> Fut,
         Fut: Future<Output = Result<DownloadDecision>>,
     {
+        self.download_tree_with_decisions(source, local, control, |conflict: Conflict| {
+            let pending = confirm(PathBuf::from(conflict.destination));
+            async move {
+                Ok(match pending.await? {
+                    DownloadDecision::Replace => ConflictReply::once(ConflictDecision::Replace),
+                    DownloadDecision::Skip => ConflictReply::once(ConflictDecision::Skip),
+                    DownloadDecision::Cancel => ConflictReply::once(ConflictDecision::Cancel),
+                    DownloadDecision::ReplaceRemaining => ConflictReply {
+                        decision: ConflictDecision::Replace,
+                        apply_to_all: true,
+                    },
+                    DownloadDecision::SkipRemaining => ConflictReply {
+                        decision: ConflictDecision::Skip,
+                        apply_to_all: true,
+                    },
+                })
+            }
+        })
+        .await
+    }
+    /// Download a tree, asking Replace / Keep both / Skip / Cancel for each existing local file.
+    pub async fn download_tree_with_decisions<F, Fut>(
+        &self,
+        source: &str,
+        local: &Path,
+        control: &TransferControl,
+        mut confirm: F,
+    ) -> Result<OperationReport>
+    where
+        F: FnMut(Conflict) -> Fut,
+        Fut: Future<Output = Result<ConflictReply>>,
+    {
         let items = self.tree(source, true, control).await?;
         control.set_total(
             items
@@ -590,26 +635,36 @@ impl SftpClient {
                         Err(e) => return Err(e.into()),
                     }
                 } else {
-                    let expected = local_identity(&destination)?;
+                    let mut expected = local_identity(&destination)?;
                     if expected.is_some() {
                         let decision = match remaining {
                             Some(decision) => decision,
-                            None => confirm(destination.clone()).await?,
+                            None => {
+                                let metadata = std::fs::symlink_metadata(&destination)?;
+                                let reply = confirm(Conflict {
+                                    source: path.clone(),
+                                    destination: destination.to_string_lossy().into_owned(),
+                                    incoming: attrs.clone(),
+                                    existing: crate::transfer::local_attributes(&metadata),
+                                })
+                                .await?;
+                                if reply.apply_to_all {
+                                    remaining = Some(reply.decision);
+                                }
+                                reply.decision
+                            }
                         };
                         match decision {
-                            DownloadDecision::Cancel => {
+                            ConflictDecision::Cancel => {
                                 control.cancel();
                                 control.check()?;
                             }
-                            DownloadDecision::Skip => return Ok(false),
-                            DownloadDecision::SkipRemaining => {
-                                remaining = Some(DownloadDecision::Skip);
-                                return Ok(false);
+                            ConflictDecision::Skip => return Ok(false),
+                            ConflictDecision::KeepBoth => {
+                                destination = free_local_name(&destination)?;
+                                expected = None;
                             }
-                            DownloadDecision::ReplaceRemaining => {
-                                remaining = Some(DownloadDecision::Replace)
-                            }
-                            DownloadDecision::Replace => {}
+                            ConflictDecision::Replace => {}
                         }
                     }
                     control.check()?;
@@ -667,6 +722,23 @@ struct LocalIdentity {
     len: u64,
     modified: Option<std::time::SystemTime>,
     created: Option<std::time::SystemTime>,
+}
+/// First unused numbered sibling of a local file, such as `report (2).txt`.
+fn free_local_name(path: &Path) -> Result<PathBuf> {
+    let parent = path.parent().ok_or("Missing local parent directory")?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("Local filename is not valid Unicode")?;
+    for number in 2..=10_000 {
+        let candidate = parent.join(crate::numbered_name(name, number, false));
+        match std::fs::symlink_metadata(&candidate) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(candidate),
+            Err(e) => return Err(e.into()),
+            Ok(_) => {}
+        }
+    }
+    Err("Too many local files already use this name".into())
 }
 fn local_identity(path: &Path) -> Result<Option<LocalIdentity>> {
     match std::fs::symlink_metadata(path) {

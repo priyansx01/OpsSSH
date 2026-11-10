@@ -346,3 +346,57 @@ async fn repeated_folder_upload_merges_and_confirms_only_colliding_files() {
     assert_eq!(remote.files["/opt/folder/test.txt"].0, b"new");
     assert_eq!(remote.files["/opt/folder/untouched.txt"].0, b"keep");
 }
+
+#[tokio::test]
+async fn upload_decisions_keep_both_skip_and_apply_to_all() {
+    use opsssh_sftp::{ConflictDecision, ConflictKind, ConflictReply};
+    let (client, remote, local) = fixture().await;
+    remote
+        .lock()
+        .unwrap()
+        .files
+        .insert("/opt/folder".into(), (vec![], 0o40755));
+    for name in ["a.txt", "b.txt"] {
+        remote
+            .lock()
+            .unwrap()
+            .files
+            .insert(format!("/opt/folder/{name}"), (b"old".to_vec(), 0o100600));
+    }
+    let folder = local.path().join("folder");
+    tokio::fs::create_dir(&folder).await.unwrap();
+    for name in ["a.txt", "b.txt"] {
+        tokio::fs::write(folder.join(name), b"new").await.unwrap();
+    }
+    let mut asked = 0;
+    client
+        .upload_tree_with_decisions(&folder, "/opt/folder", &TransferControl::default(), |c| {
+            asked += 1;
+            assert_eq!(c.kind(), ConflictKind::Files);
+            assert_eq!(c.incoming.size, Some(3));
+            async {
+                Ok(ConflictReply {
+                    decision: ConflictDecision::KeepBoth,
+                    apply_to_all: true,
+                })
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(asked, 1, "apply to all answers the second file");
+    let files = remote.lock().unwrap().files.clone();
+    for name in ["a", "b"] {
+        assert_eq!(files[&format!("/opt/folder/{name}.txt")].0, b"old");
+        assert_eq!(files[&format!("/opt/folder/{name} (2).txt")].0, b"new");
+    }
+    let mut asked = 0;
+    client
+        .upload_tree_with_decisions(&folder, "/opt/folder", &TransferControl::default(), |_| {
+            asked += 1;
+            async { Ok(ConflictReply::once(ConflictDecision::Skip)) }
+        })
+        .await
+        .unwrap();
+    assert_eq!(asked, 2);
+    assert_eq!(remote.lock().unwrap().files["/opt/folder/a.txt"].0, b"old");
+}

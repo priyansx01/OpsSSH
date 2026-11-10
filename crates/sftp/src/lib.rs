@@ -21,6 +21,13 @@ pub use operations::{
     AtomicRenamer, DownloadDecision, OperationReport, PermissionChange, RemoteAttributes,
     parse_mode, symbolic_mode,
 };
+mod transfer;
+pub use transfer::{
+    Conflict, ConflictDecision, ConflictKind, ConflictReply, MAX_NAME_BYTES, TransferItem,
+    TransferMode, numbered_name,
+};
+const UPLOAD_TYPE_CLASH: &str =
+    "cannot replace a folder, symbolic link, or special file with an upload";
 #[derive(Debug)]
 struct UploadCollision(FileAttributes);
 impl fmt::Display for UploadCollision {
@@ -263,17 +270,44 @@ impl SftpClient {
         local: &Path,
         remote: &str,
         control: &TransferControl,
-        confirm: F,
+        mut confirm: F,
     ) -> Result<u64>
     where
         F: FnMut(String) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        self.upload_tree_inner(local, remote, control, true, |conflict: Conflict| {
+            let replaceable = conflict.kind() == ConflictKind::Files;
+            let pending = replaceable.then(|| confirm(conflict.destination));
+            async move {
+                match pending {
+                    Some(pending) => pending
+                        .await
+                        .map(|()| ConflictReply::once(ConflictDecision::Replace)),
+                    None => Err(UPLOAD_TYPE_CLASH.into()),
+                }
+            }
+        })
+        .await
+    }
+
+    /// Merge folders; ask for every colliding item with Replace / Keep both / Skip / Cancel.
+    pub async fn upload_tree_with_decisions<F, Fut>(
+        &self,
+        local: &Path,
+        remote: &str,
+        control: &TransferControl,
+        confirm: F,
+    ) -> Result<u64>
+    where
+        F: FnMut(Conflict) -> Fut,
+        Fut: Future<Output = Result<ConflictReply>>,
+    {
         self.upload_tree_inner(local, remote, control, true, confirm)
             .await
     }
 
-    async fn existing_metadata(&self, path: &str) -> Result<Option<FileAttributes>> {
+    pub(crate) async fn existing_metadata(&self, path: &str) -> Result<Option<FileAttributes>> {
         match self.session.symlink_metadata(path).await {
             Ok(metadata) => Ok(Some(metadata)),
             Err(SftpError::Status(status)) if status.status_code == StatusCode::NoSuchFile => {
@@ -292,11 +326,12 @@ impl SftpClient {
         mut confirm: F,
     ) -> Result<u64>
     where
-        F: FnMut(String) -> Fut,
-        Fut: Future<Output = Result<()>>,
+        F: FnMut(Conflict) -> Fut,
+        Fut: Future<Output = Result<ConflictReply>>,
     {
         let mut pending = vec![(local.to_path_buf(), remote.to_string())];
         let mut total = 0;
+        let mut remembered: Option<ConflictDecision> = None;
         while let Some((source, destination)) = pending.pop() {
             control.check()?;
             let metadata = tokio::fs::symlink_metadata(&source).await?;
@@ -340,11 +375,44 @@ impl SftpClient {
                         else {
                             return Err(error);
                         };
-                        if !existing.is_regular() || existing.is_symlink() {
-                            return Err("cannot replace a folder, symbolic link, or special file with an upload".into());
-                        }
-                        confirm(destination.clone()).await?;
+                        let conflict = Conflict {
+                            source: source.to_string_lossy().into_owned(),
+                            destination: destination.clone(),
+                            incoming: transfer::local_attributes(&metadata),
+                            existing: RemoteAttributes::from(existing.clone()),
+                        };
+                        let kind = conflict.kind();
+                        let decision = match remembered.filter(|_| kind == ConflictKind::Files) {
+                            Some(decision) => decision,
+                            None => {
+                                let reply = confirm(conflict).await?;
+                                if reply.apply_to_all && kind == ConflictKind::Files {
+                                    remembered = Some(reply.decision);
+                                }
+                                reply.decision
+                            }
+                        };
                         control.check()?;
+                        match decision {
+                            ConflictDecision::Cancel => {
+                                control.cancel();
+                                control.check()?;
+                            }
+                            ConflictDecision::Skip => continue,
+                            ConflictDecision::KeepBoth => {
+                                let name = destination.rsplit('/').next().unwrap_or_default();
+                                let parent = transfer::parent(&destination);
+                                let free = self.free_name(parent, name, false).await?;
+                                total += self
+                                    .upload(&source, &free, WriteMode::CreateNew, control)
+                                    .await?;
+                                continue;
+                            }
+                            ConflictDecision::Replace if kind != ConflictKind::Files => {
+                                return Err(UPLOAD_TYPE_CLASH.into());
+                            }
+                            ConflictDecision::Replace => {}
+                        }
                         let current = self.existing_metadata(&destination).await?.ok_or(
                             "destination changed while waiting for replacement confirmation",
                         )?;

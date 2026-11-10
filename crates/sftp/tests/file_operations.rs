@@ -38,6 +38,8 @@ struct Remote {
     changes: Vec<String>,
     denied: Option<String>,
     cancel_after: Option<TransferControl>,
+    /// Simulates a rename that crosses filesystems for paths under this prefix.
+    rename_fails: Option<String>,
 }
 struct Server {
     remote: Arc<Mutex<Remote>>,
@@ -221,7 +223,11 @@ impl Handler for Server {
         newpath: String,
     ) -> Result<Status, StatusCode> {
         let mut r = self.remote.lock().unwrap();
-        if r.nodes.contains_key(&newpath) {
+        if r.nodes.contains_key(&newpath)
+            || r.rename_fails
+                .as_ref()
+                .is_some_and(|p| oldpath.starts_with(p.as_str()))
+        {
             return Err(StatusCode::Failure);
         }
         if !r.nodes.contains_key(&oldpath) {
@@ -760,4 +766,353 @@ async fn repeated_folder_download_merges_directories_and_applies_replace_remaini
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     assert_eq!(std::fs::read(target.join("b.txt")).unwrap(), b"second");
     assert_eq!(std::fs::read_dir(target.join("sub")).unwrap().count(), 1);
+}
+
+mod batch {
+    use super::*;
+    use opsssh_sftp::{
+        Conflict, ConflictDecision, ConflictKind, ConflictReply, TransferItem, TransferMode,
+    };
+
+    fn add(remote: &Arc<Mutex<Remote>>, nodes: &[(&str, u32, &[u8])]) {
+        let mut r = remote.lock().unwrap();
+        for (path, mode, bytes) in nodes {
+            r.nodes.insert((*path).into(), Node::new(*mode, bytes, 1));
+        }
+    }
+    fn items(paths: &[&str]) -> Vec<TransferItem> {
+        paths
+            .iter()
+            .map(|p| TransferItem::named_as_source(p).unwrap())
+            .collect()
+    }
+    fn bytes(remote: &Arc<Mutex<Remote>>, path: &str) -> Option<Vec<u8>> {
+        remote
+            .lock()
+            .unwrap()
+            .nodes
+            .get(path)
+            .map(|n| n.bytes.clone())
+    }
+    fn no_temporaries(remote: &Arc<Mutex<Remote>>) {
+        let r = remote.lock().unwrap();
+        assert!(
+            !r.nodes.keys().any(|p| p.contains(".opsssh-")),
+            "temporary file leaked: {:?}",
+            r.nodes.keys().collect::<Vec<_>>()
+        );
+    }
+    async fn never(_: Conflict) -> opsssh_sftp::Result<ConflictReply> {
+        panic!("no conflict expected")
+    }
+
+    #[tokio::test]
+    async fn moves_rename_and_copies_into_the_same_folder_keep_both_without_asking() {
+        let (client, remote) = fixture().await;
+        add(&remote, &[("/dest", 0o40755, b"")]);
+        let control = TransferControl::default();
+        let report = client
+            .transfer_items(
+                &items(&["/outside"]),
+                "/dest",
+                TransferMode::Move,
+                None,
+                &control,
+                never,
+            )
+            .await
+            .unwrap();
+        assert_eq!((report.changed, report.failures.len()), (1, 0), "{report}");
+        assert_eq!(bytes(&remote, "/dest/outside").unwrap(), b"keep me");
+        assert!(bytes(&remote, "/outside").is_none());
+
+        let report = client
+            .transfer_items(
+                &items(&["/dest/outside"]),
+                "/dest",
+                TransferMode::Copy,
+                None,
+                &control,
+                never,
+            )
+            .await
+            .unwrap();
+        assert!(report.failures.is_empty(), "{report}");
+        assert_eq!(bytes(&remote, "/dest/outside (2)").unwrap(), b"keep me");
+
+        let report = client
+            .transfer_items(
+                &items(&["/dest/outside"]),
+                "/dest",
+                TransferMode::Move,
+                None,
+                &control,
+                never,
+            )
+            .await
+            .unwrap();
+        assert_eq!((report.changed, report.skipped), (0, 1));
+        assert_eq!(bytes(&remote, "/dest/outside").unwrap(), b"keep me");
+        no_temporaries(&remote);
+    }
+
+    #[tokio::test]
+    async fn file_conflicts_follow_skip_keep_both_and_replace() {
+        let (client, remote) = fixture().await;
+        add(
+            &remote,
+            &[("/dest", 0o40755, b""), ("/dest/outside", 0o100644, b"old")],
+        );
+        let control = TransferControl::default();
+        for (decision, path, expected) in [
+            (ConflictDecision::Skip, "/dest/outside", &b"old"[..]),
+            (
+                ConflictDecision::KeepBoth,
+                "/dest/outside (2)",
+                &b"keep me"[..],
+            ),
+            (ConflictDecision::Replace, "/dest/outside", &b"keep me"[..]),
+        ] {
+            let mut asked = 0;
+            let report = client
+                .transfer_items(
+                    &items(&["/outside"]),
+                    "/dest",
+                    TransferMode::Copy,
+                    None,
+                    &control,
+                    |c| {
+                        asked += 1;
+                        assert_eq!(c.kind(), ConflictKind::Files);
+                        assert_eq!(c.destination, "/dest/outside");
+                        async move { Ok(ConflictReply::once(decision)) }
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(asked, 1);
+            assert!(report.failures.is_empty(), "{decision:?}: {report}");
+            assert_eq!(bytes(&remote, path).unwrap(), expected, "{decision:?}");
+        }
+        assert_eq!(bytes(&remote, "/outside").unwrap(), b"keep me");
+        no_temporaries(&remote);
+
+        // A move replaces atomically when the server offers posix-rename.
+        add(&remote, &[("/dest/outside", 0o100644, b"old")]);
+        let renamer = atomic_fixture(remote.clone(), true).await.unwrap();
+        let report = client
+            .transfer_items(
+                &items(&["/outside"]),
+                "/dest",
+                TransferMode::Move,
+                Some(&renamer),
+                &control,
+                |_| async { Ok(ConflictReply::once(ConflictDecision::Replace)) },
+            )
+            .await
+            .unwrap();
+        assert!(report.failures.is_empty(), "{report}");
+        assert_eq!(bytes(&remote, "/dest/outside").unwrap(), b"keep me");
+        assert!(bytes(&remote, "/outside").is_none());
+        no_temporaries(&remote);
+
+        // Without posix-rename, the original is set aside, then removed after the swap.
+        add(
+            &remote,
+            &[
+                ("/third", 0o100644, b"third"),
+                ("/dest/third", 0o100644, b"old third"),
+            ],
+        );
+        let report = client
+            .transfer_items(
+                &items(&["/third"]),
+                "/dest",
+                TransferMode::Move,
+                None,
+                &control,
+                |_| async { Ok(ConflictReply::once(ConflictDecision::Replace)) },
+            )
+            .await
+            .unwrap();
+        assert!(report.failures.is_empty(), "{report}");
+        assert_eq!(bytes(&remote, "/dest/third").unwrap(), b"third");
+        assert!(bytes(&remote, "/third").is_none());
+        no_temporaries(&remote);
+    }
+
+    #[tokio::test]
+    async fn folders_merge_with_nested_questions_and_apply_to_all() {
+        let (client, remote) = fixture().await;
+        add(
+            &remote,
+            &[
+                ("/src", 0o40755, b""),
+                ("/src/x.txt", 0o100644, b"new x"),
+                ("/src/y.txt", 0o100644, b"new y"),
+                ("/src/sub", 0o40755, b""),
+                ("/src/sub/z.txt", 0o100644, b"new z"),
+                ("/dest", 0o40755, b""),
+                ("/dest/src", 0o40755, b""),
+                ("/dest/src/x.txt", 0o100644, b"old x"),
+                ("/dest/src/y.txt", 0o100644, b"old y"),
+                ("/dest/src/sub", 0o40755, b""),
+            ],
+        );
+        let mut asked = vec![];
+        let report = client
+            .transfer_items(
+                &items(&["/src"]),
+                "/dest",
+                TransferMode::Move,
+                None,
+                &TransferControl::default(),
+                |c| {
+                    asked.push(c.destination.clone());
+                    let reply = ConflictReply {
+                        decision: ConflictDecision::Replace,
+                        apply_to_all: c.kind() == ConflictKind::Files,
+                    };
+                    async move { Ok(reply) }
+                },
+            )
+            .await
+            .unwrap();
+        assert!(report.failures.is_empty(), "{report}");
+        // Folders were asked each time; the file decision applied to the second file.
+        assert_eq!(asked, vec!["/dest/src", "/dest/src/sub", "/dest/src/x.txt"]);
+        for (path, expected) in [
+            ("/dest/src/x.txt", &b"new x"[..]),
+            ("/dest/src/y.txt", b"new y"),
+            ("/dest/src/sub/z.txt", b"new z"),
+        ] {
+            assert_eq!(bytes(&remote, path).unwrap(), expected, "{path}");
+        }
+        let r = remote.lock().unwrap();
+        assert!(
+            !r.nodes
+                .keys()
+                .any(|p| p == "/src" || p.starts_with("/src/"))
+        );
+    }
+
+    #[tokio::test]
+    async fn type_clashes_self_nesting_and_cancel_keep_existing_data() {
+        let (client, remote) = fixture().await;
+        add(
+            &remote,
+            &[
+                ("/dest", 0o40755, b""),
+                ("/dest/outside", 0o40755, b""),
+                ("/second", 0o100644, b"second"),
+                ("/dest/second", 0o100644, b"old second"),
+            ],
+        );
+        let control = TransferControl::default();
+        let report = client
+            .transfer_items(
+                &items(&["/tree"]),
+                "/tree/sub",
+                TransferMode::Copy,
+                None,
+                &control,
+                never,
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.failures.len(), 1, "{report}");
+
+        let report = client
+            .transfer_items(
+                &items(&["/outside"]),
+                "/dest",
+                TransferMode::Copy,
+                None,
+                &control,
+                |c| {
+                    assert_eq!(c.kind(), ConflictKind::Mismatch);
+                    async { Ok(ConflictReply::once(ConflictDecision::Replace)) }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.failures.len(), 1, "{report}");
+        assert!(remote.lock().unwrap().nodes["/dest/outside"].mode & 0o40000 != 0);
+
+        let control = TransferControl::default();
+        let report = client
+            .transfer_items(
+                &items(&["/second", "/outside"]),
+                "/dest",
+                TransferMode::Move,
+                None,
+                &control,
+                |_| async { Ok(ConflictReply::once(ConflictDecision::Cancel)) },
+            )
+            .await
+            .unwrap();
+        assert!(report.cancelled);
+        assert_eq!(bytes(&remote, "/outside").unwrap(), b"keep me");
+        assert_eq!(bytes(&remote, "/second").unwrap(), b"second");
+        assert_eq!(bytes(&remote, "/dest/second").unwrap(), b"old second");
+    }
+
+    #[tokio::test]
+    async fn cross_filesystem_moves_copy_then_remove_the_original() {
+        let (client, remote) = fixture().await;
+        add(&remote, &[("/dest", 0o40755, b"")]);
+        remote.lock().unwrap().rename_fails = Some("/tree".into());
+        let report = client
+            .transfer_items(
+                &items(&["/tree"]),
+                "/dest",
+                TransferMode::Move,
+                None,
+                &TransferControl::default(),
+                never,
+            )
+            .await
+            .unwrap();
+        assert!(report.failures.is_empty(), "{report}");
+        assert_eq!(
+            bytes(&remote, "/dest/tree/sub/a b'雪.txt").unwrap(),
+            b"hello world"
+        );
+        assert_eq!(bytes(&remote, "/dest/tree/link").unwrap(), b"/outside");
+        let r = remote.lock().unwrap();
+        assert!(
+            !r.nodes
+                .keys()
+                .any(|p| p == "/tree" || p.starts_with("/tree/"))
+        );
+        assert_eq!(r.nodes["/outside"].bytes, b"keep me");
+    }
+}
+
+#[tokio::test]
+async fn download_keep_both_writes_a_numbered_sibling_and_keeps_the_original() {
+    use opsssh_sftp::{ConflictDecision, ConflictReply};
+    let (client, _) = fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("outside.txt");
+    std::fs::write(&target, b"original").unwrap();
+    std::fs::write(dir.path().join("outside (2).txt"), b"taken").unwrap();
+    let report = client
+        .download_tree_with_decisions("/outside", &target, &TransferControl::default(), |c| {
+            assert_eq!(c.existing.size, Some(8));
+            assert_eq!(c.incoming.size, Some(7));
+            async { Ok(ConflictReply::once(ConflictDecision::KeepBoth)) }
+        })
+        .await
+        .unwrap();
+    assert!(report.failures.is_empty(), "{report}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"original");
+    assert_eq!(
+        std::fs::read(dir.path().join("outside (2).txt")).unwrap(),
+        b"taken"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("outside (3).txt")).unwrap(),
+        b"keep me"
+    );
 }
