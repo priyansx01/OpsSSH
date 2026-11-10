@@ -1641,16 +1641,14 @@ impl FilePane {
             .p_3()
             .child(self.history_controls(cx))
             .child(
-                Button::new("refresh")
-                    .small()
-                    .ghost()
-                    .label(tr("file-refresh"))
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-            )
-            .child(
                 div().flex_1().min_w_0().child(
                     Input::new(&self.path)
                         .small()
+                        .prefix(
+                            Icon::new(gpui_kit_assets::IconName::HardDrive)
+                                .small()
+                                .text_color(cx.theme().muted_foreground),
+                        )
                         .aria_label(tr("file-path-placeholder")),
                 ),
             )
@@ -1821,15 +1819,7 @@ impl FilePane {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(
-                        div().flex().gap_1().child(self.history_controls(cx)).child(
-                            Button::new("refresh")
-                                .small()
-                                .ghost()
-                                .label(tr("file-refresh"))
-                                .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-                        ),
-                    )
+                    .child(self.history_controls(cx))
                     .child(
                         crate::design::PrimaryAction::new("upload")
                             .small()
@@ -1912,27 +1902,40 @@ impl FilePane {
     }
     fn breadcrumb_controls(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let muted = cx.theme().muted_foreground;
-        let mut bar = div().flex().items_center().gap_1();
-        for (index, (label, path)) in breadcrumbs(&self.directory).into_iter().enumerate() {
+        let crumbs = breadcrumbs(&self.directory);
+        let last = crumbs.len().saturating_sub(1);
+        let mut bar = div().flex().items_center().gap_0p5();
+        for (index, (label, path)) in crumbs.into_iter().enumerate() {
+            if index > 0 {
+                bar = bar.child(
+                    Icon::new(IconName::ChevronRight)
+                        .xsmall()
+                        .text_color(muted.opacity(0.7)),
+                );
+            }
             let target = path.clone();
             let crumb = div()
                 .id(("file-breadcrumb-target", index))
                 .rounded_md()
                 .border_1()
                 .border_color(gpui::transparent_black());
-            bar = bar
-                .child(
-                    self.folder_drop_target(crumb, target, cx).child(
-                        Button::new(("file-breadcrumb", index))
-                            .small()
-                            .ghost()
-                            .label(label)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.navigate(path.clone(), Navigation::Visit, cx)
-                            })),
-                    ),
-                )
-                .child(div().text_color(muted).child("/"));
+            let button = Button::new(("file-breadcrumb", index))
+                .small()
+                .ghost()
+                .selected(index == last)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.navigate(path.clone(), Navigation::Visit, cx)
+                }));
+            // The file system root is a drive, as in desktop file managers.
+            let button = if index == 0 {
+                button
+                    .icon(gpui_kit_assets::IconName::HardDrive)
+                    .tooltip(tr("file-place-root"))
+                    .accessibility_label(tr("file-place-root"))
+            } else {
+                button.label(label)
+            };
+            bar = bar.child(self.folder_drop_target(crumb, target, cx).child(button));
         }
         div()
             .id("file-breadcrumbs")
@@ -2467,7 +2470,16 @@ impl FilePane {
             .into_any_element()
     }
     /// Back, Forward and Up; Up also accepts drops into the parent folder.
+    /// Back, Forward, Up and Refresh as one segmented control. Up also accepts drops
+    /// into the parent folder.
     fn history_controls(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme();
+        let (border, surface) = (theme.border, theme.secondary);
+        let alt = if cfg!(target_os = "macos") {
+            "⌥"
+        } else {
+            "Alt+"
+        };
         let up = div()
             .id("file-up-target")
             .rounded_md()
@@ -2477,16 +2489,23 @@ impl FilePane {
             Some(parent) => self.folder_drop_target(up, parent, cx),
             None => up,
         };
+        let divider = || div().w(px(1.)).h(px(16.)).mx_0p5().bg(border);
         div()
             .flex()
+            .flex_shrink_0()
             .items_center()
-            .gap_1()
+            .gap_0p5()
+            .p_0p5()
+            .rounded_lg()
+            .bg(surface)
+            .border_1()
+            .border_color(border)
             .child(
                 Button::new("file-back")
                     .small()
                     .ghost()
                     .icon(IconName::ArrowLeft)
-                    .tooltip(tr("file-back"))
+                    .tooltip(format!("{} ({alt}←)", tr("file-back")))
                     .accessibility_label(tr("file-back"))
                     .disabled(!self.history.can_go_back() || !self.available)
                     .on_click(cx.listener(|this, _, _, cx| this.go_back(cx))),
@@ -2496,20 +2515,33 @@ impl FilePane {
                     .small()
                     .ghost()
                     .icon(IconName::ArrowRight)
-                    .tooltip(tr("file-forward"))
+                    .tooltip(format!("{} ({alt}→)", tr("file-forward")))
                     .accessibility_label(tr("file-forward"))
                     .disabled(!self.history.can_go_forward() || !self.available)
                     .on_click(cx.listener(|this, _, _, cx| this.go_forward(cx))),
             )
+            .child(divider())
             .child(
                 up.child(
                     Button::new("up")
                         .small()
                         .ghost()
-                        .label(tr("file-up"))
+                        .icon(gpui_kit_assets::IconName::ArrowUp)
+                        .tooltip(format!("{} ({alt}↑)", tr("file-up")))
+                        .accessibility_label(tr("file-up"))
                         .disabled(browser::parent_of(&self.directory).is_none())
                         .on_click(cx.listener(|this, _, _, cx| this.go_up(cx))),
                 ),
+            )
+            .child(
+                Button::new("refresh")
+                    .small()
+                    .ghost()
+                    .icon(gpui_kit_assets::IconName::RefreshCw)
+                    .tooltip(format!("{} (F5)", tr("file-refresh")))
+                    .accessibility_label(tr("file-refresh"))
+                    .disabled(!self.available)
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
             .into_any_element()
     }
