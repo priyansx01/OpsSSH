@@ -1525,7 +1525,11 @@ impl Workspace {
                             .text_color(rgb(p.muted))
                             .font_family(cx.theme().mono_font_family.clone())
                             .truncate()
-                            .child(endpoint.unwrap_or_else(|| tr("local-session"))),
+                            .child(
+                                endpoint
+                                    .or_else(|| tab.local_directory.clone())
+                                    .unwrap_or_else(|| tr("local-session")),
+                            ),
                     ),
             )
             .when(remote, |d| {

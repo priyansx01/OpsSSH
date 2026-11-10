@@ -68,7 +68,7 @@ pub struct SplitSource {
 }
 
 enum Startup {
-    Local,
+    Local(Option<PathBuf>),
     Remote(Box<ConnectionOptions>),
     Channel(async_channel::Sender<SshCommand>),
 }
@@ -135,7 +135,12 @@ impl TerminalView {
         );
     }
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::start(Startup::Local, window, cx)
+        Self::new_in(None, window, cx)
+    }
+
+    /// A local shell that starts in `directory`, or in the default folder.
+    pub fn new_in(directory: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::start(Startup::Local(directory), window, cx)
     }
 
     /// A shell channel on another terminal's connected SSH transport. It shares that
@@ -174,7 +179,7 @@ impl TerminalView {
     pub fn open_split(source: SplitSource, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut view = match source.channel {
             Some(parent) => Self::open_channel(parent, window, cx),
-            None => Self::new(window, cx),
+            None => Self::new_in(None, window, cx),
         };
         view.set_font_size(source.font_size, cx);
         view
@@ -500,17 +505,20 @@ impl TerminalView {
             cx.observe_window_activation(window, |this, window, cx| this.refresh_blink(window, cx)),
         ];
         focus.focus(window, cx);
-        let options = LocalShellOptions::default();
+        let mut options = LocalShellOptions::default();
+        if let Startup::Local(directory) = &startup {
+            options.working_directory = directory.clone();
+        }
         let dimensions = options.size;
         let connection_options = match &startup {
             Startup::Remote(remote) => Some(remote.as_ref().clone()),
-            Startup::Local | Startup::Channel(_) => None,
+            Startup::Local(_) | Startup::Channel(_) => None,
         };
         let startup = cx.background_executor().spawn(async move {
             match startup {
                 Startup::Remote(remote) => Session::remote(*remote, dimensions),
                 Startup::Channel(parent) => Session::channel(parent, dimensions),
-                Startup::Local => Session::local(options),
+                Startup::Local(_) => Session::local(options),
             }
         });
         let notice_task = cx.spawn_in(window, async move |this, cx| {

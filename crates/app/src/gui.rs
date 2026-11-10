@@ -17,6 +17,7 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
 };
+use opsssh_platform::single_instance::Request as LaunchRequest;
 use opsssh_store::{Profile, Store};
 use opsssh_term_view::{TerminalView, TerminalViewEvent};
 use panes::{Axis, PaneId, PaneLayout};
@@ -39,6 +40,8 @@ struct Tab {
     endpoint: Option<String>,
     profile_id: Option<u64>,
     upload_directory: Option<String>,
+    /// The folder a local tab was opened in, shown under its name.
+    local_directory: Option<String>,
     keyboard_capture: bool,
     persistent_name: Option<String>,
     protected: bool,
@@ -135,12 +138,18 @@ struct Workspace {
     /// Last painted size of each split, used to convert divider drags to ratios.
     split_sizes: SplitSizes,
 }
-pub fn run(open_terminal: bool) {
-    run_internal(open_terminal, None);
+/// Open the window for `initial`, then keep serving requests from later launches.
+pub fn run(initial: LaunchRequest, requests: async_channel::Receiver<LaunchRequest>) {
+    run_internal(initial, None, Some(requests));
 }
 #[cfg(feature = "capture")]
 pub fn capture(screen: &str, path: PathBuf) {
-    run_internal(screen == "snapshot-local", Some((screen.into(), path)));
+    let initial = if screen == "snapshot-local" {
+        LaunchRequest::Terminal(None)
+    } else {
+        LaunchRequest::Home
+    };
+    run_internal(initial, Some((screen.into(), path)), None);
 }
 fn bind_workspace_keys(cx: &mut App) {
     TerminalView::bind_keys(cx);
@@ -163,7 +172,11 @@ fn bind_workspace_keys(cx: &mut App) {
     ]);
 }
 
-fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
+fn run_internal(
+    initial: LaunchRequest,
+    capture_path: Option<(String, PathBuf)>,
+    requests: Option<async_channel::Receiver<LaunchRequest>>,
+) {
     let launched = Instant::now();
     let enable_native_capture = capture_path.is_none();
     opsssh_platform::application().with_assets(branding::AppAssets).run(move|cx:&mut App|{
@@ -191,7 +204,10 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
             crate::design::apply(&workspace.store.settings.theme,window,cx);
             crate::design::set_reduced_motion(workspace.store.settings.reduced_motion,cx);
             crate::design::observe_system(window).detach();
-            if open_terminal{workspace.open_local(&OpenLocalTerminal,window,cx);}else{workspace.home_focus.focus(window,cx);}
+            match initial.clone() {
+                LaunchRequest::Terminal(folder) => workspace.open_local_at(folder, window, cx),
+                LaunchRequest::Home => workspace.home_focus.focus(window, cx),
+            }
             #[cfg(feature="capture")]
             if let Some((screen,path))=capture_path{
                 // In-memory fixtures only; snapshot processes cannot save user data.
@@ -259,6 +275,23 @@ fn run_internal(open_terminal: bool, capture_path: Option<(String, PathBuf)>) {
             workspace
         });
         if enable_native_capture {workspace.update(cx,|this,cx|this.install_keyboard_capture(window,cx));}
+        // Later launches (for example from the File Explorer menu) arrive here.
+        if let Some(requests) = requests.clone() {
+            let weak = workspace.downgrade();
+            window
+                .spawn(cx, async move |cx| {
+                    while let Ok(request) = requests.recv().await {
+                        let delivered = cx.update(|window, cx| {
+                            weak.update(cx, |this, cx| this.handle_launch(request, window, cx))
+                                .is_ok()
+                        });
+                        if !matches!(delivered, Ok(true)) {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+        }
         let weak=workspace.downgrade();
         window.on_window_should_close(cx,move|window,cx| {weak.update(cx,|this,cx| this.quit(&Quit,window,cx)).is_err()});
         cx.new(|cx|Root::new(workspace,window,cx))
@@ -490,14 +523,45 @@ impl Workspace {
         }
     }
     fn open_local(&mut self, _: &OpenLocalTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_local_at(None, window, cx);
+    }
+    /// A launch request from another OpsSSH process: open it here and come to the front.
+    fn handle_launch(
+        &mut self,
+        request: LaunchRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match request {
+            LaunchRequest::Terminal(folder) => self.open_local_at(folder, window, cx),
+            LaunchRequest::Home => self.home(&GoHome, window, cx),
+        }
+        window.activate_window();
+        cx.activate(true);
+    }
+    /// Open a local terminal, in `folder` when given; the tab is named after the folder.
+    fn open_local_at(
+        &mut self,
+        folder: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.settings_page = false;
         self.help_page = false;
         let id = self.navigation.allocate();
+        let local_directory = folder.as_ref().map(|path| path.display().to_string());
+        let name = folder
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .or_else(|| local_directory.clone())
+            .unwrap_or_else(|| "Local".into());
         self.sessions.push(Tab {
             id,
             endpoint: None,
             profile_id: None,
             upload_directory: None,
+            local_directory: local_directory.clone(),
             keyboard_capture: false,
             persistent_name: None,
             protected: false,
@@ -505,9 +569,9 @@ impl Workspace {
             page: SessionPage::Terminal,
             infrastructure: None,
             ssh_management: None,
-            name: "Local".into(),
+            name,
             terminal: cx.new(|cx| {
-                let mut terminal = TerminalView::new(window, cx);
+                let mut terminal = TerminalView::new_in(folder, window, cx);
                 terminal.set_font_size(self.store.settings.font_size as f32, cx);
                 terminal
             }),
@@ -1300,6 +1364,7 @@ impl Workspace {
                     id,
                     profile_id: (profile.id != 0).then_some(profile.id),
                     upload_directory: profile.terminal_upload_directory.clone(),
+                    local_directory: None,
                     keyboard_capture: true,
                     endpoint: Some(format!(
                         "{}@{}:{}",
@@ -2096,6 +2161,7 @@ mod tests {
                     endpoint: Some("deploy@fixture.invalid:22".into()),
                     profile_id: None,
                     upload_directory: None,
+                    local_directory: None,
                     keyboard_capture: true,
                     persistent_name: None,
                     protected: false,

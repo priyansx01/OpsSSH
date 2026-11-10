@@ -41,12 +41,39 @@ fn main() -> ExitCode {
     }
 }
 
+/// How the desktop window was asked to start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Launch {
+    Home,
+    /// A local terminal, in this folder when one was given and exists.
+    Terminal(Option<std::path::PathBuf>),
+}
+
+/// The folder passed by `opsssh local <folder>`, as an absolute existing directory.
+/// File Explorer passes a drive root as `"C:\"`, which Windows argument rules deliver as
+/// `C:"`; the stray quote is turned back into the separator.
+fn local_directory(raw: &str) -> Option<std::path::PathBuf> {
+    let raw = raw.trim();
+    let text = match raw.strip_suffix('"') {
+        Some(stripped) => format!("{stripped}{}", std::path::MAIN_SEPARATOR),
+        None => raw.to_owned(),
+    };
+    if text.is_empty() {
+        return None;
+    }
+    let path = std::path::absolute(text).ok()?;
+    path.is_dir().then_some(path)
+}
+
 fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     match arguments.as_slice() {
         [] => {
-            launch(false);
+            launch(Launch::Home);
         }
-        [command] if command == "local" => launch(true),
+        [command] if command == "local" => launch(Launch::Terminal(None)),
+        [command, folder] if command == "local" => {
+            launch(Launch::Terminal(local_directory(folder)))
+        }
         #[cfg(feature = "capture")]
         [command, path] if command.starts_with("snapshot") => gui::capture(command, path.into()),
         [command] if command == "--help" || command == "-h" => help(),
@@ -74,7 +101,7 @@ fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 
 fn help() {
     println!(
-        "Usage: opsssh [local | diagnostics | bench [iterations] | bench-parser [MiB] | --help]"
+        "Usage: opsssh [local [FOLDER] | diagnostics | bench [iterations] | bench-parser [MiB] | --help]"
     );
     println!("bench emits JSON for input encoding and frame scheduling, not GPU/VT performance.");
 }
@@ -113,12 +140,23 @@ fn diagnostics() {
     );
 }
 
-fn launch(local: bool) {
+fn launch(launch: Launch) {
     #[cfg(feature = "gui")]
-    gui::run(local);
+    {
+        use opsssh_platform::single_instance::{Instance, Request, hand_off_or_listen};
+        let request = match launch {
+            Launch::Home => Request::Home,
+            Launch::Terminal(folder) => Request::Terminal(folder),
+        };
+        // A running OpsSSH window takes the request; otherwise this process becomes it.
+        match hand_off_or_listen(request.clone()) {
+            Instance::Delivered => {}
+            Instance::Primary(requests) => gui::run(request, requests),
+        }
+    }
     #[cfg(not(feature = "gui"))]
     {
-        let _ = local;
+        let _ = launch;
         eprintln!("GUI disabled; build with the default features to open a window.");
     }
 }
@@ -184,5 +222,39 @@ mod tests {
         assert!(run(vec!["connect".into()]).is_err());
         assert!(run(vec!["bench-parser".into(), "0".into()]).is_err());
         assert!(run(vec!["bench-parser".into(), "1025".into()]).is_err());
+    }
+
+    #[test]
+    fn folders_from_file_explorer_are_normalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let spaced = dir.path().join("my folder 雪");
+        std::fs::create_dir(&spaced).unwrap();
+        assert_eq!(
+            local_directory(spaced.to_str().unwrap()).as_deref(),
+            Some(spaced.as_path())
+        );
+        // Relative folders resolve against the current directory.
+        assert!(local_directory(".").is_some_and(|path| path.is_absolute()));
+        assert_eq!(local_directory(""), None);
+        assert_eq!(
+            local_directory(spaced.join("missing").to_str().unwrap()),
+            None
+        );
+        let file = dir.path().join("note.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(
+            local_directory(file.to_str().unwrap()),
+            None,
+            "files are not folders"
+        );
+        // Explorer's "%V" for a drive root arrives as `C:"`.
+        #[cfg(target_os = "windows")]
+        {
+            let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+            assert_eq!(
+                local_directory(&format!("{drive}\"")),
+                Some(std::path::PathBuf::from(format!("{drive}\\")))
+            );
+        }
     }
 }
