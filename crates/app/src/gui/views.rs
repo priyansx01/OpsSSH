@@ -1311,40 +1311,212 @@ impl Workspace {
         let live = state == opsssh_term_core::SessionState::Connected;
         let endpoint = tab.endpoint.clone();
         let copy = endpoint.clone().unwrap_or_default();
+        let terminal_page = tab.page == SessionPage::Terminal;
+        let remote = tab.endpoint.is_some();
+        let small_chip = |text: String, color: gpui::Hsla| {
+            div()
+                .flex_shrink_0()
+                .px_2()
+                .py_0p5()
+                .rounded_md()
+                .border_1()
+                .border_color(color)
+                .text_xs()
+                .text_color(rgb(p.muted))
+                .child(text)
+        };
+        // Terminal tools share the header row so the terminal gets the height.
+        let tools = terminal_page.then(|| {
+            let divider = || div().w(px(1.)).h(px(16.)).mx_0p5().bg(rgb(p.border));
+            let capture_state = tr(if !tab.keyboard_capture {
+                "keyboard-released"
+            } else if !live {
+                "keyboard-paused"
+            } else {
+                "keyboard-captured"
+            });
+            let show_capture = remote
+                && (self.capture.is_some()
+                    || (cfg!(feature = "capture")
+                        && self.load_failed
+                        && opsssh_platform::info().os == "windows"));
+            div()
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap_0p5()
+                .p_0p5()
+                .rounded_lg()
+                .bg(rgb(p.surface))
+                .border_1()
+                .border_color(rgb(p.border))
+                .child(
+                    Button::new("split-right")
+                        .small()
+                        .ghost()
+                        .icon(IconName::PanelRight)
+                        .tooltip(tr("split-right"))
+                        .accessibility_label(tr("split-right"))
+                        .disabled(remote && !live)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.split_pane(id, Axis::Horizontal, window, cx)
+                        })),
+                )
+                .child(
+                    Button::new("split-down")
+                        .small()
+                        .ghost()
+                        .icon(IconName::PanelBottom)
+                        .tooltip(tr("split-down"))
+                        .accessibility_label(tr("split-down"))
+                        .disabled(remote && !live)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.split_pane(id, Axis::Vertical, window, cx)
+                        })),
+                )
+                .when(remote, |d| {
+                    d.child(divider())
+                        .when(show_capture, |d| {
+                            d.child(
+                                Button::new("keyboard-capture")
+                                    .small()
+                                    .ghost()
+                                    .selected(tab.keyboard_capture)
+                                    .icon(if tab.keyboard_capture {
+                                        gpui_kit_assets::IconName::Keyboard
+                                    } else {
+                                        gpui_kit_assets::IconName::KeyboardOff
+                                    })
+                                    .tooltip(format!(
+                                        "{capture_state} · {}",
+                                        tr("keyboard-capture-help")
+                                    ))
+                                    .accessibility_label(capture_state.clone())
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if let Some(index) = this.session_index(id) {
+                                            this.terminal_focus_released = false;
+                                            this.sessions[index].keyboard_capture =
+                                                !this.sessions[index].keyboard_capture;
+                                            this.sessions[index]
+                                                .terminal
+                                                .update(cx, |terminal, cx| {
+                                                    terminal.focus(window, cx)
+                                                });
+                                        }
+                                        this.update_keyboard_capture(window, cx);
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                        .child(
+                            Button::new("terminal-upload-destination")
+                                .small()
+                                .ghost()
+                                .icon(gpui_kit_assets::IconName::Upload)
+                                .tooltip(format!(
+                                    "{}: {}",
+                                    tr("upload-destination"),
+                                    tab.upload_directory
+                                        .clone()
+                                        .unwrap_or_else(|| tr("upload-destination-help"))
+                                ))
+                                .accessibility_label(tr("upload-destination"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.choose_upload_destination(id, vec![], window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("toggle-files")
+                                .small()
+                                .ghost()
+                                .selected(visible)
+                                .icon(IconName::Folder)
+                                .label(tr("files"))
+                                .tooltip(tr("files"))
+                                .accessibility_label(tr("files"))
+                                .on_click(cx.listener(move |this, _, w, cx| {
+                                    let Some(i) = this.session_index(id) else {
+                                        return;
+                                    };
+                                    if this.sessions[i].files_visible {
+                                        this.close_files(id, w, cx);
+                                    } else {
+                                        let t = this.sessions[i].terminal.clone();
+                                        this.ensure_files(&t, w, cx);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .when(visible, |d| {
+                            d.child(
+                                Button::new("follow-folder")
+                                    .small()
+                                    .ghost()
+                                    .selected(follow)
+                                    .icon(gpui_kit_assets::IconName::FolderSync)
+                                    .tooltip(tr("follow-folder"))
+                                    .accessibility_label(tr("follow-folder"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let Some(i) = this.session_index(id) else {
+                                            return;
+                                        };
+                                        let tab = &mut this.sessions[i];
+                                        tab.follow = !tab.follow;
+                                        if tab.follow
+                                            && let (Some(path), Some(files)) = (
+                                                tab.terminal
+                                                    .read(cx)
+                                                    .current_directory()
+                                                    .map(str::to_owned),
+                                                tab.files.clone(),
+                                            )
+                                        {
+                                            files.update(cx, |f, cx| {
+                                                f.follow_directory(path.clone(), cx)
+                                            });
+                                            tab.followed_directory = Some(path);
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                })
+        });
         let header = div()
-            .min_h(px(76.))
+            .h(px(48.))
             .flex_shrink_0()
-            .px_5()
-            .py_3()
+            .px_3()
             .flex()
             .items_center()
-            .gap_3()
+            .gap_2()
             .border_b_1()
             .border_color(rgb(p.border))
             .bg(rgb(p.sidebar))
             .child(
                 div()
-                    .size(px(40.))
-                    .rounded(px(7.))
+                    .size(px(28.))
+                    .flex_shrink_0()
+                    .rounded(px(6.))
                     .bg(design::action_gradient(false))
                     .text_color(rgb(0xffffff))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_lg()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child(">_"),
             )
             .child(
                 div()
                     .flex_1()
-                    .min_w_0()
+                    .min_w(px(120.))
                     .flex()
                     .flex_col()
-                    .gap_1()
                     .child(
                         div()
-                            .text_lg()
+                            .text_sm()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .truncate()
                             .child(tab.name.clone()),
                     )
                     .child(
@@ -1356,9 +1528,10 @@ impl Workspace {
                             .child(endpoint.unwrap_or_else(|| tr("local-session"))),
                     ),
             )
-            .when(tab.endpoint.is_some(), |d| {
+            .when(remote, |d| {
                 d.child(
                     Button::new("copy-endpoint")
+                        .small()
                         .ghost()
                         .icon(IconName::Copy)
                         .tooltip(tr("copy-endpoint"))
@@ -1370,40 +1543,54 @@ impl Workspace {
                 )
             })
             .when(!tab.environment.is_empty(), |d| {
-                d.child(
-                    div()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(tab.color))
-                        .text_xs()
-                        .text_color(rgb(p.muted))
-                        .child(tab.environment.clone()),
-                )
+                d.child(small_chip(tab.environment.clone(), rgb(tab.color).into()))
             })
-            .when(tab.endpoint.is_some(), |d| {
+            .when(remote, |d| {
+                let protection = tr(if tab.protected {
+                    "tmux-protected"
+                } else {
+                    "session-unprotected"
+                });
                 d.child(
                     div()
-                        .text_xs()
-                        .text_color(rgb(p.muted))
-                        .child(tr(if tab.protected {
-                            "tmux-protected"
-                        } else {
-                            "session-unprotected"
-                        })),
+                        .id("session-protection")
+                        .flex_shrink_0()
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(protection.clone())
+                                .build(window, cx)
+                        })
+                        .child(
+                            gpui_component::Icon::new(if tab.protected {
+                                gpui_kit_assets::IconName::ShieldCheck
+                            } else {
+                                gpui_kit_assets::IconName::ShieldOff
+                            })
+                            .small()
+                            .text_color(if tab.protected {
+                                cx.theme().success
+                            } else {
+                                rgb(p.muted).into()
+                            }),
+                        ),
                 )
             })
             .when(tab.connected_at.is_some(), |d| {
-                d.child(div().text_xs().text_color(rgb(p.muted)).child(format!(
-                    "{}m",
-                    tab.connected_at.unwrap().elapsed().as_secs() / 60
-                )))
+                d.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(rgb(p.muted))
+                        .child(format!(
+                            "{}m",
+                            tab.connected_at.unwrap().elapsed().as_secs() / 60
+                        )),
+                )
             })
             .child(
                 div()
-                    .px_3()
-                    .py_2()
+                    .flex_shrink_0()
+                    .px_2()
+                    .py_1()
                     .rounded(px(6.))
                     .bg(rgb(p.surface))
                     .border_1()
@@ -1426,10 +1613,11 @@ impl Workspace {
                     opsssh_term_core::SessionState::Disconnected
                         | opsssh_term_core::SessionState::Closed
                         | opsssh_term_core::SessionState::Reconnecting
-                ) && tab.endpoint.is_some(),
+                ) && remote,
                 |d| {
                     d.child(
                         crate::design::PrimaryAction::new("reconnect-server")
+                            .small()
                             .label(tr("reconnect-server"))
                             .disabled(terminal.read(cx).retry_pending())
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -1450,6 +1638,7 @@ impl Workspace {
             .when(state == opsssh_term_core::SessionState::Reconnecting, |d| {
                 d.child(
                     Button::new("stop-recovery")
+                        .small()
                         .ghost()
                         .label(tr("stop-reconnecting"))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -1462,7 +1651,8 @@ impl Workspace {
                             cx.notify();
                         })),
                 )
-            });
+            })
+            .when_some(tools, |d, tools| d.child(tools));
         let body = match tab.page {
             SessionPage::Files => files
                 .clone()
@@ -1498,146 +1688,8 @@ impl Workspace {
                 .flex()
                 .flex_col()
                 .min_h_0()
-                .p_4()
-                .gap_3()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child(tr("nav-terminal")),
-                        )
-                        .child(div().flex_1())
-                        .child(
-                            Button::new("split-right")
-                                .ghost()
-                                .icon(IconName::PanelRight)
-                                .tooltip(tr("split-right"))
-                                .accessibility_label(tr("split-right"))
-                                .disabled(tab.endpoint.is_some() && !live)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.split_pane(id, Axis::Horizontal, window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("split-down")
-                                .ghost()
-                                .icon(IconName::PanelBottom)
-                                .tooltip(tr("split-down"))
-                                .accessibility_label(tr("split-down"))
-                                .disabled(tab.endpoint.is_some() && !live)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.split_pane(id, Axis::Vertical, window, cx)
-                                })),
-                        )
-                        .when(tab.endpoint.is_some(), |d| {
-                            d.when(
-                                self.capture.is_some()
-                                    || (cfg!(feature = "capture")
-                                        && self.load_failed
-                                        && opsssh_platform::info().os == "windows"),
-                                |d| {
-                                    d.child(
-                                        Button::new("keyboard-capture")
-                                            .ghost()
-                                            .selected(tab.keyboard_capture)
-                                            .label(tr(if !tab.keyboard_capture {
-                                                "keyboard-released"
-                                            } else if !live {
-                                                "keyboard-paused"
-                                            } else {
-                                                "keyboard-captured"
-                                            }))
-                                            .tooltip(tr("keyboard-capture-help"))
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                if let Some(index) = this.session_index(id) {
-                                                    this.terminal_focus_released = false;
-                                    this.sessions[index].keyboard_capture =
-                                                        !this.sessions[index].keyboard_capture;
-                                                    this.sessions[index]
-                                                        .terminal
-                                                        .update(cx, |terminal, cx| {
-                                                            terminal.focus(window, cx)
-                                                        });
-                                                }
-                                                this.update_keyboard_capture(window, cx);
-                                                cx.notify();
-                                            })),
-                                    )
-                                },
-                            )
-                            .child(
-                                Button::new("terminal-upload-destination")
-                                    .ghost()
-                                    .label(tr("upload-destination"))
-                                    .tooltip(
-                                        tab.upload_directory
-                                            .clone()
-                                            .unwrap_or_else(|| tr("upload-destination-help")),
-                                    )
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.choose_upload_destination(id, vec![], window, cx)
-                                    })),
-                            )
-                        })
-                        .when(tab.endpoint.is_some(), |d| {
-                            d.child(
-                                Button::new("toggle-files")
-                                    .ghost()
-                                    .selected(visible)
-                                    .icon(IconName::Folder)
-                                    .label(tr("files"))
-                                    .tooltip(tr("files"))
-                                    .accessibility_label(tr("files"))
-                                    .on_click(cx.listener(move |this, _, w, cx| {
-                                        let Some(i) = this.session_index(id) else {
-                                            return;
-                                        };
-                                        if this.sessions[i].files_visible {
-                                            this.close_files(id,w,cx);
-                                        } else {
-                                            let t = this.sessions[i].terminal.clone();
-                                            this.ensure_files(&t, w, cx);
-                                        }
-                                        cx.notify();
-                                    })),
-                            )
-                            .when(visible, |d| {
-                                d.child(
-                                    Button::new("follow-folder")
-                                        .ghost()
-                                        .selected(follow)
-                                        .label(tr("follow-folder"))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            let Some(i) = this.session_index(id) else {
-                                                return;
-                                            };
-                                            let tab = &mut this.sessions[i];
-                                            tab.follow = !tab.follow;
-                                            if tab.follow
-                                                && let (Some(path), Some(files)) = (
-                                                    tab.terminal
-                                                        .read(cx)
-                                                        .current_directory()
-                                                        .map(str::to_owned),
-                                                    tab.files.clone(),
-                                                )
-                                            {
-                                                files.update(cx, |f, cx| {
-                                                    f.follow_directory(path.clone(), cx)
-                                                });
-                                                tab.followed_directory = Some(path);
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                            })
-                        }),
-                )
+                .p_2()
+                .gap_2()
                 .when_some(files.clone(), |d, files| {
                     d.child(files.update(cx, |files, cx| {
                         files.terminal_tray(self.store.settings.reduced_motion, cx)

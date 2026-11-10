@@ -8,6 +8,9 @@ All notable changes to OpsSSH are documented here. The project follows
 ### Fixed
 - Splitting a terminal on an SSH connection no longer disconnects the whole connection, and the new pane connects instead of staying on "Connecting".
 
+### Changed
+- Combine the server header and terminal toolbar into one compact row, giving the terminal more height.
+
 ## 0.1.0 (2026-11-10)
 
 First public release.
