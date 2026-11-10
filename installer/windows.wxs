@@ -32,6 +32,62 @@
             <File Source="$(var.Stage)/opsssh.png" />
             <File Source="$(var.Stage)/opsssh-mascot.svg" />
           </Component>
+          <!-- File Explorer right-click menu: OpsSSH > Open terminal here / Open OpsSSH.
+               Classic menu entries; on Windows 11 they appear under "Show more options". -->
+          <Component Id="ExplorerMenu" Guid="F3C98CED-11B0-4B50-A6AC-B2A9BCAC5C14">
+            <RegistryValue Root="HKCU" Key="Software\OpsSSH\Installer" Name="ExplorerMenu" Type="integer" Value="1" KeyPath="yes" />
+            <RegistryKey Root="HKCU" Key="Software\Classes\Directory\shell\OpsSSH" ForceDeleteOnUninstall="yes">
+              <RegistryValue Name="MUIVerb" Type="string" Value="OpsSSH" />
+              <RegistryValue Name="Icon" Type="string" Value="[#OpsSSHExe]" />
+              <RegistryValue Name="SubCommands" Type="string" Value="" />
+            </RegistryKey>
+            <RegistryKey Root="HKCU" Key="Software\Classes\Directory\shell\OpsSSH\shell\01terminal">
+              <RegistryValue Name="MUIVerb" Type="string" Value="Open terminal here" />
+              <RegistryValue Name="Icon" Type="string" Value="[#OpsSSHExe]" />
+            </RegistryKey>
+            <RegistryValue Root="HKCU" Key="Software\Classes\Directory\shell\OpsSSH\shell\01terminal\command" Type="string"
+                           Value="&quot;[#OpsSSHExe]&quot; local &quot;%V&quot;" />
+            <RegistryKey Root="HKCU" Key="Software\Classes\Directory\shell\OpsSSH\shell\02app">
+              <RegistryValue Name="MUIVerb" Type="string" Value="Open OpsSSH" />
+              <RegistryValue Name="Icon" Type="string" Value="[#OpsSSHExe]" />
+            </RegistryKey>
+            <RegistryValue Root="HKCU" Key="Software\Classes\Directory\shell\OpsSSH\shell\02app\command" Type="string"
+                           Value="&quot;[#OpsSSHExe]&quot;" />
+            <RegistryKey Root="HKCU" Key="Software\Classes\Directory\Background\shell\OpsSSH" ForceDeleteOnUninstall="yes">
+              <RegistryValue Name="MUIVerb" Type="string" Value="OpsSSH" />
+              <RegistryValue Name="Icon" Type="string" Value="[#OpsSSHExe]" />
+              <RegistryValue Name="SubCommands" Type="string" Value="" />
+            </RegistryKey>
+            <RegistryKey Root="HKCU" Key="Software\Classes\Directory\Background\shell\OpsSSH\shell\01terminal">
+              <RegistryValue Name="MUIVerb" Type="string" Value="Open terminal here" />
+              <RegistryValue Name="Icon" Type="string" Value="[#OpsSSHExe]" />
+            </RegistryKey>
+            <RegistryValue Root="HKCU" Key="Software\Classes\Directory\Background\shell\OpsSSH\shell\01terminal\command" Type="string"
+                           Value="&quot;[#OpsSSHExe]&quot; local &quot;%V&quot;" />
+            <RegistryKey Root="HKCU" Key="Software\Classes\Directory\Background\shell\OpsSSH\shell\02app">
+              <RegistryValue Name="MUIVerb" Type="string" Value="Open OpsSSH" />
+              <RegistryValue Name="Icon" Type="string" Value="[#OpsSSHExe]" />
+            </RegistryKey>
+            <RegistryValue Root="HKCU" Key="Software\Classes\Directory\Background\shell\OpsSSH\shell\02app\command" Type="string"
+                           Value="&quot;[#OpsSSHExe]&quot;" />
+            <RegistryKey Root="HKCU" Key="Software\Classes\Drive\shell\OpsSSH" ForceDeleteOnUninstall="yes">
+              <RegistryValue Name="MUIVerb" Type="string" Value="OpsSSH" />
+              <RegistryValue Name="Icon" Type="string" Value="[#OpsSSHExe]" />
+              <RegistryValue Name="SubCommands" Type="string" Value="" />
+            </RegistryKey>
+            <RegistryKey Root="HKCU" Key="Software\Classes\Drive\shell\OpsSSH\shell\01terminal">
+              <RegistryValue Name="MUIVerb" Type="string" Value="Open terminal here" />
+              <RegistryValue Name="Icon" Type="string" Value="[#OpsSSHExe]" />
+            </RegistryKey>
+            <RegistryValue Root="HKCU" Key="Software\Classes\Drive\shell\OpsSSH\shell\01terminal\command" Type="string"
+                           Value="&quot;[#OpsSSHExe]&quot; local &quot;%V&quot;" />
+            <RegistryKey Root="HKCU" Key="Software\Classes\Drive\shell\OpsSSH\shell\02app">
+              <RegistryValue Name="MUIVerb" Type="string" Value="Open OpsSSH" />
+              <RegistryValue Name="Icon" Type="string" Value="[#OpsSSHExe]" />
+            </RegistryKey>
+            <RegistryValue Root="HKCU" Key="Software\Classes\Drive\shell\OpsSSH\shell\02app\command" Type="string"
+                           Value="&quot;[#OpsSSHExe]&quot;" />
+          </Component>
           <Component Id="Documentation" Guid="BBCB5B76-60F1-43CA-8EED-4A726230F17A">
             <RegistryValue Root="HKCU" Key="Software\OpsSSH\Installer" Name="Documentation" Type="integer" Value="1" KeyPath="yes" />
             <File Source="$(var.Stage)/LICENSE-MIT" />
@@ -59,6 +115,7 @@
       <ComponentRef Id="Branding" />
       <ComponentRef Id="Documentation" />
       <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="ExplorerMenu" />
     </Feature>
   </Package>
 </Wix>
