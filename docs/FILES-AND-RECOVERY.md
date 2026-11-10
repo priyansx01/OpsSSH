@@ -6,12 +6,33 @@ list renders only visible rows using GPUI's uniform list. The SFTP library itsel
 currently materializes each directory listing before returning it; 100,000-entry
 listing responsiveness and memory remain measurement gates.
 
-Browse with the folder field, Enter, Up, Refresh or a folder double-click. Upload
-accepts files and directories, downloads use the native destination picker, and
-Create makes a folder. Delete requires a second explicit action and handles files
-only. Cancel requests cancellation between transfer chunks. Partial files stay in
-place. Existing destinations are never silently replaced. A save dialog's generic
-overwrite prompt does not override exclusive-create in this version.
+Browse with the folder field, breadcrumbs, Places, Back/Forward (Alt+Left/Right or
+the mouse's side buttons), Up (Alt+Up or Backspace) or a folder double-click.
+Selection is kept by remote path, so a refresh never selects a different item:
+Ctrl/Cmd+click toggles, Shift+click selects a range, Ctrl+A selects everything
+listed, and dragging on empty space draws a selection rectangle. Keyboard
+shortcuts apply only while the listing has focus: F2 renames in place, Delete asks
+before deleting the selection, Ctrl+X/C/V cut, copy and paste, Ctrl+Shift+C copies
+paths, Ctrl+H shows hidden files, Ctrl+L edits the path, Ctrl+D bookmarks the open
+folder and F5 refreshes.
+
+Dragging items onto a folder, breadcrumb, Up or a Place moves them; holding Ctrl
+(Option on macOS) copies instead. A folder under the pointer opens after 0.9 s.
+Drops onto the item itself, into one of its own subfolders, from another
+connection or into the folder that already holds them are refused before anything
+is queued. Files dropped from the desktop upload into the folder under the pointer.
+
+Every transfer shares one conflict dialog: Replace, Keep both (a numbered name
+such as `report (2).txt` or `backup (2).tar.gz`), Skip or Cancel all, with Apply to
+all for the rest of the batch. Same-named folders merge, and each clashing file
+inside is asked about again. Items of different types are never replaced. Closing
+the dialog skips the item. A file the operating system's save dialog already
+confirmed is replaced without a second question; files inside a downloaded folder
+were never shown by that dialog and are still asked about. Moves use an atomic
+SFTP rename; a move across filesystems copies and then removes the original only
+after a clean copy. Replacing during a move uses `posix-rename@openssh.com` when
+the server offers it and otherwise sets the original aside until the new file is
+in place.
 
 `opsssh-sftp` provides explicit overwrite and resume APIs. Resume binds a transfer
 to the verified host fingerprint, canonical path, size and modification time, then
@@ -24,8 +45,19 @@ within each file is supplied by russh-sftp.
 Recursive uploads reject symlinks and special files and create every destination
 exclusively. Remote filenames containing controls or path separators are rejected.
 This deliberately excludes some valid POSIX filenames until a safe representation
-and interaction design is implemented. The file listing cannot rename or preview
-files from the pane yet; rename exists as a non-overwriting service API.
+and interaction design is implemented.
+
+Dragging items out to the desktop is experimental and off by default; start OpsSSH
+with `OPSSSH_EXPERIMENTAL_DRAG_OUT=1` to try it. On Windows the drag starts as soon
+as the pointer leaves the window. Releasing over a File Explorer window or the
+desktop drops instantly: OpsSSH finds that folder and downloads into it as a normal
+transfer, with progress and the usual conflict dialog. A drop onto a subfolder icon
+inside Explorer uses the folder that window shows. Other applications need real
+files, so only small file selections (32 MiB) that finished preparing while the
+drag started can be dropped there. On macOS and Linux Wayland only those prepared
+small selections can leave the window. Prepared files live in a private folder
+under the system temporary directory, are removed when the pane closes, and
+leftovers older than a day are swept at start.
 
 At a positively identified shell prompt, a drop targets the reported current
 directory. Otherwise it creates a random `opsssh-drop-<UUID>` folder beneath the
