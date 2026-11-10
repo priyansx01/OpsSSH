@@ -12,7 +12,7 @@ pub use session::{LocalSession, SessionNotice};
 #[cfg(feature = "gui")]
 mod gpu;
 #[cfg(feature = "gui")]
-pub use gpu::{TerminalView, TerminalViewEvent};
+pub use gpu::{SplitSource, TerminalView, TerminalViewEvent};
 
 use std::collections::BTreeSet;
 use std::time::Duration;

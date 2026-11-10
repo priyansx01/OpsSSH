@@ -570,12 +570,14 @@ impl Workspace {
         } else {
             tab.active_terminal().clone()
         };
-        let Some(peer) = source.update(cx, |source, cx| source.split_peer(window, cx)) else {
+        let Some(split) = source.read(cx).split_source() else {
             self.message = tr("split-needs-connection");
             cx.notify();
             return;
         };
-        let terminal = cx.new(|_| peer);
+        // The new pane must own its startup: building it in the source pane's context
+        // would install the new shell into the source pane and drop the connection.
+        let terminal = cx.new(|cx| TerminalView::open_split(split, window, cx));
         let tab = &mut self.sessions[index];
         let Some(pane) = tab.layout.split(tab.active_pane, axis) else {
             return;

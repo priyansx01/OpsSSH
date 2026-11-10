@@ -60,6 +60,13 @@ struct ShapedRow {
     backgrounds: Vec<(Range<usize>, Rgb)>,
 }
 
+/// Describes a new pane to open beside an existing terminal; see [`TerminalView::open_split`].
+#[derive(Debug, Clone)]
+pub struct SplitSource {
+    channel: Option<async_channel::Sender<SshCommand>>,
+    font_size: f32,
+}
+
 enum Startup {
     Local,
     Remote(Box<ConnectionOptions>),
@@ -144,18 +151,33 @@ impl TerminalView {
         view
     }
 
-    /// Another terminal beside this one: a local shell, or a channel on this connection.
-    pub fn split_peer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Self> {
-        let mut peer = if self.connection_options.is_none() && !self.channel {
-            Self::new(window, cx)
+    /// What a new pane beside this terminal should open: a local shell, or a channel on
+    /// this connection. `None` while a remote session is not connected.
+    pub fn split_source(&self) -> Option<SplitSource> {
+        let channel = if self.connection_options.is_none() && !self.channel {
+            None
         } else {
             if self.state() != SessionState::Connected {
                 return None;
             }
-            Self::open_channel(self.ssh_commands()?, window, cx)
+            Some(self.ssh_commands()?)
         };
-        peer.set_font_size(self.font_size, cx);
-        Some(peer)
+        Some(SplitSource {
+            channel,
+            font_size: self.font_size,
+        })
+    }
+
+    /// Build a split pane. Call inside `cx.new` for the new pane: startup tasks and focus
+    /// listeners belong to the entity whose context is passed here, so building it in the
+    /// existing pane's context would hand the new session to that pane instead.
+    pub fn open_split(source: SplitSource, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut view = match source.channel {
+            Some(parent) => Self::open_channel(parent, window, cx),
+            None => Self::new(window, cx),
+        };
+        view.set_font_size(source.font_size, cx);
+        view
     }
 
     /// True for a shell opened on another terminal's SSH connection.
@@ -2134,6 +2156,35 @@ mod clipboard_tests {
             div()
         }
     }
+    #[gpui::test]
+    fn a_split_pane_receives_its_own_startup_result(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        // Invalid options fail before any connection or thread starts.
+        let (source, cx) = cx.add_window_view(|window, cx| {
+            TerminalView::connect(ConnectionOptions::new("", "", PathBuf::new()), window, cx)
+        });
+        cx.run_until_parked();
+        let source_error = cx.update(|_, cx| source.read(cx).error.clone());
+        assert!(source_error.is_some());
+        // A connection that has already closed fails the new pane's startup at once.
+        let (closed, receiver) = async_channel::bounded::<SshCommand>(1);
+        drop(receiver);
+        let split = SplitSource {
+            channel: Some(closed),
+            font_size: 18.,
+        };
+        let pane = cx.update(|window, cx| cx.new(|cx| TerminalView::open_split(split, window, cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.error.as_deref(), Some("SSH session closed"));
+            assert!(pane.is_channel());
+            assert_eq!(pane.font_size, 18.);
+            // The startup result never lands on the pane the split came from.
+            assert_eq!(source.read(cx).error, source_error);
+        });
+    }
+
     #[gpui::test]
     fn resize_burst_coalesces_and_applies_final_size_without_clearing_selection(
         cx: &mut TestAppContext,
