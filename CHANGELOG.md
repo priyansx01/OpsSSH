@@ -5,6 +5,10 @@ All notable changes to OpsSSH are documented here. The project follows
 
 ## 0.1.1 (2026-11-10)
 
+### Added
+- Open a local terminal in any folder from the File Explorer right-click menu (OpsSSH ▸ Open terminal here), or open the app (Open OpsSSH). The running OpsSSH window is reused with a new tab.
+- `opsssh local <folder>` starts a local terminal in that folder.
+
 ### Fixed
 - Splitting a terminal on an SSH connection no longer disconnects the whole connection, and the new pane connects instead of staying on "Connecting".
 

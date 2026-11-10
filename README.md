@@ -122,6 +122,15 @@ if you tick **Save**. One-time codes are never stored.
   locking out the key you are using, and create Linux users with sudo.
   See [SSH Management](docs/SSH_MANAGEMENT.md).
 
+### Windows integration
+- Right-click a folder, the empty space inside one, or a drive in File Explorer
+  and choose **OpsSSH ▸ Open terminal here** for a local terminal in that folder,
+  or **Open OpsSSH** for the app. On Windows 11 the entry is under
+  **Show more options** (or Shift+right-click).
+- An open OpsSSH window is reused: it comes to the front with a new tab instead
+  of starting a second copy.
+- From any shell: `opsssh local <folder>`.
+
 ### Experimental
 - **Drag files out to your desktop.** Start OpsSSH with
   `OPSSSH_EXPERIMENTAL_DRAG_OUT=1`. On Windows, dropping onto a File Explorer
