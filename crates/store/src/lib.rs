@@ -124,15 +124,20 @@ impl Profile {
 pub struct WorkspacePreference {
     pub files_open: bool,
     pub files_width: f32,
+    /// Remote folders pinned in the file manager's Places list, in display order.
+    pub bookmarks: Vec<String>,
 }
 impl Default for WorkspacePreference {
     fn default() -> Self {
         Self {
             files_open: false,
             files_width: 0.,
+            bookmarks: vec![],
         }
     }
 }
+/// Bookmarks kept per server; each is an absolute remote folder path.
+pub const MAX_BOOKMARKS: usize = 64;
 /// Namespaced IDs for saved profiles and endpoint-qualified SSH config aliases. Never includes credentials.
 pub fn workspace_key(profile: &Profile) -> String {
     if profile.id != 0 {
@@ -253,6 +258,12 @@ impl Store {
                 key.len() > 2048
                     || !value.files_width.is_finite()
                     || !(0.0..=1200.0).contains(&value.files_width)
+                    || value.bookmarks.len() > MAX_BOOKMARKS
+                    || value.bookmarks.iter().any(|path| {
+                        !path.starts_with('/')
+                            || path.len() > 4096
+                            || path.chars().any(char::is_control)
+                    })
             })
         {
             return Err(invalid("Invalid workspace panel preferences"));
@@ -398,10 +409,15 @@ mod tests {
             WorkspacePreference {
                 files_open: true,
                 files_width: 360.,
+                bookmarks: vec!["/var/log".into(), "/srv/雪".into()],
             },
         );
         let restored = Store::parse(&toml::to_string(&store).unwrap()).unwrap();
         assert_eq!(restored.settings.workspaces[&key].files_width, 360.);
+        assert_eq!(
+            restored.settings.workspaces[&key].bookmarks,
+            ["/var/log", "/srv/雪"]
+        );
         assert!(restored.settings.workspaces[&key].files_open);
         assert!(
             Store::parse(&store.export().unwrap())
@@ -425,6 +441,12 @@ mod tests {
         store.settings.workspaces.get_mut(&key).unwrap().files_width = f32::NAN;
         assert!(store.validate().is_err());
         store.settings.workspaces.get_mut(&key).unwrap().files_width = 1201.;
+        assert!(store.validate().is_err());
+        store.settings.workspaces.get_mut(&key).unwrap().files_width = 300.;
+        store.settings.workspaces.get_mut(&key).unwrap().bookmarks = vec!["relative".into()];
+        assert!(store.validate().is_err());
+        store.settings.workspaces.get_mut(&key).unwrap().bookmarks =
+            vec!["/a".into(); MAX_BOOKMARKS + 1];
         assert!(store.validate().is_err());
     }
     #[test]

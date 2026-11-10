@@ -2,8 +2,8 @@
 use crate::localization::text as tr;
 use async_channel::{Receiver, Sender};
 use gpui::{
-    ClipboardItem, Context, Entity, EventEmitter, PathPromptOptions, Render, Task, Window, div,
-    prelude::*, px, uniform_list,
+    ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, PathPromptOptions, Render, Task,
+    Window, div, prelude::*, px, uniform_list,
 };
 use gpui_component::{
     ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, WindowExt,
@@ -12,12 +12,20 @@ use gpui_component::{
     menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
 };
 use opsssh_sftp::{
-    DownloadDecision, Entry, PermissionChange, RemoteAttributes, SftpClient, TransferControl,
+    Conflict, ConflictDecision, ConflictReply, Entry, PermissionChange, RemoteAttributes,
+    SftpClient, TransferControl, TransferItem, TransferMode,
 };
 use opsssh_ssh_core::{ExecRequest, SshCommand};
 use std::{path::PathBuf, time::Duration};
 mod actions;
+mod browser;
+mod conflict;
+mod dnd;
+mod places;
+mod selection;
 use actions::FileEditor;
+use browser::{FileClipboard, History, InlineRename, Navigation};
+use conflict::PendingConflict;
 
 pub enum FilePaneEvent {
     ClosePanel,
@@ -26,7 +34,12 @@ pub enum FilePaneEvent {
     DestinationValidated(u64, String),
     DestinationFailed(u64, String),
     ChooseUploadDestination,
-    OpenTerminal { directory: String, new_tab: bool },
+    OpenTerminal {
+        directory: String,
+        new_tab: bool,
+    },
+    /// The user changed this server's Places bookmarks; persist them.
+    BookmarksChanged(Vec<String>),
 }
 #[derive(Clone)]
 enum Job {
@@ -44,11 +57,13 @@ enum Job {
     Download {
         remote: String,
         local: PathBuf,
+        /// The native save dialog already confirmed replacing this existing file.
+        confirmed_existing: bool,
         control: TransferControl,
     },
     Mkdir(String),
     Delete {
-        path: String,
+        paths: Vec<String>,
         control: TransferControl,
     },
     Attributes {
@@ -64,10 +79,11 @@ enum Job {
         group: Option<String>,
         control: TransferControl,
     },
-    RemoteTransfer {
-        source: String,
-        target: String,
-        copy: bool,
+    /// Copy or move items into a folder, asking about each name conflict.
+    Transfer {
+        items: Vec<TransferItem>,
+        destination: String,
+        mode: TransferMode,
         control: TransferControl,
     },
 }
@@ -77,8 +93,7 @@ enum Update {
     Message(String),
     Unavailable(String),
     Insert(u64, String),
-    Replace(u64, String, Sender<bool>),
-    DownloadReplace(u64, PathBuf, Sender<DownloadDecision>),
+    Conflict(u64, Conflict, Sender<ConflictReply>),
     DestinationValidated(u64, String),
     DestinationFailed(u64, String),
     Started(u64),
@@ -125,10 +140,6 @@ impl TransferState {
         })
     }
 }
-enum ReplacementReply {
-    Remote(Sender<bool>),
-    Local(Sender<DownloadDecision>),
-}
 struct TransferTask {
     id: u64,
     label: String,
@@ -142,7 +153,7 @@ struct TransferTask {
     pending_insert: bool,
     insert_generation: Option<u64>,
     dismissed: bool,
-    replacement: Option<(String, ReplacementReply)>,
+    conflict: Option<PendingConflict>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FileSort {
@@ -167,9 +178,27 @@ pub struct FilePane {
     visible: Vec<usize>,
     browser_dirty: bool,
     entries: Vec<Entry>,
-    selected: Option<usize>,
+    selection: selection::Selection,
+    history: History,
+    /// Pending listing job and how it was requested, for Back/Forward history.
+    navigation: Option<(u64, Navigation)>,
+    clipboard: Option<FileClipboard>,
+    rename: Option<InlineRename>,
+    /// Folder under a drag and when the pointer arrived, for spring-loaded opening.
+    spring: Option<(String, std::time::Instant)>,
+    /// Folder that just received a drop, for a short highlight.
+    drop_pulse: Option<(String, std::time::Instant)>,
+    drop_serial: u64,
+    band: Option<dnd::BandDrag>,
+    /// Changes with every new folder listing, so rows animate in once.
+    listing_generation: u64,
+    bookmarks: Vec<String>,
+    /// The terminal's current folder, offered as a place.
+    terminal_directory: Option<String>,
+    /// The first folder listed after connecting, which is the login home.
+    home_hint: String,
     message: String,
-    pending_delete: Option<String>,
+    pending_delete: Option<Vec<String>>,
     pending: usize,
     next_id: u64,
     transfers: Vec<TransferTask>,
@@ -179,6 +208,9 @@ pub struct FilePane {
     pending_validation: Option<u64>,
     editor: Option<FileEditor>,
     editor_serial: u64,
+    /// Transfer whose conflict is shown in the decision dialog.
+    conflict_dialog: Option<u64>,
+    conflict_apply_all: bool,
     #[cfg(feature = "capture")]
     _preview_jobs: Option<Receiver<QueuedJob>>,
 }
@@ -275,7 +307,23 @@ impl FilePane {
                 is_symlink: false,
             })
             .collect(),
-            selected: Some(2),
+            selection: {
+                let mut selection = selection::Selection::default();
+                selection.select_only("/srv/application/README.md");
+                selection
+            },
+            history: History::default(),
+            navigation: None,
+            clipboard: None,
+            rename: None,
+            spring: None,
+            drop_pulse: None,
+            drop_serial: 0,
+            band: None,
+            listing_generation: 0,
+            bookmarks: vec![],
+            terminal_directory: None,
+            home_hint: String::new(),
             message: tr("file-entry-count"),
             pending_delete: None,
             pending: 0,
@@ -293,7 +341,7 @@ impl FilePane {
                 pending_insert: false,
                 insert_generation: None,
                 dismissed: false,
-                replacement: None,
+                conflict: None,
             }],
             progress_task: None,
             worker_generation: 0,
@@ -301,6 +349,8 @@ impl FilePane {
             pending_validation: None,
             editor: None,
             editor_serial: 0,
+            conflict_dialog: None,
+            conflict_apply_all: false,
             _preview_jobs: Some(preview_jobs),
         }
     }
@@ -361,7 +411,19 @@ impl FilePane {
             visible: vec![],
             browser_dirty: true,
             entries: vec![],
-            selected: None,
+            selection: selection::Selection::default(),
+            history: History::default(),
+            navigation: None,
+            clipboard: None,
+            rename: None,
+            spring: None,
+            drop_pulse: None,
+            drop_serial: 0,
+            band: None,
+            listing_generation: 0,
+            bookmarks: vec![],
+            terminal_directory: None,
+            home_hint: String::new(),
             message: tr("file-opening"),
             pending_delete: None,
             pending: 0,
@@ -373,6 +435,8 @@ impl FilePane {
             pending_validation: None,
             editor: None,
             editor_serial: 0,
+            conflict_dialog: None,
+            conflict_apply_all: false,
             #[cfg(feature = "capture")]
             _preview_jobs: None,
         };
@@ -431,7 +495,6 @@ impl FilePane {
     #[cfg(feature = "capture")]
     pub fn preview_upload_replacement(&mut self, cx: &mut Context<Self>) {
         self.preview_transfer(false);
-        let id = self.transfers[0].id;
         self.transfers[0].label = format!("{}: test.txt", tr("file-upload"));
         self.transfers[0].bytes = 0;
         let (reply, receive) = async_channel::bounded(1);
@@ -439,7 +502,13 @@ impl FilePane {
             let _ = receive.recv().await;
         })
         .detach();
-        self.request_replacement(id, "/opt/test.txt".into(), reply, cx);
+        // The dialog opens on the next frame, once the window can show one.
+        self.transfers[0].state = TransferState::AwaitingReplace;
+        self.transfers[0].conflict = Some(PendingConflict {
+            conflict: conflict::sample_conflict("/opt/test.txt"),
+            reply,
+        });
+        cx.notify();
     }
     #[cfg(feature = "capture")]
     pub fn preview_list(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -503,29 +572,30 @@ impl FilePane {
                                 cx.emit(FilePaneEvent::DestinationFailed(request, error));
                             }
                             Update::Listed(path, entries) => {
-                                if this.directory != path {
+                                let previous = std::mem::take(&mut this.directory);
+                                if previous != path {
                                     this.search
                                         .update(cx, |state, cx| state.set_value("", window, cx));
+                                    this.record_navigation(&previous, &path);
+                                    this.reset_selection();
+                                    this.listing_generation =
+                                        this.listing_generation.wrapping_add(1);
+                                }
+                                if this.home_hint.is_empty() {
+                                    this.home_hint = path.clone();
                                 }
                                 this.directory = path.clone();
                                 this.path
                                     .update(cx, |state, cx| state.set_value(path, window, cx));
                                 this.entries = entries;
                                 this.browser_dirty = true;
-                                this.selected = None;
                                 this.message =
                                     format!("{}: {}", tr("file-entry-count"), this.entries.len());
                             }
                             Update::Refreshed(path, entries) => {
                                 if this.directory == path {
-                                    let selected_path = this
-                                        .selected
-                                        .and_then(|index| this.entries.get(index))
-                                        .map(|entry| entry.path.clone());
+                                    // Selection is kept by path and pruned after filtering.
                                     this.entries = entries;
-                                    this.selected = selected_path.and_then(|path| {
-                                        this.entries.iter().position(|entry| entry.path == path)
-                                    });
                                     this.browser_dirty = true;
                                 }
                             }
@@ -543,7 +613,7 @@ impl FilePane {
                                 for task in &mut this.transfers {
                                     if task.state.active() {
                                         task.control.cancel();
-                                        task.replacement = None;
+                                        task.conflict = None;
                                         task.state = if task.state == TransferState::Cancelling {
                                             TransferState::Cancelled
                                         } else {
@@ -562,22 +632,8 @@ impl FilePane {
                                 }
                                 cx.emit(FilePaneEvent::InsertText(id, text));
                             }
-                            Update::DownloadReplace(id, path, reply) => {
-                                if let Some(task) =
-                                    this.transfers.iter_mut().find(|task| task.id == id)
-                                    && task.control.ensure_active().is_ok()
-                                {
-                                    task.state = TransferState::AwaitingReplace;
-                                    task.replacement = Some((
-                                        path.display().to_string(),
-                                        ReplacementReply::Local(reply),
-                                    ));
-                                    task.dismissed = false;
-                                    cx.notify();
-                                }
-                            }
-                            Update::Replace(id, path, reply) => {
-                                this.request_replacement(id, path, reply, cx);
+                            Update::Conflict(id, conflict, reply) => {
+                                this.receive_conflict(id, conflict, reply, window, cx);
                             }
                             Update::Started(id) => {
                                 if let Some(task) =
@@ -594,7 +650,7 @@ impl FilePane {
                                     this.transfers.iter_mut().find(|task| task.id == id)
                                 {
                                     task.bytes = task.control.batch_transferred();
-                                    task.replacement = None;
+                                    task.conflict = None;
                                     task.failure = result.err();
                                     task.state = if success {
                                         TransferState::Completed
@@ -610,6 +666,15 @@ impl FilePane {
                                     }
                                 }
                                 this.pending = this.pending.saturating_sub(1);
+                                if !success && this.navigation.is_some_and(|(job, _)| job == id) {
+                                    // The folder could not be opened; history stays as it was.
+                                    this.navigation = None;
+                                }
+                                if this.conflict_dialog == Some(id) {
+                                    // The worker no longer waits; never leave a stale question open.
+                                    this.conflict_dialog = None;
+                                    window.close_dialog(cx);
+                                }
                                 if success {
                                     cx.spawn_in(window, async move |this, cx| {
                                         cx.background_executor()
@@ -725,12 +790,14 @@ impl FilePane {
                 let generation = self.worker_generation;
                 cx.spawn_in(window, async move |this, cx| {
                     if let Ok(Ok(Some(local))) = picker.await {
+                        let confirmed_existing = picked_existing_file(&local);
                         let _ = this.update_in(cx, |this, _, cx| {
                             if this.available && this.worker_generation == generation {
                                 this.enqueue(
                                     Job::Download {
                                         remote,
                                         local,
+                                        confirmed_existing,
                                         control: TransferControl::default(),
                                     },
                                     cx,
@@ -795,19 +862,37 @@ impl FilePane {
                 ),
                 control.clone(),
             )),
-            Job::RemoteTransfer {
-                source,
-                copy,
+            Job::Transfer {
+                items,
+                mode,
                 control,
                 ..
             } => Some((
                 format!(
-                    "{} · {source}",
-                    if *copy { "Copy" } else { "Move / rename" }
+                    "{} · {}",
+                    tr(if *mode == TransferMode::Copy {
+                        "file-copy"
+                    } else {
+                        "file-move"
+                    }),
+                    match items.as_slice() {
+                        [item] => item.name.clone(),
+                        items => format!("{} {}", items.len(), tr("file-items")),
+                    }
                 ),
                 control.clone(),
             )),
-            Job::Delete { path, control } => Some((format!("Delete · {path}"), control.clone())),
+            Job::Delete { paths, control } => Some((
+                format!(
+                    "{} · {}",
+                    tr("file-delete"),
+                    match paths.as_slice() {
+                        [path] => path.clone(),
+                        paths => format!("{} {}", paths.len(), tr("file-items")),
+                    }
+                ),
+                control.clone(),
+            )),
             Job::Permissions { path, control, .. } => {
                 Some((format!("Permissions · {path}"), control.clone()))
             }
@@ -839,7 +924,7 @@ impl FilePane {
                         pending_insert: false,
                         insert_generation: None,
                         dismissed: false,
-                        replacement: None,
+                        conflict: None,
                     });
                 }
                 self.message = format!("{}: {}", tr("file-pending-count"), self.pending);
@@ -897,18 +982,20 @@ impl FilePane {
             .find(|task| task.id == id && task.state.active())
         {
             task.control.cancel();
-            task.replacement = None;
+            task.conflict = None;
             task.state = TransferState::Cancelling;
             self.message = tr("file-cancel-requested");
             cx.notify();
         }
     }
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.enqueue(Job::List(self.path.read(cx).value().to_string()), cx);
+        let path = self.path.read(cx).value().to_string();
+        self.navigate(path, Navigation::Visit, cx);
     }
     pub fn follow_directory(&mut self, path: String, cx: &mut Context<Self>) {
+        self.terminal_directory = Some(path.clone());
         if self.directory != path {
-            self.enqueue(Job::List(path), cx);
+            self.navigate(path, Navigation::Visit, cx);
         }
     }
     pub fn upload_files(
@@ -954,70 +1041,15 @@ impl FilePane {
         .detach();
     }
     fn pick_download(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(entry) = self
-            .selected
-            .and_then(|index| self.entries.get(index))
-            .cloned()
-        else {
-            return;
-        };
-        self.download_entry(entry, window, cx);
+        self.download_selection(window, cx);
     }
 }
 impl FilePane {
-    fn request_replacement(
-        &mut self,
-        id: u64,
-        path: String,
-        reply: Sender<bool>,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(task) = self.transfers.iter_mut().find(|task| task.id == id)
-            && task.state != TransferState::Cancelling
-            && task.control.ensure_active().is_ok()
-        {
-            task.state = TransferState::AwaitingReplace;
-            task.replacement = Some((path, ReplacementReply::Remote(reply)));
-            // A dismissed active upload must become visible when it requires a decision.
-            task.dismissed = false;
-            cx.notify();
-        }
-    }
-
-    fn replace_transfer(&mut self, id: u64, cx: &mut Context<Self>) {
-        if let Some(task) = self.transfers.iter_mut().find(|task| task.id == id)
-            && task.state == TransferState::AwaitingReplace
-            && task.control.ensure_active().is_ok()
-            && let Some((_, reply)) = task.replacement.take()
-        {
-            let sent = match reply {
-                ReplacementReply::Remote(reply) => reply.try_send(true).is_ok(),
-                ReplacementReply::Local(reply) => reply.try_send(DownloadDecision::Replace).is_ok(),
-            };
-            if sent {
-                task.state = TransferState::Running;
-            }
-            cx.notify();
-        }
-    }
-
-    fn decide_download(&mut self, id: u64, decision: DownloadDecision, cx: &mut Context<Self>) {
-        if let Some(task) = self.transfers.iter_mut().find(|task| task.id == id)
-            && task.control.ensure_active().is_ok()
-            && let Some((_, ReplacementReply::Local(reply))) = task.replacement.take()
-        {
-            if reply.try_send(decision).is_ok() {
-                task.state = TransferState::Running;
-            }
-            cx.notify();
-        }
-    }
-
     pub fn dismiss_transfer_notice(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(task) = self.transfers.iter_mut().find(|task| task.id == id) {
             if task.state == TransferState::AwaitingReplace {
                 task.control.cancel();
-                task.replacement = None;
+                task.conflict = None;
                 task.state = TransferState::Cancelling;
             }
             task.dismissed = true;
@@ -1135,8 +1167,12 @@ impl FilePane {
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(if let Some((path, _)) = &task.replacement {
-                                    format!("{} {path}", tr("upload-file-exists"))
+                                .child(if let Some(pending) = &task.conflict {
+                                    format!(
+                                        "{} {}",
+                                        tr("upload-file-exists"),
+                                        pending.conflict.destination
+                                    )
                                 } else if let Some(error) = &task.failure {
                                     error.clone()
                                 } else {
@@ -1166,14 +1202,13 @@ impl FilePane {
                             })),
                     )
                 })
-                .when_some(task.replacement.as_ref(), |d, _| {
+                .when(task.conflict.is_some(), |d| {
                     d.child(
-                        crate::design::PrimaryAction::new(("drop-replace", id))
+                        crate::design::PrimaryAction::new(("drop-review", id))
                             .small()
-                            .label(tr("upload-replace"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.replace_transfer(id, cx);
-                                cx.emit(FilePaneEvent::FocusTerminal);
+                            .label(tr("conflict-review"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.review_conflict(id, window, cx);
                             })),
                     )
                 })
@@ -1270,7 +1305,7 @@ impl FilePane {
     fn entry_element(&self, index: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         let entry = &self.entries[index];
         let theme = cx.theme();
-        let (background, foreground, muted, border, hover, selected, accent) = (
+        let (background, foreground, muted, border, hover, selected, accent, danger) = (
             theme.background,
             theme.foreground,
             theme.muted_foreground,
@@ -1278,9 +1313,18 @@ impl FilePane {
             theme.muted,
             theme.accent,
             theme.primary,
+            theme.danger,
         );
         let full_path = entry.path.clone();
         let grid = self.full_page && self.grid;
+        let is_selected = self.is_selected(&entry.path);
+        let is_cursor = self.selection.cursor() == Some(entry.path.as_str());
+        let folder = entry.is_directory && !entry.is_symlink;
+        let spring = folder && self.spring.as_ref().is_some_and(|(p, _)| *p == entry.path);
+        let renaming = self
+            .rename
+            .as_ref()
+            .filter(|rename| rename.path == entry.path);
         let size = entry
             .size
             .filter(|_| !entry.is_directory)
@@ -1290,11 +1334,30 @@ impl FilePane {
             .modified
             .map(format_modified)
             .unwrap_or_else(|| "—".into());
-        let icon = Icon::new(entry_icon(entry)).text_color(if entry.is_directory {
-            accent
+        let icon = Icon::new(if spring {
+            gpui_kit_assets::IconName::FolderOpen
         } else {
-            muted
-        });
+            entry_icon(entry)
+        })
+        .text_color(if entry.is_directory { accent } else { muted });
+        let name: gpui::AnyElement = match renaming {
+            Some(rename) => div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .min_w_0()
+                .child(Input::new(&rename.input).small())
+                .when_some(rename.error.clone(), |d, error| {
+                    d.child(div().text_xs().text_color(danger).child(error))
+                })
+                .into_any_element(),
+            None => div()
+                .text_sm()
+                .truncate()
+                .when(grid, |d| d.h(px(20.)).font_weight(gpui::FontWeight::MEDIUM))
+                .child(entry.name.clone())
+                .into_any_element(),
+        };
         let mut cell = div()
             .id(("file-entry", index))
             .tooltip(move |window, cx| {
@@ -1304,11 +1367,14 @@ impl FilePane {
             .min_w_0()
             .h_full()
             .flex()
-            .bg(if self.selected == Some(index) {
-                selected
+            .border_1()
+            .border_color(if is_cursor && !grid {
+                accent.opacity(0.5)
             } else {
-                background
+                gpui::transparent_black()
             })
+            .bg(if is_selected { selected } else { background })
+            .when(self.is_cut(&entry.path), |d| d.opacity(0.5))
             .text_color(foreground)
             .hover(move |style| style.bg(hover));
         if grid {
@@ -1318,8 +1384,7 @@ impl FilePane {
                 .p_3()
                 .gap_2()
                 .rounded_md()
-                .border_1()
-                .border_color(if self.selected == Some(index) {
+                .border_color(if is_selected || spring {
                     accent
                 } else {
                     border
@@ -1332,15 +1397,7 @@ impl FilePane {
                         .justify_center()
                         .child(icon.size(px(30.))),
                 )
-                .child(
-                    div()
-                        .text_sm()
-                        .flex_shrink_0()
-                        .h(px(20.))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .truncate()
-                        .child(entry.name.clone()),
-                )
+                .child(div().flex_shrink_0().child(name))
                 .child(
                     div()
                         .flex()
@@ -1370,7 +1427,7 @@ impl FilePane {
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(div().text_sm().truncate().child(entry.name.clone()))
+                        .child(name)
                         .child(div().text_xs().text_color(muted).child(file_kind(entry))),
                 )
                 .child(
@@ -1404,6 +1461,7 @@ impl FilePane {
             .dropdown_menu(move |menu, _, cx| {
                 if let Some(view) = overflow_view.upgrade() {
                     view.update(cx, |state, cx| {
+                        state.ensure_selected(&overflow_target.path);
                         state.action_menu(overflow_target.clone(), menu, cx)
                     })
                 } else {
@@ -1415,30 +1473,73 @@ impl FilePane {
         } else {
             cell.child(options)
         };
-        cell.on_click(
+        let clicked = entry.path.clone();
+        cell = cell.on_click(
             cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                if this.rename.is_some() {
+                    return;
+                }
                 this.list_focus.focus(window, cx);
-                this.selected = Some(index);
-                if event.click_count() == 2
-                    && let Some(entry) = this.entries.get(index)
-                {
-                    if entry.is_directory {
-                        this.enqueue(Job::List(entry.path.clone()), cx);
-                    } else {
-                        this.pick_download(window, cx);
+                let modifiers = event.modifiers();
+                if event.click_count() == 2 && !modifiers.shift && !modifiers.control {
+                    if let Some(entry) = this.entry_for(&clicked).cloned() {
+                        this.selection.select_only(&clicked);
+                        this.open_entry(entry, window, cx);
                     }
+                } else {
+                    this.click_entry(&clicked, &modifiers);
                 }
                 cx.notify();
             }),
-        )
-        .context_menu(move |menu, _, cx| {
-            if let Some(view) = weak.upgrade() {
-                view.update(cx, |state, cx| state.action_menu(target.clone(), menu, cx))
-            } else {
-                menu
-            }
-        })
-        .into_any_element()
+        );
+        if self.available && renaming.is_none() {
+            let value = self.drag_value(entry, cx.entity_id());
+            cell = cell.on_drag(value, |items, _, _, cx| {
+                cx.new(|_| dnd::DragGhost::new(items.clone()))
+            });
+        }
+        if folder {
+            let hovered = entry.path.clone();
+            cell = self
+                .folder_drop_target(cell, entry.path.clone(), cx)
+                .on_drag_move(cx.listener(
+                    move |this, event: &gpui::DragMoveEvent<dnd::DraggedItems>, window, cx| {
+                        this.spring_hover(&hovered, event.bounds, event.event.position, window, cx);
+                    },
+                ));
+        }
+        let pulse = self
+            .drop_pulse
+            .as_ref()
+            .filter(|(path, at)| *path == entry.path && at.elapsed() < Duration::from_millis(600))
+            .map(|(_, at)| *at);
+        let _ = pulse.map(|at| at.elapsed());
+        let reduced = cx.reduce_motion();
+        let element = cell
+            .context_menu(move |menu, _, cx| {
+                if let Some(view) = weak.upgrade() {
+                    view.update(cx, |state, cx| {
+                        state.ensure_selected(&target.path);
+                        cx.notify();
+                        state.action_menu(target.clone(), menu, cx)
+                    })
+                } else {
+                    menu
+                }
+            })
+            .into_any_element();
+        match pulse {
+            // A folder that just received a drop pulses once.
+            Some(_) if !reduced => gpui::AnimationExt::with_animation(
+                div().flex_1().min_w_0().h_full().flex().child(element),
+                ("drop-pulse", self.drop_serial as usize),
+                gpui::Animation::new(Duration::from_millis(500))
+                    .with_easing(crate::design::spring_out),
+                |d, t| d.opacity(0.55 + 0.45 * t),
+            )
+            .into_any_element(),
+            _ => element,
+        }
     }
 }
 impl Drop for FilePane {
@@ -1487,22 +1588,7 @@ impl FilePane {
             .items_center()
             .gap_2()
             .p_3()
-            .child(
-                Button::new("up")
-                    .small()
-                    .ghost()
-                    .label(tr("file-up"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let parent = this
-                            .directory
-                            .trim_end_matches('/')
-                            .rsplit_once('/')
-                            .map(|(path, _)| if path.is_empty() { "/" } else { path })
-                            .unwrap_or("/")
-                            .to_string();
-                        this.enqueue(Job::List(parent), cx);
-                    })),
-            )
+            .child(self.history_controls(cx))
             .child(
                 Button::new("refresh")
                     .small()
@@ -1538,7 +1624,7 @@ impl FilePane {
                 Button::new("download")
                     .small()
                     .label(tr("file-download"))
-                    .disabled(self.selected.is_none() || !self.available)
+                    .disabled(self.selection.is_empty() || !self.available)
                     .on_click(cx.listener(|this, _, window, cx| this.pick_download(window, cx))),
             )
             .child(
@@ -1546,14 +1632,8 @@ impl FilePane {
                     .small()
                     .ghost()
                     .label(tr("file-delete"))
-                    .disabled(self.selected.is_none() || !self.available)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(entry) = this.selected.and_then(|index| this.entries.get(index))
-                        {
-                            this.pending_delete = Some(entry.path.clone());
-                        }
-                        cx.notify();
-                    })),
+                    .disabled(self.selection.is_empty() || !self.available)
+                    .on_click(cx.listener(|this, _, _, cx| this.request_delete_selection(cx))),
             )
             .child(
                 div().flex_1().min_w_0().max_w(px(480.)).child(
@@ -1691,32 +1771,13 @@ impl FilePane {
                     .items_center()
                     .justify_between()
                     .child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .child(
-                                Button::new("up")
-                                    .small()
-                                    .ghost()
-                                    .label(tr("file-up"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        let path = &this.directory;
-                                        let parent = path
-                                            .trim_end_matches('/')
-                                            .rsplit_once('/')
-                                            .map(|(p, _)| if p.is_empty() { "/" } else { p })
-                                            .unwrap_or("/")
-                                            .to_string();
-                                        this.enqueue(Job::List(parent), cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("refresh")
-                                    .small()
-                                    .ghost()
-                                    .label(tr("file-refresh"))
-                                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-                            ),
+                        div().flex().gap_1().child(self.history_controls(cx)).child(
+                            Button::new("refresh")
+                                .small()
+                                .ghost()
+                                .label(tr("file-refresh"))
+                                .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                        ),
                     )
                     .child(
                         crate::design::PrimaryAction::new("upload")
@@ -1802,15 +1863,23 @@ impl FilePane {
         let muted = cx.theme().muted_foreground;
         let mut bar = div().flex().items_center().gap_1();
         for (index, (label, path)) in breadcrumbs(&self.directory).into_iter().enumerate() {
+            let target = path.clone();
+            let crumb = div()
+                .id(("file-breadcrumb-target", index))
+                .rounded_md()
+                .border_1()
+                .border_color(gpui::transparent_black());
             bar = bar
                 .child(
-                    Button::new(("file-breadcrumb", index))
-                        .small()
-                        .ghost()
-                        .label(label)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.enqueue(Job::List(path.clone()), cx)
-                        })),
+                    self.folder_drop_target(crumb, target, cx).child(
+                        Button::new(("file-breadcrumb", index))
+                            .small()
+                            .ghost()
+                            .label(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.navigate(path.clone(), Navigation::Visit, cx)
+                            })),
+                    ),
                 )
                 .child(div().text_color(muted).child("/"));
         }
@@ -1939,12 +2008,19 @@ impl FilePane {
     fn entries_view(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
+        let (band_fill, band_border) = (theme.primary.opacity(0.12), theme.primary.opacity(0.7));
+        let listing = div()
+            .id("file-listing")
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .border_1()
+            .border_color(gpui::transparent_black());
+        let listing = self.listing_interactions(listing, cx);
         if self.visible.is_empty() {
-            (div()
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .flex_col()
+            return listing
                 .justify_center()
                 .items_center()
                 .gap_2()
@@ -1959,47 +2035,86 @@ impl FilePane {
                     tr("file-empty-help")
                 } else {
                     tr("file-no-matches-help")
-                })))
-            .into_any_element()
-        } else {
-            let rows = self.visible.len().div_ceil(self.columns);
-            (uniform_list(
-                "file-entries",
-                rows,
-                cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
-                    range
-                        .map(|row| {
-                            let start = row * this.columns;
-                            let end = (start + this.columns).min(this.visible.len());
-                            let indices = this.visible[start..end].to_vec();
-                            let mut line = div().w_full().flex().gap_3().h(px(
-                                if this.full_page && this.grid {
-                                    164.
-                                } else {
-                                    56.
-                                },
-                            ));
-                            if this.full_page && this.grid {
-                                line = line.px_3().py_2();
-                            }
-                            for index in indices {
-                                line = line.child(this.entry_element(index, cx));
-                            }
-                            if this.full_page && this.grid {
-                                for _ in end - start..this.columns {
-                                    line = line.child(div().flex_1().min_w_0());
-                                }
-                            }
-                            line
-                        })
-                        .collect()
-                }),
-            )
-            .track_scroll(&self.list_scroll)
-            .flex_1()
-            .min_h_0())
-            .into_any_element()
+                }))
+                .into_any_element();
         }
+        let rows = self.visible.len().div_ceil(self.columns);
+        let generation = self.listing_generation;
+        let reduced = cx.reduce_motion();
+        let list = uniform_list(
+            "file-entries",
+            rows,
+            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                range
+                    .map(|row| {
+                        let start = row * this.columns;
+                        let end = (start + this.columns).min(this.visible.len());
+                        let indices = this.visible[start..end].to_vec();
+                        let grid = this.full_page && this.grid;
+                        let mut line =
+                            div()
+                                .w_full()
+                                .flex()
+                                .gap_3()
+                                .h(px(if grid { 164. } else { 56. }));
+                        if grid {
+                            line = line.px_3().py_2();
+                        }
+                        for index in indices {
+                            line = line.child(this.entry_element(index, cx));
+                        }
+                        if grid {
+                            // Fillers match a cell's padding and border so every row lines up.
+                            for _ in end - start..this.columns {
+                                line = line.child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .p_3()
+                                        .border_1()
+                                        .border_color(gpui::transparent_black()),
+                                );
+                            }
+                        }
+                        // A new folder's first rows fade and slide in once.
+                        if row < 24 && !reduced {
+                            gpui::AnimationExt::with_animation(
+                                line,
+                                (
+                                    "file-row",
+                                    generation.wrapping_mul(64).wrapping_add(row as u64) as usize,
+                                ),
+                                gpui::Animation::new(Duration::from_millis(180 + row as u64 * 12))
+                                    .with_easing(crate::design::spring_out),
+                                |d, t| d.opacity(t).mt(px(6. * (1. - t))),
+                            )
+                            .into_any_element()
+                        } else {
+                            line.into_any_element()
+                        }
+                    })
+                    .collect()
+            }),
+        )
+        .track_scroll(&self.list_scroll)
+        .flex_1()
+        .min_h_0();
+        listing
+            .child(list)
+            .when_some(self.band_rect(), |d, rect| {
+                d.child(
+                    div()
+                        .absolute()
+                        .left(rect.origin.x)
+                        .top(rect.origin.y)
+                        .w(rect.size.width)
+                        .h(rect.size.height)
+                        .bg(band_fill)
+                        .border_1()
+                        .border_color(band_border),
+                )
+            })
+            .into_any_element()
     }
     fn file_actions(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         if self.full_page {
@@ -2023,7 +2138,7 @@ impl FilePane {
                         Button::new("download")
                             .small()
                             .label(tr("file-download"))
-                            .disabled(self.selected.is_none() || !self.available)
+                            .disabled(self.selection.is_empty() || !self.available)
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.pick_download(window, cx)),
                             ),
@@ -2033,15 +2148,10 @@ impl FilePane {
                             .small()
                             .ghost()
                             .label(tr("file-delete"))
-                            .disabled(self.selected.is_none() || !self.available)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(entry) =
-                                    this.selected.and_then(|index| this.entries.get(index))
-                                {
-                                    this.pending_delete = Some(entry.path.clone());
-                                }
-                                cx.notify();
-                            })),
+                            .disabled(self.selection.is_empty() || !self.available)
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.request_delete_selection(cx)),
+                            ),
                     ),
             )
             .child(
@@ -2075,7 +2185,23 @@ impl FilePane {
             )
             .into_any_element()
     }
-    fn delete_confirmation(&self, path: String, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn delete_confirmation(&self, paths: Vec<String>, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let names = paths
+            .iter()
+            .take(5)
+            .map(|path| path.rsplit('/').next().unwrap_or(path).to_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let summary = if paths.len() > 5 {
+            format!(
+                "{names} {} {} {}",
+                tr("file-and"),
+                paths.len() - 5,
+                tr("file-more")
+            )
+        } else {
+            names
+        };
         div()
             .mx_3()
             .mb_3()
@@ -2086,8 +2212,12 @@ impl FilePane {
             .flex()
             .flex_col()
             .gap_2()
-            .child("Permanently delete this item and everything inside it? This cannot be undone.")
-            .child(div().text_xs().child(path))
+            .child(if paths.len() == 1 {
+                tr("file-delete-one-help")
+            } else {
+                format!("{} {}", paths.len(), tr("file-delete-many-help"))
+            })
+            .child(div().text_xs().child(summary))
             .child(
                 div()
                     .flex()
@@ -2098,10 +2228,10 @@ impl FilePane {
                             .danger()
                             .label(tr("file-delete-permanently"))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(path) = this.pending_delete.take() {
+                                if let Some(paths) = this.pending_delete.take() {
                                     this.enqueue(
                                         Job::Delete {
-                                            path,
+                                            paths,
                                             control: TransferControl::default(),
                                         },
                                         cx,
@@ -2228,47 +2358,21 @@ impl FilePane {
                     ),
             );
         }
-        if let Some((path, _)) = &task.replacement {
+        if let Some(pending) = &task.conflict {
             card = card
+                .child(div().text_xs().child(format!(
+                    "{} {}",
+                    tr("upload-file-exists"),
+                    pending.conflict.destination
+                )))
                 .child(
-                    div()
-                        .text_xs()
-                        .child(format!("{} {path}", tr("upload-file-exists"))),
-                )
-                .child(
-                    crate::design::PrimaryAction::new(("transfer-replace", id))
+                    crate::design::PrimaryAction::new(("transfer-review", id))
                         .small()
-                        .label(tr("upload-replace"))
-                        .on_click(cx.listener(move |this, _, _, cx| this.replace_transfer(id, cx))),
+                        .label(tr("conflict-review"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.review_conflict(id, window, cx)
+                        })),
                 );
-        }
-        if matches!(
-            task.replacement.as_ref(),
-            Some((_, ReplacementReply::Local(_)))
-        ) {
-            card = card.child(
-                div().flex().flex_wrap().gap_1().children(
-                    [
-                        (DownloadDecision::Skip, "download-skip"),
-                        (
-                            DownloadDecision::ReplaceRemaining,
-                            "download-replace-remaining",
-                        ),
-                        (DownloadDecision::SkipRemaining, "download-skip-remaining"),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, (decision, label))| {
-                        Button::new(("download-conflict", id * 4 + index as u64))
-                            .xsmall()
-                            .ghost()
-                            .label(tr(label))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.decide_download(id, decision, cx)
-                            }))
-                    }),
-                ),
-            );
         }
         if let Some(failure) = &task.failure {
             card = card.child(div().text_xs().text_color(muted).child(failure.clone()));
@@ -2276,19 +2380,92 @@ impl FilePane {
         card.into_any_element()
     }
     fn status_bar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let selected = self.selected_entries();
+        let summary = (!selected.is_empty()).then(|| {
+            let bytes: u64 = selected
+                .iter()
+                .filter(|entry| !entry.is_directory)
+                .filter_map(|entry| entry.size)
+                .sum();
+            format!(
+                "{} {} · {}",
+                selected.len(),
+                tr("file-selected"),
+                format_bytes(bytes)
+            )
+        });
         div()
             .px_3()
             .py_2()
+            .flex()
+            .gap_3()
             .text_xs()
             .text_color(cx.theme().muted_foreground)
             .border_t_1()
             .border_color(cx.theme().border)
-            .child(self.message.clone())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(self.message.clone()),
+            )
+            .when_some(summary, |d, summary| {
+                d.child(div().flex_shrink_0().child(summary))
+            })
+            .into_any_element()
+    }
+    /// Back, Forward and Up; Up also accepts drops into the parent folder.
+    fn history_controls(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let up = div()
+            .id("file-up-target")
+            .rounded_md()
+            .border_1()
+            .border_color(gpui::transparent_black());
+        let up = match browser::parent_of(&self.directory) {
+            Some(parent) => self.folder_drop_target(up, parent, cx),
+            None => up,
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                Button::new("file-back")
+                    .small()
+                    .ghost()
+                    .icon(IconName::ArrowLeft)
+                    .tooltip(tr("file-back"))
+                    .accessibility_label(tr("file-back"))
+                    .disabled(!self.history.can_go_back() || !self.available)
+                    .on_click(cx.listener(|this, _, _, cx| this.go_back(cx))),
+            )
+            .child(
+                Button::new("file-forward")
+                    .small()
+                    .ghost()
+                    .icon(IconName::ArrowRight)
+                    .tooltip(tr("file-forward"))
+                    .accessibility_label(tr("file-forward"))
+                    .disabled(!self.history.can_go_forward() || !self.available)
+                    .on_click(cx.listener(|this, _, _, cx| this.go_forward(cx))),
+            )
+            .child(
+                up.child(
+                    Button::new("up")
+                        .small()
+                        .ghost()
+                        .label(tr("file-up"))
+                        .disabled(browser::parent_of(&self.directory).is_none())
+                        .on_click(cx.listener(|this, _, _, cx| this.go_up(cx))),
+                ),
+            )
             .into_any_element()
     }
 }
 impl Render for FilePane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.schedule_conflict(window, cx);
         if self.browser_dirty {
             self.visible = visible_entries(
                 &self.entries,
@@ -2300,79 +2477,34 @@ impl Render for FilePane {
             self.browser_dirty = false;
         }
         self.columns = if self.full_page && self.grid {
-            ((f32::from(window.viewport_size().width) - 280.) / 210.)
+            ((f32::from(window.viewport_size().width) - 480.) / 210.)
                 .floor()
                 .max(1.) as usize
         } else {
             1
         };
-        if self
-            .selected
-            .is_some_and(|index| !self.visible.contains(&index))
-        {
-            self.selected = None;
-        }
+        self.prune_selection();
         let theme = cx.theme();
         let (background, foreground) = (theme.sidebar, theme.sidebar_foreground);
         let mut pane = div()
             .id("file-pane")
             .track_focus(&self.list_focus)
+            .on_mouse_down(
+                gpui::MouseButton::Navigate(gpui::NavigationDirection::Back),
+                cx.listener(|this, _, _, cx| this.go_back(cx)),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Navigate(gpui::NavigationDirection::Forward),
+                cx.listener(|this, _, _, cx| this.go_forward(cx)),
+            )
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                if !this.list_focus.is_focused(window) || this.visible.is_empty() {
+                // Inputs (path bar, search, rename) keep their own keys.
+                if !this.list_focus.is_focused(window) {
                     return;
                 }
-                let position = this
-                    .selected
-                    .and_then(|index| this.visible.iter().position(|&i| i == index));
-                let step = this.columns;
-                match event.keystroke.key.as_str() {
-                    "f10" if event.keystroke.modifiers.shift => {
-                        this.keyboard_actions(window, cx);
-                        cx.stop_propagation();
-                        return;
-                    }
-                    "down" => {
-                        this.selected = Some(
-                            this.visible
-                                [position.map_or(0, |i| (i + step).min(this.visible.len() - 1))],
-                        )
-                    }
-                    "up" => {
-                        this.selected =
-                            Some(this.visible[position.map_or(0, |i| i.saturating_sub(step))])
-                    }
-                    "right" => {
-                        this.selected = Some(
-                            this.visible
-                                [position.map_or(0, |i| (i + 1).min(this.visible.len() - 1))],
-                        )
-                    }
-                    "left" => {
-                        this.selected =
-                            Some(this.visible[position.map_or(0, |i| i.saturating_sub(1))])
-                    }
-                    "home" => this.selected = Some(this.visible[0]),
-                    "end" => this.selected = this.visible.last().copied(),
-                    "enter" => {
-                        if let Some(entry) = this.selected.and_then(|i| this.entries.get(i)) {
-                            if entry.is_directory {
-                                this.enqueue(Job::List(entry.path.clone()), cx);
-                            } else {
-                                this.pick_download(window, cx);
-                            }
-                        }
-                    }
-                    _ => return,
+                if this.handle_list_key(event, window, cx) {
+                    cx.stop_propagation();
                 }
-                if let Some(index) = this
-                    .selected
-                    .and_then(|index| this.visible.iter().position(|&i| i == index))
-                {
-                    this.list_scroll
-                        .scroll_to_item(index / this.columns, gpui::ScrollStrategy::Nearest);
-                }
-                cx.stop_propagation();
-                cx.notify();
             }))
             .flex()
             .flex_col()
@@ -2397,14 +2529,21 @@ impl Render for FilePane {
             .child(
                 div()
                     .flex()
-                    .flex_col()
                     .flex_1()
                     .min_h(px(120.))
-                    .child(self.entries_view(cx)),
+                    .when(self.full_page, |d| d.child(self.places_view(cx)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.entries_view(cx)),
+                    ),
             )
             .child(self.file_actions(cx));
-        if let Some(path) = self.pending_delete.clone() {
-            pane = pane.child(self.delete_confirmation(path, cx));
+        if let Some(paths) = self.pending_delete.clone() {
+            pane = pane.child(self.delete_confirmation(paths, cx));
         }
         if !self.full_page || !self.transfers.is_empty() {
             pane = pane.child(self.transfers_view(cx));
@@ -2429,7 +2568,7 @@ fn interrupt_transfers(transfers: &mut [TransferTask]) {
         if task.state.active() {
             task.bytes = task.control.batch_transferred();
             task.control.cancel();
-            task.replacement = None;
+            task.conflict = None;
             task.state = TransferState::Failed;
             task.failure = Some(tr("file-interrupted-transfer"));
         }
@@ -2632,8 +2771,8 @@ async fn execute(
                     .ok_or_else(|| tr("file-invalid-name"))?;
                 let remote = opsssh_drop::join_remote(&directory, name)?;
                 client
-                    .upload_tree_with_confirmation(&path, &remote, &control, |remote| {
-                        request_upload_replacement(updates, id, remote, &control)
+                    .upload_tree_with_decisions(&path, &remote, &control, |conflict| {
+                        conflict::request_conflict(updates, id, conflict, &control)
                     })
                     .await?;
                 inserted.push(opsssh_drop::quote(&remote, opsssh_drop::Shell::Posix)?);
@@ -2655,11 +2794,26 @@ async fn execute(
         Job::Download {
             remote,
             local,
+            confirmed_existing,
             control,
         } => {
             let report = client
-                .download_tree_with_confirmation(&remote, &local, &control, |path| {
-                    request_download_replacement(updates, id, path, &control)
+                .download_tree_with_decisions(&remote, &local, &control, |conflict| {
+                    let preconfirmed = preconfirmed_download(
+                        &local,
+                        confirmed_existing,
+                        std::path::Path::new(&conflict.destination),
+                    );
+                    let control = control.clone();
+                    async move {
+                        if preconfirmed {
+                            // The save dialog already asked; never ask twice for the same file.
+                            control.ensure_active()?;
+                            Ok(ConflictReply::once(ConflictDecision::Replace))
+                        } else {
+                            conflict::request_conflict(updates, id, conflict, &control).await
+                        }
+                    }
                 })
                 .await?;
             updates
@@ -2677,12 +2831,30 @@ async fn execute(
                 .await?;
             refresh_parent(client, &path, updates).await;
         }
-        Job::Delete { path, control } => {
-            let report = client.delete_tree(&path, &control).await?;
+        Job::Delete { paths, control } => {
+            let mut report = opsssh_sftp::OperationReport::default();
+            for path in &paths {
+                if control.ensure_active().is_err() {
+                    report.cancelled = true;
+                    break;
+                }
+                // One failing item is reported; the rest are still deleted.
+                match client.delete_tree(path, &control).await {
+                    Ok(part) => {
+                        report.changed += part.changed;
+                        report.skipped += part.skipped;
+                        report.failures.extend(part.failures);
+                        report.cancelled |= part.cancelled;
+                    }
+                    Err(error) => report.failures.push(format!("{path}: {error}")),
+                }
+            }
+            if let Some(path) = paths.first() {
+                refresh_parent(client, path, updates).await;
+            }
             updates
-                .send(Update::Message(format!("Delete: {report}")))
+                .send(Update::Message(format!("{}: {report}", tr("file-delete"))))
                 .await?;
-            refresh_parent(client, &path, updates).await;
             actions::report_result(&report)?;
         }
         Job::Attributes { path, serial } => {
@@ -2734,113 +2906,61 @@ async fn execute(
                 .await?;
             actions::report_result(&report)?;
         }
-        Job::RemoteTransfer {
-            source,
-            target,
-            copy,
+        Job::Transfer {
+            items,
+            destination,
+            mode,
             control,
         } => {
-            let (source, target) = client.transfer_target(&source, &target).await?;
-            let mut replace = false;
-            let mut atomic = None;
-            let mut reviewed = None;
-            if client.exists(&target).await? {
-                let a = client.attributes(&target).await?;
-                let s = client.attributes(&source).await?;
-                if a.is_directory || a.is_symlink || !a.is_regular || !s.is_regular {
-                    return Err(
-                        "Destination exists. Choose another name; folders are never merged.".into(),
-                    );
-                }
-                if !copy {
-                    atomic = Some(actions::atomic_renamer(commands, &control).await?);
-                }
-                reviewed = Some((s, a));
-                request_upload_replacement(updates, id, target.clone(), &control).await?;
-                replace = true;
-            }
-            if let Some((s, a)) = &reviewed
-                && (client.attributes(&source).await? != *s
-                    || client.attributes(&target).await? != *a)
-            {
-                return Err(
-                    "Source or destination changed during confirmation; review again".into(),
-                );
-            }
-            let result = if copy {
-                client
-                    .copy_tree(&source, &target, replace, &control)
-                    .await
-                    .and_then(|r| {
-                        actions::report_result(&r)?;
-                        Ok(r.to_string())
-                    })
-            } else if let Some(renamer) = atomic {
-                let (s, a) = reviewed.as_ref().ok_or("Missing replacement review")?;
-                renamer
-                    .replace(&source, &target, s, a, &control)
-                    .await
-                    .map(|()| "Moved and replaced atomically".into())
+            // posix-rename makes a confirmed move-replace atomic; without it a safe swap is used.
+            let renamer = if mode == TransferMode::Move {
+                actions::atomic_renamer(commands, &control).await.ok()
             } else {
-                client
-                    .rename_item(&source, &target, &control)
-                    .await
-                    .map(|()| "Moved successfully".into())
+                None
             };
-            refresh_parent(client, &source, updates).await;
-            refresh_parent(client, &target, updates).await;
-            updates.send(Update::Message(result?)).await?;
+            let report = client
+                .transfer_items(
+                    &items,
+                    &destination,
+                    mode,
+                    renamer.as_ref(),
+                    &control,
+                    |conflict| conflict::request_conflict(updates, id, conflict, &control),
+                )
+                .await;
+            for item in &items {
+                refresh_parent(client, &item.source, updates).await;
+            }
+            refresh_directory(client, &destination, updates).await;
+            let report = report?;
+            updates
+                .send(Update::Message(format!(
+                    "{}: {report}",
+                    tr(if mode == TransferMode::Copy {
+                        "file-copy-complete"
+                    } else {
+                        "file-move-complete"
+                    })
+                )))
+                .await?;
+            actions::report_result(&report)?;
         }
     }
     Ok(())
 }
-async fn request_download_replacement(
-    updates: &Sender<Update>,
-    id: u64,
-    path: PathBuf,
-    control: &TransferControl,
-) -> opsssh_sftp::Result<DownloadDecision> {
-    control.ensure_active()?;
-    let (reply, receive) = async_channel::bounded(1);
-    updates
-        .send(Update::DownloadReplace(id, path, reply))
-        .await?;
-    loop {
-        tokio::select! {
-            decision = receive.recv() => { control.ensure_active()?; return Ok(decision?); },
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                control.ensure_active()?;
-                if updates.is_closed() { return Err("Download pane closed; existing file kept".into()); }
-            }
-        }
-    }
+/// True when the native save dialog chose an existing regular file, which the OS
+/// dialog has already asked to replace.
+fn picked_existing_file(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
-async fn request_upload_replacement(
-    updates: &Sender<Update>,
-    id: u64,
-    path: String,
-    control: &TransferControl,
-) -> opsssh_sftp::Result<()> {
-    control.ensure_active()?;
-    let (reply, receive) = async_channel::bounded(1);
-    updates.send(Update::Replace(id, path, reply)).await?;
-    loop {
-        tokio::select! {
-            decision = receive.recv() => {
-                if decision? {
-                    control.ensure_active()?;
-                    return Ok(());
-                }
-                return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "upload cancelled; existing file kept").into());
-            }
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                control.ensure_active()?;
-                if updates.is_closed() {
-                    return Err("upload pane closed; existing file kept".into());
-                }
-            }
-        }
-    }
+/// Only the exact file confirmed by the save dialog skips OpsSSH's replacement prompt.
+/// Files inside a downloaded folder were never shown by the dialog and still ask.
+fn preconfirmed_download(
+    chosen: &std::path::Path,
+    confirmed_existing: bool,
+    conflict: &std::path::Path,
+) -> bool {
+    confirmed_existing && conflict == chosen
 }
 async fn refresh_parent(client: &SftpClient, path: &str, updates: &Sender<Update>) {
     let parent = path
@@ -2866,27 +2986,38 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(gpui_component::init);
-        let (pane, cx) = cx.add_window_view(FilePane::preview);
-        cx.update(|_, cx| {
+        let mut pane = None;
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| FilePane::preview(window, cx));
+            pane = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let pane = pane.unwrap();
+        let replace = ConflictReply::once(ConflictDecision::Replace);
+        cx.update(|window, cx| {
             pane.update(cx, |pane, cx| {
                 pane.preview_transfer(false);
                 let id = pane.transfers[0].id;
                 pane.dismiss_transfer_notice(id, cx);
                 let (reply, receive) = async_channel::bounded(1);
-                pane.request_replacement(id, "/opt/test.txt".into(), reply, cx);
+                let conflict = conflict::sample_conflict("/opt/test.txt");
+                pane.receive_conflict(id, conflict, reply, window, cx);
                 assert!(!pane.transfers[0].dismissed);
                 assert!(pane.transfers[0].state == TransferState::AwaitingReplace);
+                assert_eq!(pane.conflict_dialog, Some(id), "the dialog asks right away");
                 assert!(receive.try_recv().is_err(), "replace must not be automatic");
-                pane.replace_transfer(id, cx);
-                assert_eq!(receive.try_recv(), Ok(true));
+                assert!(pane.resolve_conflict(id, replace, cx));
+                assert_eq!(receive.try_recv(), Ok(replace));
                 assert!(pane.transfers[0].state == TransferState::Running);
-                pane.replace_transfer(id, cx);
                 assert!(
-                    receive.try_recv().is_err(),
-                    "replace must only be sent once"
+                    !pane.resolve_conflict(id, replace, cx),
+                    "answered only once"
                 );
+                assert!(receive.try_recv().is_err());
                 let (reply, receive) = async_channel::bounded(1);
-                pane.request_replacement(id, "/opt/test.txt".into(), reply, cx);
+                pane.conflict_dialog = None;
+                let conflict = conflict::sample_conflict("/opt/test.txt");
+                pane.receive_conflict(id, conflict, reply, window, cx);
                 pane.dismiss_transfer_notice(id, cx);
                 assert!(pane.transfers[0].state == TransferState::Cancelling);
                 assert!(receive.try_recv().is_err());
@@ -2905,20 +3036,34 @@ mod tests {
             let (updates, receive) = async_channel::bounded(1);
             let control = TransferControl::default();
             let (result, ()) = tokio::join!(
-                request_upload_replacement(&updates, 42, "/opt/test.txt".into(), &control),
+                conflict::request_conflict(
+                    &updates,
+                    42,
+                    conflict::sample_conflict("/opt/test.txt"),
+                    &control
+                ),
                 async {
-                    let Update::Replace(id, path, reply) = receive.recv().await.unwrap() else {
+                    let Update::Conflict(id, conflict, reply) = receive.recv().await.unwrap()
+                    else {
                         panic!("expected collision");
                     };
-                    assert_eq!((id, path.as_str()), (42, "/opt/test.txt"));
-                    reply.send(true).await.unwrap();
+                    assert_eq!((id, conflict.destination.as_str()), (42, "/opt/test.txt"));
+                    reply
+                        .send(ConflictReply::once(ConflictDecision::KeepBoth))
+                        .await
+                        .unwrap();
                 }
             );
-            result.unwrap();
+            assert_eq!(result.unwrap().decision, ConflictDecision::KeepBoth);
             let (result, ()) = tokio::join!(
-                request_upload_replacement(&updates, 43, "/opt/test.txt".into(), &control),
+                conflict::request_conflict(
+                    &updates,
+                    43,
+                    conflict::sample_conflict("/opt/test.txt"),
+                    &control
+                ),
                 async {
-                    let Update::Replace(_, _, _reply) = receive.recv().await.unwrap() else {
+                    let Update::Conflict(_, _, _reply) = receive.recv().await.unwrap() else {
                         panic!("expected collision");
                     };
                     control.cancel();
@@ -2926,6 +3071,199 @@ mod tests {
                 }
             );
             assert!(result.is_err());
+        });
+    }
+
+    #[cfg(feature = "capture")]
+    fn queued(pane: &FilePane) -> Vec<Job> {
+        let receiver = pane._preview_jobs.as_ref().unwrap();
+        std::iter::from_fn(|| receiver.try_recv().ok().map(|queued| queued.job)).collect()
+    }
+
+    #[cfg(feature = "capture")]
+    fn transfer(job: &Job) -> (Vec<String>, String, TransferMode) {
+        let Job::Transfer {
+            items,
+            destination,
+            mode,
+            ..
+        } = job
+        else {
+            panic!("expected a transfer");
+        };
+        (
+            items.iter().map(|item| item.name.clone()).collect(),
+            destination.clone(),
+            *mode,
+        )
+    }
+
+    #[cfg(feature = "capture")]
+    #[gpui::test]
+    fn dragging_a_selection_moves_it_and_refuses_unsafe_targets(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (pane, cx) = cx.add_window_view(FilePane::preview);
+        cx.update(|window, cx| {
+            pane.update(cx, |this, cx| {
+                this.visible = (0..this.entries.len()).collect();
+                let toml = this.entries[2].clone();
+                let readme = this.entries[6].clone();
+                this.selection.select_only(&toml.path);
+                this.click_entry(
+                    &readme.path,
+                    &gpui::Modifiers {
+                        control: !cfg!(target_os = "macos"),
+                        platform: cfg!(target_os = "macos"),
+                        ..Default::default()
+                    },
+                );
+                let items = this.drag_value(&toml, cx.entity_id());
+                assert_eq!(items.paths.len(), 2, "the whole selection travels");
+                this.drop_items(&items, "/srv/application/logs".into(), window, cx);
+                let jobs = queued(this);
+                assert_eq!(jobs.len(), 1);
+                assert_eq!(
+                    transfer(&jobs[0]),
+                    (
+                        vec!["application.toml".into(), "README.md".into()],
+                        "/srv/application/logs".into(),
+                        TransferMode::Move
+                    )
+                );
+
+                // An unselected item is dragged alone.
+                let logs = this.entries[0].clone();
+                let folder = this.drag_value(&logs, cx.entity_id());
+                assert_eq!(folder.paths, vec![logs.path.clone()]);
+                for target in [
+                    logs.path.clone(),
+                    format!("{}/nested", logs.path),
+                    "/srv/application".into(),
+                ] {
+                    this.drop_items(&folder, target, window, cx);
+                }
+                let mut stale = folder.clone();
+                stale.generation += 1;
+                this.drop_items(&stale, "/srv".into(), window, cx);
+                assert!(
+                    queued(this).is_empty(),
+                    "self, descendant, no-op and stale drops"
+                );
+            })
+        });
+    }
+
+    #[cfg(feature = "capture")]
+    #[gpui::test]
+    fn cut_items_fade_until_pasted_and_copies_paste_repeatedly(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (pane, cx) = cx.add_window_view(FilePane::preview);
+        cx.update(|_, cx| {
+            pane.update(cx, |this, cx| {
+                this.visible = (0..this.entries.len()).collect();
+                let readme = this.entries[6].path.clone();
+                this.selection.select_only(&readme);
+                this.copy_selection(TransferMode::Move, cx);
+                assert!(this.is_cut(&readme));
+                // With one folder selected, Paste goes into that folder.
+                this.selection.select_only("/srv/application/releases");
+                let target = this.paste_target();
+                assert_eq!(target, "/srv/application/releases");
+                this.paste(target, cx);
+                assert!(this.clipboard.is_none() && !this.is_cut(&readme));
+                assert_eq!(transfer(&queued(this)[0]).2, TransferMode::Move);
+
+                this.selection.select_only(&readme);
+                this.copy_selection(TransferMode::Copy, cx);
+                this.selection.clear();
+                assert_eq!(this.paste_target(), "/srv/application");
+                this.paste(this.paste_target(), cx);
+                this.paste(this.paste_target(), cx);
+                assert_eq!(queued(this).len(), 2);
+                // A clipboard from an earlier connection is never replayed.
+                this.worker_generation += 1;
+                this.paste("/srv/application".into(), cx);
+                assert!(queued(this).is_empty() && this.clipboard.is_none());
+            })
+        });
+    }
+
+    #[cfg(feature = "capture")]
+    #[gpui::test]
+    fn inline_rename_validates_and_moves_within_the_folder(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (pane, cx) = cx.add_window_view(FilePane::preview);
+        cx.update(|window, cx| {
+            pane.update(cx, |this, cx| {
+                this.visible = (0..this.entries.len()).collect();
+                this.selection.select_only("/srv/application/README.md");
+                this.begin_rename(window, cx);
+                let input = this.rename.as_ref().unwrap().input.clone();
+                input.update(cx, |input, cx| input.set_value("bad/name", window, cx));
+                this.commit_rename(window, cx);
+                assert!(this.rename.as_ref().unwrap().error.is_some());
+                assert!(queued(this).is_empty());
+                input.update(cx, |input, cx| input.set_value("NOTES.md", window, cx));
+                this.commit_rename(window, cx);
+                assert!(this.rename.is_none());
+                assert_eq!(
+                    transfer(&queued(this)[0]),
+                    (
+                        vec!["NOTES.md".into()],
+                        "/srv/application".into(),
+                        TransferMode::Move
+                    )
+                );
+                // Escape-style cancel leaves nothing queued.
+                this.begin_rename(window, cx);
+                this.cancel_rename(window, cx);
+                assert!(this.rename.is_none() && queued(this).is_empty());
+            })
+        });
+    }
+
+    #[cfg(feature = "capture")]
+    #[gpui::test]
+    fn keyboard_selects_all_asks_before_delete_and_clears(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (pane, cx) = cx.add_window_view(FilePane::preview);
+        cx.update(|window, cx| {
+            pane.update(cx, |this, cx| {
+                this.list_focus.focus(window, cx);
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        let select_all = if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        };
+        cx.simulate_keystrokes(select_all);
+        cx.update(|_, cx| {
+            let this = pane.read(cx);
+            assert_eq!(this.selected_entries().len(), this.entries.len());
+        });
+        cx.simulate_keystrokes("delete");
+        cx.update(|_, cx| {
+            let this = pane.read(cx);
+            assert_eq!(this.pending_delete.as_ref().map(Vec::len), Some(7));
+            assert!(
+                queued(this).is_empty(),
+                "nothing is deleted before confirmation"
+            );
+        });
+        cx.simulate_keystrokes("escape");
+        cx.update(|_, cx| assert!(pane.read(cx).selected_entries().is_empty()));
+        cx.simulate_keystrokes("end shift-up");
+        cx.update(|_, cx| {
+            let names: Vec<_> = pane
+                .read(cx)
+                .selected_entries()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+            assert_eq!(names.len(), 2, "{names:?}");
         });
     }
 
@@ -3096,6 +3434,27 @@ mod tests {
         assert_eq!(format_modified(u32::MAX), "2106-02-07 UTC");
     }
     #[test]
+    fn save_dialog_confirmation_covers_only_the_existing_chosen_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("report.txt");
+        let folder = dir.path().join("logs");
+        std::fs::write(&file, b"old").unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        assert!(picked_existing_file(&file));
+        assert!(!picked_existing_file(&folder));
+        assert!(!picked_existing_file(&dir.path().join("missing.txt")));
+
+        assert!(preconfirmed_download(&file, true, &file));
+        // A file that did not exist when the dialog closed was never confirmed.
+        assert!(!preconfirmed_download(&file, false, &file));
+        // Files inside a downloaded folder were never shown by the save dialog.
+        assert!(!preconfirmed_download(
+            &folder,
+            true,
+            &folder.join("app.log")
+        ));
+    }
+    #[test]
     fn interrupted_transfers_retain_retry_descriptors_and_completed_work() {
         let control = TransferControl::default();
         let job = Job::Upload {
@@ -3118,7 +3477,7 @@ mod tests {
                 pending_insert: false,
                 insert_generation: None,
                 dismissed: false,
-                replacement: None,
+                conflict: None,
             },
             TransferTask {
                 id: 2,
@@ -3133,7 +3492,7 @@ mod tests {
                 pending_insert: false,
                 insert_generation: None,
                 dismissed: false,
-                replacement: None,
+                conflict: None,
             },
         ];
         interrupt_transfers(&mut tasks);

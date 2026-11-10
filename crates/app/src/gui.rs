@@ -1346,12 +1346,46 @@ impl Workspace {
         let Some(key) = tab.workspace_key.clone() else {
             return;
         };
+        let bookmarks = self
+            .store
+            .settings
+            .workspaces
+            .get(&key)
+            .map(|preference| preference.bookmarks.clone())
+            .unwrap_or_default();
         let preference = opsssh_store::WorkspacePreference {
             files_open: tab.files_visible,
             files_width: tab.files_width,
+            bookmarks,
         };
         let old = self.store.clone();
         self.store.settings.workspaces.insert(key, preference);
+        if !self.persist() {
+            self.store = old;
+        }
+        cx.notify();
+    }
+    fn save_bookmarks(
+        &mut self,
+        pane: &Entity<FilePane>,
+        bookmarks: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(key) = self
+            .sessions
+            .iter()
+            .find(|tab| tab.files.as_ref() == Some(pane))
+            .and_then(|tab| tab.workspace_key.clone())
+        else {
+            return;
+        };
+        let old = self.store.clone();
+        self.store
+            .settings
+            .workspaces
+            .entry(key)
+            .or_default()
+            .bookmarks = bookmarks;
         if !self.persist() {
             self.store = old;
         }
@@ -1598,8 +1632,17 @@ impl Workspace {
         };
         let directory = view.current_directory().unwrap_or(".").to_owned();
         let generation = view.connection_generation();
-        let files =
-            cx.new(|cx| FilePane::new(commands, fingerprint, directory.clone(), window, cx));
+        let bookmarks = self.sessions[index]
+            .workspace_key
+            .as_ref()
+            .and_then(|key| self.store.settings.workspaces.get(key))
+            .map(|preference| preference.bookmarks.clone())
+            .unwrap_or_default();
+        let files = cx.new(|cx| {
+            let mut pane = FilePane::new(commands, fingerprint, directory.clone(), window, cx);
+            pane.set_bookmarks(bookmarks, cx);
+            pane
+        });
         cx.observe(&files, |_, _, cx| cx.notify()).detach();
         cx.subscribe_in(&files, window, move |this, pane, event, window, cx| {
             let (id, text) = match event {
@@ -1643,6 +1686,10 @@ impl Workspace {
                 }
                 FilePaneEvent::DestinationValidated(request, path) => {
                     this.destination_validated(pane, *request, path.clone(), window, cx);
+                    return;
+                }
+                FilePaneEvent::BookmarksChanged(bookmarks) => {
+                    this.save_bookmarks(pane, bookmarks.clone(), cx);
                     return;
                 }
                 FilePaneEvent::DestinationFailed(request, error) => {

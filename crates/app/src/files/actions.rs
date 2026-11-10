@@ -10,6 +10,9 @@ pub(super) enum FileAction {
     NewTerminal,
     Download,
     Rename,
+    Cut,
+    CopyItems,
+    Paste,
     Copy,
     Move,
     CopyPath,
@@ -17,32 +20,43 @@ pub(super) enum FileAction {
     Delete,
 }
 impl FileAction {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Open => "Open",
-            Self::Terminal => "Open inside terminal",
-            Self::NewTerminal => "Open in Terminal tab",
-            Self::Download => "Download",
-            Self::Rename => "Rename",
-            Self::Copy => "Copy",
-            Self::Move => "Move",
-            Self::CopyPath => "Copy path",
-            Self::Permissions => "Permissions",
-            Self::Delete => "Delete",
-        }
+    fn label(self) -> String {
+        tr(match self {
+            Self::Open => "file-action-open",
+            Self::Terminal => "file-action-terminal",
+            Self::NewTerminal => "file-action-new-terminal",
+            Self::Download => "file-download",
+            Self::Rename => "file-action-rename",
+            Self::Cut => "file-action-cut",
+            Self::CopyItems => "file-action-copy",
+            Self::Paste => "file-action-paste-into",
+            Self::Copy => "file-action-copy-to",
+            Self::Move => "file-action-move-to",
+            Self::CopyPath => "file-action-copy-path",
+            Self::Permissions => "file-action-permissions",
+            Self::Delete => "file-delete",
+        })
     }
-    fn all() -> [Self; 10] {
-        [
-            Self::Open,
-            Self::Terminal,
-            Self::NewTerminal,
-            Self::Download,
-            Self::Rename,
-            Self::Copy,
-            Self::Move,
-            Self::CopyPath,
-            Self::Permissions,
-            Self::Delete,
+    /// Actions for one item, grouped by separators.
+    fn single(folder: bool) -> Vec<Vec<Self>> {
+        vec![
+            vec![Self::Open, Self::Terminal, Self::NewTerminal],
+            vec![Self::Download],
+            vec![Self::Cut, Self::CopyItems]
+                .into_iter()
+                .chain(folder.then_some(Self::Paste))
+                .collect(),
+            vec![Self::Rename, Self::Copy, Self::Move, Self::CopyPath],
+            vec![Self::Permissions],
+            vec![Self::Delete],
+        ]
+    }
+    /// Actions that apply to every selected item.
+    fn multiple() -> Vec<Vec<Self>> {
+        vec![
+            vec![Self::Download],
+            vec![Self::Cut, Self::CopyItems, Self::CopyPath],
+            vec![Self::Delete],
         ]
     }
 }
@@ -112,31 +126,43 @@ impl FilePane {
         mut menu: PopupMenu,
         cx: &Context<Self>,
     ) -> PopupMenu {
-        menu = menu.label(entry.name.clone()).separator();
-        for action in FileAction::all() {
-            if matches!(
-                action,
-                FileAction::Download
-                    | FileAction::Rename
-                    | FileAction::Permissions
-                    | FileAction::Delete
-            ) {
-                menu = menu.separator();
-            }
-            let weak = cx.entity().downgrade();
-            let target = entry.clone();
-            let enabled = self.available || action == FileAction::CopyPath;
-            let mut item = if action == FileAction::Delete {
-                PopupMenuItem::element(|_, cx| div().text_color(cx.theme().danger).child("Delete"))
-            } else {
-                PopupMenuItem::new(action.label())
-            };
-            item = item.disabled(!enabled).on_click(move |_, window, cx| {
-                let _ = weak.update(cx, |this, cx| {
-                    this.file_action(target.clone(), action, window, cx)
+        let selected = self.selected_entries();
+        let multiple = selected.len() > 1 && self.is_selected(&entry.path);
+        menu = menu.label(if multiple {
+            format!("{} {}", selected.len(), tr("file-items"))
+        } else {
+            entry.name.clone()
+        });
+        let groups = if multiple {
+            FileAction::multiple()
+        } else {
+            FileAction::single(entry.is_directory && !entry.is_symlink)
+        };
+        for group in groups {
+            menu = menu.separator();
+            for action in group {
+                let weak = cx.entity().downgrade();
+                let target = entry.clone();
+                let enabled = match action {
+                    FileAction::CopyPath => true,
+                    FileAction::Paste => self.available && self.clipboard.is_some(),
+                    _ => self.available,
+                };
+                let mut item = if action == FileAction::Delete {
+                    let label = action.label();
+                    PopupMenuItem::element(move |_, cx| {
+                        div().text_color(cx.theme().danger).child(label.clone())
+                    })
+                } else {
+                    PopupMenuItem::new(action.label())
+                };
+                item = item.disabled(!enabled).on_click(move |_, window, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.file_action(target.clone(), action, window, cx)
+                    });
                 });
-            });
-            menu = menu.item(item);
+                menu = menu.item(item);
+            }
         }
         menu
     }
@@ -152,16 +178,36 @@ impl FilePane {
         }
         match action {
             FileAction::Open => {
-                if entry.is_directory {
-                    self.enqueue(Job::List(entry.path), cx);
-                } else {
-                    self.download_entry(entry, window, cx);
-                }
+                self.open_entry(entry, window, cx);
             }
-            FileAction::Download => self.download_entry(entry, window, cx),
+            FileAction::Download => {
+                self.ensure_selected(&entry.path);
+                self.download_selection(window, cx);
+            }
+            FileAction::Cut | FileAction::CopyItems => {
+                self.ensure_selected(&entry.path);
+                self.copy_selection(
+                    if action == FileAction::Cut {
+                        TransferMode::Move
+                    } else {
+                        TransferMode::Copy
+                    },
+                    cx,
+                );
+            }
+            FileAction::Paste => self.paste(entry.path, cx),
             FileAction::CopyPath => {
-                cx.write_to_clipboard(ClipboardItem::new_string(entry.path));
-                self.message = "Remote path copied".into();
+                // The captured item decides when it is not part of the selection.
+                let paths = if self.is_selected(&entry.path) {
+                    self.selected_entries()
+                        .into_iter()
+                        .map(|entry| entry.path)
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![entry.path]
+                };
+                cx.write_to_clipboard(ClipboardItem::new_string(paths.join("\n")));
+                self.message = tr("file-paths-copied");
             }
             FileAction::Terminal | FileAction::NewTerminal => {
                 let directory = if entry.is_directory {
@@ -175,7 +221,8 @@ impl FilePane {
                 });
             }
             FileAction::Delete => {
-                self.pending_delete = Some(entry.path);
+                self.ensure_selected(&entry.path);
+                self.request_delete_selection(cx);
             }
             FileAction::Permissions => {
                 self.editor_serial = self.editor_serial.wrapping_add(1);
@@ -213,7 +260,11 @@ impl FilePane {
                 );
                 self.open_file_dialog(window, cx);
             }
-            FileAction::Rename | FileAction::Copy | FileAction::Move => {
+            FileAction::Rename => {
+                self.selection.select_only(&entry.path);
+                self.begin_rename(window, cx);
+            }
+            FileAction::Copy | FileAction::Move => {
                 let destination =
                     cx.new(|cx| InputState::new(window, cx).default_value(parent(&entry.path)));
                 let name =
@@ -246,12 +297,14 @@ impl FilePane {
         let picker = cx.prompt_for_new_path(&home, Some(&entry.name));
         cx.spawn_in(window, async move |this, cx| match picker.await {
             Ok(Ok(Some(local))) => {
+                let confirmed_existing = super::picked_existing_file(&local);
                 let _ = this.update(cx, |this, cx| {
                     if this.available && this.worker_generation == generation {
                         this.enqueue(
                             Job::Download {
                                 remote: entry.path,
                                 local,
+                                confirmed_existing,
                                 control: TransferControl::default(),
                             },
                             cx,
@@ -270,7 +323,7 @@ impl FilePane {
         .detach();
     }
     pub(super) fn keyboard_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(entry) = self.selected.and_then(|i| self.entries.get(i)).cloned() {
+        if let Some(entry) = self.focused_entry() {
             self.editor = Some(FileEditor::Actions(entry));
             self.open_file_dialog(window, cx);
             cx.notify();
@@ -287,9 +340,9 @@ impl FilePane {
                 return dialog;
             };
             let title = match editor {
-                FileEditor::Permissions(_) => "Permissions",
+                FileEditor::Permissions(_) => tr("file-action-permissions"),
                 FileEditor::Transfer { action, .. } => action.label(),
-                FileEditor::Actions(_) => "File actions",
+                FileEditor::Actions(_) => tr("file-actions"),
             };
             let body = state.editor_body(window, cx, weak.clone());
             let footer = state.editor_footer(cx, weak.clone());
@@ -337,14 +390,18 @@ impl FilePane {
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .child(entry.name.clone()),
                 );
-                for action in FileAction::all() {
+                let folder = entry.is_directory && !entry.is_symlink;
+                for action in FileAction::single(folder).into_iter().flatten() {
                     let target = entry.clone();
                     let weak = weak.clone();
                     body = body.child(
-                        Button::new(action.label())
+                        Button::new(gpui::SharedString::from(action.label()))
                             .ghost()
                             .label(action.label())
-                            .disabled(!self.available && action != FileAction::CopyPath)
+                            .disabled(
+                                (!self.available && action != FileAction::CopyPath)
+                                    || (action == FileAction::Paste && self.clipboard.is_none()),
+                            )
                             .on_click(move |_, window, cx| {
                                 window.close_dialog(cx);
                                 let _ = weak.update(cx, |this, cx| {
@@ -368,8 +425,12 @@ impl FilePane {
                         .child("Destination folder on this server")
                         .child(Input::new(destination));
                 }
-                body = body.child("Name").child(Input::new(name)).child(div().text_sm().text_color(cx.theme().muted_foreground)
-                    .child("Existing files require replacement confirmation. Folders are never merged."));
+                body = body.child("Name").child(Input::new(name)).child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(tr("file-transfer-conflict-help")),
+                );
                 if !error.is_empty() {
                     body = body.child(
                         div()
@@ -660,11 +721,11 @@ impl FilePane {
         let cancel = weak.clone();
         let (label, enabled) = match &self.editor {
             Some(FileEditor::Permissions(p)) => (
-                "Apply",
+                "Apply".to_owned(),
                 self.available && !p.busy && permission_change(p, cx).is_ok_and(|c| c.is_some()),
             ),
             Some(FileEditor::Transfer { action, .. }) => (action.label(), self.available),
-            _ => ("", false),
+            _ => (String::new(), false),
         };
         div()
             .flex()
@@ -722,18 +783,29 @@ impl FilePane {
                 } else {
                     destination.read(cx).value().to_string()
                 };
-                let target = match opsssh_drop::join_remote(&directory, &name.read(cx).value()) {
-                    Ok(path) if path.starts_with('/') && path != entry.path => path,
+                let new_name = name.read(cx).value().to_string();
+                match opsssh_drop::join_remote(&directory, &new_name) {
+                    // Copying onto itself keeps both, like a file manager's duplicate.
+                    Ok(path)
+                        if path.starts_with('/')
+                            && (path != entry.path || *action == FileAction::Copy) => {}
                     _ => {
                         *error = "Enter an absolute destination and a different valid name".into();
                         cx.notify();
                         return;
                     }
-                };
-                let job = Job::RemoteTransfer {
-                    source: entry.path.clone(),
-                    target,
-                    copy: *action == FileAction::Copy,
+                }
+                let job = Job::Transfer {
+                    items: vec![TransferItem {
+                        source: entry.path.clone(),
+                        name: new_name,
+                    }],
+                    destination: directory,
+                    mode: if *action == FileAction::Copy {
+                        TransferMode::Copy
+                    } else {
+                        TransferMode::Move
+                    },
                     control: TransferControl::default(),
                 };
                 self.editor = None;
@@ -1081,12 +1153,19 @@ mod tests {
         cx.update(|window, cx| {
             pane.update(cx, |this, cx| {
                 let clicked = this.entries[0].clone();
-                this.selected = Some(3);
+                let other = this.entries[3].path.clone();
+                this.selection.select_only(&other);
                 this.file_action(clicked.clone(), FileAction::CopyPath, window, cx);
                 assert_eq!(
                     cx.read_from_clipboard().unwrap().text().unwrap(),
                     clicked.path
                 );
+                // When the clicked item is part of a selection, every selected path is copied.
+                this.selection.select_only(&clicked.path);
+                this.selection.toggle(&other);
+                this.file_action(clicked.clone(), FileAction::CopyPath, window, cx);
+                let copied = cx.read_from_clipboard().unwrap().text().unwrap();
+                assert_eq!(copied.lines().count(), 2, "{copied}");
             })
         });
     }
