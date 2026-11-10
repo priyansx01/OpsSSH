@@ -1,0 +1,59 @@
+name: Release
+on:
+  push:
+    tags: ['v*.*.*']
+permissions:
+  contents: read
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        name: Check the tag matches the workspace version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "$tag" != "$crate" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $crate" >&2
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+  packages:
+    needs: version
+    uses: ./.github/workflows/package.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+  publish:
+    needs: [version, packages]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages
+          merge-multiple: true
+      - name: Create the release if it does not exist
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "OpsSSH ${TAG#v}" --notes "See CHANGELOG.md for this release. Builds are unsigned; verify the .sha256 files."
+          fi
+      - name: Attach packages that are not already published
+        # Assets uploaded and verified by the maintainer are never replaced.
+        run: |
+          existing=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          for file in packages/*; do
+            name=$(basename "$file")
+            if printf '%s\n' "$existing" | grep -Fxq "$name"; then
+              echo "Keeping existing $name"
+            else
+              gh release upload "$TAG" "$file"
+            fi
+          done
