@@ -18,6 +18,10 @@ pub(super) struct DraggedItems {
     pub folders: Vec<String>,
     pub first_name: String,
     pub first_is_folder: bool,
+    /// Local copies prepared if the drag leaves the window.
+    pub stage: drag_out::SharedStage,
+    /// Set once the pointer has left the window during this drag.
+    pub left_window: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Whether `paths` may be dropped into `target`. A move into the folder that already
@@ -115,6 +119,16 @@ impl Render for DragGhost {
                         "file-drop-move"
                     })),
             )
+            .when_some(drag_out::status(&self.items.stage), |d, status| {
+                d.child(
+                    div()
+                        .max_w(px(220.))
+                        .truncate()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(status),
+                )
+            })
             .with_animation(
                 "drag-ghost-enter",
                 gpui::Animation::new(Duration::from_millis(if reduced { 0 } else { 160 }))
@@ -159,6 +173,8 @@ impl FilePane {
             folders,
             first_name: entry.name.clone(),
             first_is_folder: entry.is_directory,
+            stage: Default::default(),
+            left_window: Default::default(),
         }
     }
 
@@ -177,6 +193,10 @@ impl FilePane {
         cx: &mut Context<Self>,
     ) {
         self.spring = None;
+        // Dropped inside OpsSSH: files prepared for the desktop are no longer needed.
+        if let drag_out::Stage::Preparing(control) = &*drag_out::lock(&items.stage) {
+            control.cancel();
+        }
         let copy = wants_copy(window);
         if items.pane != cx.entity_id() || !self.accepts_items(items, &target, copy) {
             return;
@@ -440,8 +460,21 @@ impl FilePane {
         let element = self.folder_drop_target(element, directory, cx);
         element
             .on_drag_move(
-                cx.listener(|this, event: &DragMoveEvent<DraggedItems>, _, cx| {
-                    if this.edge_scroll(event.event.position) {
+                cx.listener(|this, event: &DragMoveEvent<DraggedItems>, window, cx| {
+                    let position = event.event.position;
+                    let size = window.viewport_size();
+                    if position.x < px(0.)
+                        || position.y < px(0.)
+                        || position.x > size.width
+                        || position.y > size.height
+                    {
+                        if let Some(items) = event.dragged_item().downcast_ref::<DraggedItems>() {
+                            let items = items.clone();
+                            this.drag_left_window(&items, window, cx);
+                        }
+                        return;
+                    }
+                    if this.edge_scroll(position) {
                         cx.notify();
                     }
                 }),

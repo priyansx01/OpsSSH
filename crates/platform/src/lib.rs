@@ -6,6 +6,8 @@ pub mod agent;
 mod pty;
 pub use pty::{NativeTerminal, NativeTerminalFactory, TerminalKiller};
 
+#[cfg(target_os = "windows")]
+pub mod file_drag;
 #[cfg(feature = "gui")]
 pub mod keyboard_capture;
 

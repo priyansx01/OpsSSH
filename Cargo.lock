@@ -5375,6 +5375,7 @@ dependencies = [
  "shlex 2.0.1",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -5413,6 +5414,8 @@ dependencies = [
  "raw-window-handle",
  "russh",
  "tokio",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
  "windows-sys 0.61.2",
 ]
 

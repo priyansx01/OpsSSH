@@ -24,8 +24,11 @@ async-channel = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Threading", "Win32_System_LibraryLoader"] }
+# Same version GPUI already uses; only the shell drag APIs are added.
+windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_SystemServices", "Win32_System_Variant", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
+windows-core = "=0.62.2"
 
-# Only keyboard_capture's audited Win32 boundary may use unsafe code.
+# Only the audited Win32 boundaries (keyboard capture, file drag) may use unsafe code.
 [lints.rust]
 unsafe_code = "deny"
 missing_debug_implementations = "warn"

@@ -21,6 +21,7 @@ mod actions;
 mod browser;
 mod conflict;
 mod dnd;
+mod drag_out;
 mod places;
 mod selection;
 use actions::FileEditor;
@@ -77,6 +78,13 @@ enum Job {
         change: PermissionChange,
         owner: Option<String>,
         group: Option<String>,
+        control: TransferControl,
+    },
+    /// Download dragged items into a private folder before they leave the window.
+    Stage {
+        paths: Vec<String>,
+        folder: PathBuf,
+        stage: drag_out::SharedStage,
         control: TransferControl,
     },
     /// Copy or move items into a folder, asking about each name conflict.
@@ -197,6 +205,8 @@ pub struct FilePane {
     terminal_directory: Option<String>,
     /// The first folder listed after connecting, which is the login home.
     home_hint: String,
+    /// Temporary folders holding files prepared for dragging out; removed with the pane.
+    staged_folders: Vec<PathBuf>,
     message: String,
     pending_delete: Option<Vec<String>>,
     pending: usize,
@@ -324,6 +334,7 @@ impl FilePane {
             bookmarks: vec![],
             terminal_directory: None,
             home_hint: String::new(),
+            staged_folders: vec![],
             message: tr("file-entry-count"),
             pending_delete: None,
             pending: 0,
@@ -385,6 +396,9 @@ impl FilePane {
             }
         })
         .detach();
+        if drag_out::enabled() {
+            std::thread::spawn(drag_out::sweep_stale);
+        }
         let thread = Self::start_worker(
             commands,
             fingerprint,
@@ -424,6 +438,7 @@ impl FilePane {
             bookmarks: vec![],
             terminal_directory: None,
             home_hint: String::new(),
+            staged_folders: vec![],
             message: tr("file-opening"),
             pending_delete: None,
             pending: 0,
@@ -1494,9 +1509,36 @@ impl FilePane {
         );
         if self.available && renaming.is_none() {
             let value = self.drag_value(entry, cx.entity_id());
-            cell = cell.on_drag(value, |items, _, _, cx| {
-                cx.new(|_| dnd::DragGhost::new(items.clone()))
-            });
+            let pane = cx.entity().downgrade();
+            let leaving = pane.clone();
+            cell = cell
+                .on_drag(value, move |items, _, _, cx| {
+                    // The same value serves every drag until the next render: start fresh,
+                    // keeping files that are already prepared.
+                    items
+                        .left_window
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    {
+                        let mut stage = drag_out::lock(&items.stage);
+                        if matches!(
+                            *stage,
+                            drag_out::Stage::Failed(_) | drag_out::Stage::TooLarge
+                        ) {
+                            *stage = drag_out::Stage::Idle;
+                        }
+                    }
+                    if drag_out::enabled() {
+                        let _ = pane.update(cx, |pane, cx| {
+                            if pane.eager_stage(items) {
+                                pane.start_stage(items, cx);
+                            }
+                        });
+                    }
+                    cx.new(|_| dnd::DragGhost::new(items.clone()))
+                })
+                .external_drag_payload(move |items: &dnd::DraggedItems, window, cx| {
+                    drag_out::leave_window(items, window, cx, leaving.clone())
+                });
         }
         if folder {
             let hovered = entry.path.clone();
@@ -1546,6 +1588,15 @@ impl Drop for FilePane {
     fn drop(&mut self) {
         for task in &self.transfers {
             task.control.cancel();
+        }
+        // Drop targets copy staged files before their drag returns; nothing else uses them.
+        let staged = std::mem::take(&mut self.staged_folders);
+        if !staged.is_empty() {
+            std::thread::spawn(move || {
+                for folder in staged {
+                    let _ = std::fs::remove_dir_all(folder);
+                }
+            });
         }
         self.jobs.close();
     }
@@ -2905,6 +2956,14 @@ async fn execute(
                 .send(Update::Message(format!("Permissions: {}", message?)))
                 .await?;
             actions::report_result(&report)?;
+        }
+        Job::Stage {
+            paths,
+            folder,
+            stage,
+            control,
+        } => {
+            drag_out::stage(client, &paths, &folder, &stage, &control).await?;
         }
         Job::Transfer {
             items,
